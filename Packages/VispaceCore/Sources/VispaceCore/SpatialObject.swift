@@ -1,0 +1,166 @@
+import Foundation
+
+public enum SpatialObjectError: Error, Equatable, Sendable {
+    case emptySemanticLabel
+    case invalidTimestamp
+}
+
+public enum ObjectCertainty: String, Codable, Hashable, Sendable {
+    case provisional
+    case confirmed
+}
+
+public enum ObjectPresence: String, Codable, Hashable, Sendable {
+    case visible
+    case notVisible
+    case lastSeen
+    case removed
+}
+
+public struct SpatialObject: Codable, Hashable, Sendable {
+    public let id: ObjectID
+    public var semanticLabel: String
+    public var nodeID: SpatialNodeID?
+    public var position: Vec3
+    public var bounds: AABB?
+    public var certainty: ObjectCertainty
+    public var presence: ObjectPresence
+    public var confidence: ConfidenceVector
+    public let firstSeenAt: TimeInterval
+    public var lastSeenAt: TimeInterval
+    /// Ordering timestamp for lifecycle mutations. This is distinct from
+    /// `lastSeenAt`, which always means the time of the latest observation.
+    public var stateUpdatedAt: TimeInterval
+
+    public init(
+        id: ObjectID = ObjectID(),
+        semanticLabel: String,
+        nodeID: SpatialNodeID? = nil,
+        position: Vec3,
+        bounds: AABB? = nil,
+        certainty: ObjectCertainty,
+        presence: ObjectPresence = .visible,
+        confidence: ConfidenceVector,
+        firstSeenAt: TimeInterval,
+        lastSeenAt: TimeInterval,
+        stateUpdatedAt: TimeInterval? = nil
+    ) throws {
+        let normalizedLabel = semanticLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedStateUpdatedAt = stateUpdatedAt ?? lastSeenAt
+        guard !normalizedLabel.isEmpty else {
+            throw SpatialObjectError.emptySemanticLabel
+        }
+        guard firstSeenAt.isFinite, firstSeenAt >= 0,
+            lastSeenAt.isFinite, lastSeenAt >= firstSeenAt,
+            resolvedStateUpdatedAt.isFinite, resolvedStateUpdatedAt >= lastSeenAt
+        else {
+            throw SpatialObjectError.invalidTimestamp
+        }
+
+        self.id = id
+        self.semanticLabel = normalizedLabel
+        self.nodeID = nodeID
+        self.position = position
+        self.bounds = bounds
+        self.certainty = certainty
+        self.presence = presence
+        self.confidence = confidence
+        self.firstSeenAt = firstSeenAt
+        self.lastSeenAt = lastSeenAt
+        self.stateUpdatedAt = resolvedStateUpdatedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case semanticLabel
+        case nodeID
+        case position
+        case bounds
+        case certainty
+        case presence
+        case confidence
+        case firstSeenAt
+        case lastSeenAt
+        case stateUpdatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        do {
+            try self.init(
+                id: container.decode(ObjectID.self, forKey: .id),
+                semanticLabel: container.decode(String.self, forKey: .semanticLabel),
+                nodeID: container.decodeIfPresent(SpatialNodeID.self, forKey: .nodeID),
+                position: container.decode(Vec3.self, forKey: .position),
+                bounds: container.decodeIfPresent(AABB.self, forKey: .bounds),
+                certainty: container.decode(ObjectCertainty.self, forKey: .certainty),
+                presence: container.decode(ObjectPresence.self, forKey: .presence),
+                confidence: container.decode(ConfidenceVector.self, forKey: .confidence),
+                firstSeenAt: container.decode(TimeInterval.self, forKey: .firstSeenAt),
+                lastSeenAt: container.decode(TimeInterval.self, forKey: .lastSeenAt),
+                stateUpdatedAt: container.decode(TimeInterval.self, forKey: .stateUpdatedAt)
+            )
+        } catch let error as DecodingError {
+            throw error
+        } catch {
+            throw DecodingError.dataCorruptedError(
+                forKey: .semanticLabel,
+                in: container,
+                debugDescription: "Spatial object contains an invalid label or timestamp."
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(semanticLabel, forKey: .semanticLabel)
+        try container.encodeIfPresent(nodeID, forKey: .nodeID)
+        try container.encode(position, forKey: .position)
+        try container.encodeIfPresent(bounds, forKey: .bounds)
+        try container.encode(certainty, forKey: .certainty)
+        try container.encode(presence, forKey: .presence)
+        try container.encode(confidence, forKey: .confidence)
+        try container.encode(firstSeenAt, forKey: .firstSeenAt)
+        try container.encode(lastSeenAt, forKey: .lastSeenAt)
+        try container.encode(stateUpdatedAt, forKey: .stateUpdatedAt)
+    }
+}
+
+public enum ObjectEvent: Codable, Hashable, Sendable {
+    case upsert(SpatialObject)
+    case observed(
+        objectID: ObjectID,
+        at: TimeInterval,
+        position: Vec3,
+        bounds: AABB?,
+        confidence: ConfidenceVector
+    )
+    case becameNotVisible(objectID: ObjectID, at: TimeInterval)
+    case becameLastSeen(objectID: ObjectID, at: TimeInterval)
+    case moved(
+        objectID: ObjectID,
+        from: Vec3,
+        to: Vec3,
+        at: TimeInterval,
+        confidence: ConfidenceScore
+    )
+    case removed(objectID: ObjectID, at: TimeInterval, confidence: ConfidenceScore)
+    case discardProvisional(objectID: ObjectID)
+}
+
+public struct SpatialDelta: Codable, Hashable, Sendable {
+    public let id: SpatialDeltaID
+    public let baseRevision: UInt64
+    public let events: [ObjectEvent]
+
+    public init(
+        id: SpatialDeltaID = SpatialDeltaID(),
+        baseRevision: UInt64,
+        events: [ObjectEvent]
+    ) {
+        self.id = id
+        self.baseRevision = baseRevision
+        self.events = events
+    }
+}

@@ -1,0 +1,32 @@
+# Xcode
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+*.moved-aside
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/**/.build/
+
+# XcodeGen
+project.generated.yml
+
+# Local signing and secrets
+Config/Signing.xcconfig
+*.mobileprovision
+*.p12
+.env
+.env.*
+
+# Test and review output
+TestResults/
+*.xcresult
+.impeccable/review/
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/

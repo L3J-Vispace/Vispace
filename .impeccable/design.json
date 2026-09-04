@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-04T01:47:54.308Z",
+  "title": "Design System: Vispace",
+  "extensions": {
+    "colorMeta": {
+      "unavailable-capture": {
+        "role": "neutral",
+        "displayName": "Unavailable Capture",
+        "canonical": "#000000",
+        "tonalRamp": [
+          "#000000",
+          "#000000",
+          "#000000",
+          "#000000",
+          "#000000",
+          "#000000",
+          "#000000",
+          "#000000"
+        ]
+      }
+    }
+  },
+  "components": [],
+  "narrative": {
+    "northStar": "Unmediated Lens",
+    "overview": "Vispace treats the observed world as the interface. It removes every app-owned visual layer so live camera pixels remain unmodified and occupy the entire visible surface.\n\nThat absence is deliberate, not unfinished. Pure black is a functional fallback only while capture is unavailable; it is not a brand field, theme surface, or decorative palette.",
+    "keyCharacteristics": [
+      "Live camera pixels are the only visible application content.",
+      "Capture begins as soon as system permission and hardware allow.",
+      "App-owned interface chrome is absent in every visual state.",
+      "Nonvisual accessibility metadata remains available without adding visible UI."
+    ],
+    "rules": [
+      {
+        "name": "The Unmediated Lens Doctrine",
+        "body": "The observed world is the interface; app-owned visuals must never mediate the camera image.",
+        "section": "overview"
+      },
+      {
+        "name": "The No Decorative Color Rule",
+        "body": "Camera pixels supply every visible color. The app contributes no tint, accent, overlay, or theme coloration.",
+        "section": "colors"
+      },
+      {
+        "name": "The Every Pixel Rule",
+        "body": "When capture is available, the camera feed covers the full window edge to edge.",
+        "section": "layout"
+      }
+    ],
+    "dos": [
+      "Do let unmodified live camera pixels fill every visible pixel whenever capture is available.",
+      "Do reserve unavailable-capture black for states in which the camera feed cannot be shown.",
+      "Do allow the system-owned camera permission prompt to interrupt the surface when required.",
+      "Do retain the nonvisual \"Live camera\" accessibility label.",
+      "Do verify the live-camera surface on a physical iPhone."
+    ],
+    "donts": [
+      "Don't add app-owned text, controls, typography, cards, chrome, HUDs, coaching, debug geometry, or AR markers.",
+      "Don't introduce decorative color, tint, overlays, depth, borders, shapes, or motion.",
+      "Don't add future Search/Ask or AR guidance interface until an explicit decision changes the visible contract."
+    ]
+  }
+}

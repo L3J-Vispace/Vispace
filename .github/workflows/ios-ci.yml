@@ -1,0 +1,199 @@
+name: iOS CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-analyze:
+    name: Build, test, and analyze
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      REQUIRED_XCODE_VERSION: 26.6
+      XCODEGEN_VERSION: 2.46.0
+      XCODEGEN_SHA256: 4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify Xcode baseline
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          version="$(xcodebuild -version | awk 'NR == 1 { print $2 }')"
+          if [[ "${version}" != "${REQUIRED_XCODE_VERSION}" ]]; then
+            echo "Vispace CI requires Xcode ${REQUIRED_XCODE_VERSION}; runner selected ${version}." >&2
+            exit 1
+          fi
+          major="${version%%.*}"
+          if [[ -z "${major}" || "${major}" -lt 26 ]]; then
+            echo "Vispace requires Xcode 26 or newer; runner selected ${version}." >&2
+            exit 1
+          fi
+          sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
+          sdk_major="${sdk_version%%.*}"
+          if [[ -z "${sdk_major}" || "${sdk_major}" -lt 26 ]]; then
+            echo "Vispace requires the iOS 26 SDK or newer; runner selected ${sdk_version}." >&2
+            exit 1
+          fi
+
+      - name: Install pinned XcodeGen
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/xcodegen.zip"
+          destination="${RUNNER_TEMP}/xcodegen-release"
+          curl --fail --silent --show-error --location \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip" \
+            --output "${archive}"
+          printf '%s  %s\n' "${XCODEGEN_SHA256}" "${archive}" | shasum -a 256 --check
+          unzip -q "${archive}" -d "${destination}"
+          chmod +x "${destination}/xcodegen/bin/xcodegen"
+          echo "${destination}/xcodegen/bin" >> "${GITHUB_PATH}"
+          "${destination}/xcodegen/bin/xcodegen" --version
+
+      - name: Verify privacy build settings
+        run: |
+          set -euo pipefail
+          grep -q 'INFOPLIST_KEY_NSCameraUsageDescription' project.yml
+          grep -q 'UIRequiredDeviceCapabilities' project.yml
+          grep -q 'UIInterfaceOrientationPortrait' project.yml
+          grep -q 'SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated' Config/Shared.xcconfig
+          plutil -lint Vispace/Resources/PrivacyInfo.xcprivacy
+          if grep -R --line-number --exclude-dir=.git \
+            -E 'NSMicrophoneUsageDescription|INFOPLIST_KEY_NSMicrophoneUsageDescription' \
+            project.yml Config Vispace; then
+            echo 'Microphone usage description must remain absent.' >&2
+            exit 1
+          fi
+
+      - name: Generate deterministic Xcode project
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.yml
+          git diff --exit-code -- Vispace.xcodeproj
+          xcodebuild -list -project Vispace.xcodeproj
+
+      - name: Test local core package
+        run: |
+          set -euo pipefail
+          swift test --package-path Packages/VispaceCore --parallel
+
+      - name: Resolve local package graph
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project Vispace.xcodeproj \
+            -scheme Vispace
+
+      - name: Select an available iPhone Simulator
+        run: |
+          set -euo pipefail
+          simulator_udid="$(xcrun simctl list devices available --json | python3 -c '
+          import json, re, sys
+
+          devices = json.load(sys.stdin)["devices"]
+          candidates = []
+          for runtime, runtime_devices in devices.items():
+              match = re.search(r"\.iOS-(\d+)(?:-(\d+))?(?:-(\d+))?$", runtime)
+              if match is None:
+                  continue
+              version = tuple(int(part or 0) for part in match.groups())
+              for device in runtime_devices:
+                  if device.get("isAvailable") and device.get("name", "").startswith("iPhone"):
+                      candidates.append((version, device["name"], device["udid"]))
+
+          if not candidates:
+              raise SystemExit("No available iPhone Simulator was found")
+
+          latest_version = max(candidate[0] for candidate in candidates)
+          latest = sorted(candidate for candidate in candidates if candidate[0] == latest_version)
+          print(latest[0][2])
+          ')"
+          echo "SIMULATOR_UDID=${simulator_udid}" >> "${GITHUB_ENV}"
+          xcrun simctl list devices | grep "${simulator_udid}"
+
+      - name: Build without signing
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Vispace.xcodeproj \
+            -scheme Vispace \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "${RUNNER_TEMP}/VispaceDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build
+
+      - name: Build optimized configuration without signing
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Vispace.xcodeproj \
+            -scheme Vispace \
+            -configuration Release \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "${RUNNER_TEMP}/VispaceReleaseDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build
+
+      - name: Archive device configuration without signing
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Vispace.xcodeproj \
+            -scheme Vispace \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "${RUNNER_TEMP}/VispaceDeviceDerivedData" \
+            -archivePath "${RUNNER_TEMP}/Vispace.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            archive
+
+      - name: Test on Simulator
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Vispace.xcodeproj \
+            -scheme Vispace \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${SIMULATOR_UDID}" \
+            -derivedDataPath "${RUNNER_TEMP}/VispaceDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            test
+
+      - name: Analyze
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Vispace.xcodeproj \
+            -scheme Vispace \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "${RUNNER_TEMP}/VispaceDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            analyze
