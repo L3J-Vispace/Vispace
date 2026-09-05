@@ -72,6 +72,35 @@ final class SpatialDataManagementControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testDeletionInvalidatesOldOverviewAndStaysBusyUntilRefreshFinishes() async {
+        let provider = SuspendedStorageOverviewProvider()
+        let controller = SpatialDataManagementController(
+            overviewProvider: { await provider.read() }, deleteAction: {}
+        )
+        let oldRefresh = Task { await controller.refreshOverview() }
+        for _ in 0..<100 {
+            if await provider.requestCount == 1 { break }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        controller.deleteAllSpatialData()
+        for _ in 0..<100 {
+            if await provider.requestCount == 2 { break }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(controller.isBusy)
+        XCTAssertEqual(controller.state, .deleting)
+        await provider.complete(1, usedBytes: 0)
+        await waitUntil { controller.state == .deleted }
+        XCTAssertFalse(controller.isBusy)
+        XCTAssertEqual(controller.overview?.usedBytes, 0)
+
+        await provider.complete(0, usedBytes: 123)
+        await oldRefresh.value
+        XCTAssertEqual(controller.overview?.usedBytes, 0)
+        XCTAssertFalse(controller.overviewFailed)
+    }
+
+    @MainActor
     private func waitUntil(
         timeout: TimeInterval = 1,
         condition: @escaping @MainActor () -> Bool
@@ -88,6 +117,23 @@ private actor DeletionRecorder {
 
     func record() {
         count += 1
+    }
+}
+
+private actor SuspendedStorageOverviewProvider {
+    private(set) var requestCount = 0
+    private var pending: [Int: CheckedContinuation<SpatialStorageOverview, Never>] = [:]
+
+    func read() async -> SpatialStorageOverview {
+        let request = requestCount
+        requestCount += 1
+        return await withCheckedContinuation { pending[request] = $0 }
+    }
+
+    func complete(_ request: Int, usedBytes: Int64) {
+        pending.removeValue(forKey: request)?.resume(returning: SpatialStorageOverview(
+            usedBytes: usedBytes, availableBytes: 1_000, places: []
+        ))
     }
 }
 

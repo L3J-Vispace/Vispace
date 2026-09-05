@@ -6,6 +6,18 @@ import XCTest
 final class SpatialApplicationLifecycleTests: XCTestCase {
     private enum Failure: Error { case storage, deletion }
 
+    func testPlaceMaintenanceUsesTheWriterBarrierWithoutDeletingOtherPlaces() async throws {
+        var calls: [String] = []
+        let lifecycle = SpatialApplicationLifecycle(
+            prepareStorage: { calls.append("prepare") }, start: { calls.append("start") },
+            stop: { calls.append("stop:\($0)") }, quiesce: { calls.append("joined") },
+            deleteStore: { calls.append("deleteAll") }
+        )
+        lifecycle.setActive(true)
+        try await lifecycle.performStorageMaintenance { calls.append("selectedPlace") }
+        XCTAssertEqual(calls, ["prepare", "start", "stop:false", "joined", "selectedPlace", "prepare", "start"])
+    }
+
     func testRepeatedSceneTransitionsStartAndCheckpointOnlyOnce() {
         var calls: [String] = []
         let lifecycle = SpatialApplicationLifecycle(

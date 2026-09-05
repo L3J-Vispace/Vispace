@@ -56,6 +56,10 @@ final class SpatialApplicationLifecycle: ObservableObject {
     }
 
     func deleteSpatialData() async throws {
+        try await performStorageMaintenance(deleteStore)
+    }
+
+    func performStorageMaintenance(_ action: () async throws -> Void) async throws {
         guard !isDeleting else { throw LifecycleError.deletionInProgress }
         isDeleting = true
         state = .deleting
@@ -70,7 +74,7 @@ final class SpatialApplicationLifecycle: ObservableObject {
         }
         // All asynchronous writers must be joined before the store disappears.
         await quiesce()
-        try await deleteStore()
+        try await action()
     }
 
     private func activateIfAllowed() {

@@ -46,12 +46,24 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
 
     @Published public private(set) var state: ARSessionControllerState = .detached
     @Published public private(set) var capabilities: ARCaptureCapabilities?
+    @Published public private(set) var persistenceFailureMessage: String?
+    private var restoreFailureMessage: String?
+    private var saveFailureMessage: String?
+    public var onCaptureIdentityChange: (@MainActor (ARCaptureIdentity) -> Void)?
 
     public var poses: AsyncStream<ARPoseSnapshot> { delegateProxy.poses }
     public var frames: AsyncStream<ARFrameSnapshot> { delegateProxy.frames }
     public var surfaces: AsyncStream<ARSurfaceStateSnapshot> { delegateProxy.surfaces }
     public var events: AsyncStream<ARSessionEvent> { delegateProxy.events }
     public var captureIdentity: ARCaptureIdentity { captureIdentityBox.value }
+    public var latestDepthFrame: ARFrameSnapshot? {
+        guard state == .running, let frame = delegateProxy.frameChannel.latest,
+            confirmedCaptureIdentity(for: frame) == captureIdentity,
+            let timestamp = navigationEvaluationTimestamp,
+            timestamp >= frame.pose.timestamp, timestamp - frame.pose.timestamp <= 1
+        else { return nil }
+        return frame
+    }
 
     /// Evaluation time shares ARKit's monotonic session clock with geometry
     /// and poses. Wall-clock Date values are not comparable to those samples.
@@ -157,7 +169,8 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
     public static func live(
         repository: WorldMapCheckpointRepository = WorldMapCheckpointRepository(
             directoryURL: VispaceStoragePaths.spatialCaptureDirectory()
-        )
+        ),
+        preferredMapProvider: @escaping @Sendable () async -> MapID? = { nil }
     ) -> ARSessionController {
         let controller = ARSessionController(
             maximumSnapshotFramesPerSecond: 5,
@@ -168,7 +181,7 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
                 )
             },
             worldMapRestoreProvider: {
-                try await repository.loadLatestValidCheckpoint()
+                try await repository.loadLatestValidCheckpoint(mapID: preferredMapProvider())
             }
         )
         return controller
@@ -442,6 +455,9 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
                     mapID: metadata.mapID,
                     matching: identity
                 )
+                self.saveFailureMessage = nil
+                self.publishPersistenceFailure()
+                self.onCaptureIdentityChange?(self.captureIdentity)
                 self.delegateProxy.requestAuthoritativeSurfaceRepublish()
             } catch is CancellationError {
                 // User-requested deletion intentionally revokes this write.
@@ -483,6 +499,16 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
         enterBackground()
     }
 
+    public func resetPersistenceStatus() {
+        restoreFailureMessage = nil
+        saveFailureMessage = nil
+        publishPersistenceFailure()
+    }
+
+    private func publishPersistenceFailure() {
+        persistenceFailureMessage = restoreFailureMessage ?? saveFailureMessage
+    }
+
     /// Associates the live capture with an already-persisted map only when
     /// both sides name the exact same confirmed coordinate frame. Cross-frame
     /// place matches must go through validated alignment and a fresh
@@ -505,6 +531,7 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
         captureIdentityBox.recordCheckpoint(mapID: mapID, matching: identity)
         let didAssociate = captureIdentityBox.value.mapID == mapID
         if didAssociate {
+            onCaptureIdentityChange?(captureIdentity)
             delegateProxy.requestAuthoritativeSurfaceRepublish(afterNextFrame: true)
         }
         return didAssociate
@@ -903,6 +930,8 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
                 return
             }
             guard let candidate else {
+                restoreFailureMessage = nil
+                publishPersistenceFailure()
                 hasAttemptedRestore = true
                 delegateProxy.emit(.worldMapRestoreSkipped(reason: "No saved world map exists."))
                 return
@@ -916,6 +945,8 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
             }
             hasAttemptedRestore = true
             pendingInitialWorldMap = transfer.value
+            restoreFailureMessage = nil
+            publishPersistenceFailure()
             captureIdentityBox.value = ARCaptureIdentity(
                 coordinateFrameID: candidate.metadata.coordinateFrameID,
                 segmentID: CaptureSegmentID(),
@@ -928,6 +959,8 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
                 return
             }
             hasAttemptedRestore = true
+            restoreFailureMessage = String(localized: "storage.restore.failed")
+            publishPersistenceFailure()
             delegateProxy.emit(
                 .worldMapRestoreSkipped(reason: String(describing: error))
             )
@@ -1066,6 +1099,7 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
     }
 
     private func handleSessionEvent(_ event: ARSessionEvent) {
+        defer { onCaptureIdentityChange?(captureIdentity) }
         switch event {
         case .interrupted(let context):
             guard sessionIsRunning, isCurrentSessionRunContext(context) else {
@@ -1179,11 +1213,13 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
             sessionIsRunning = false
             arView?.environment.background = .color(.black)
             state = .failed(message: message)
+        case .worldMapArchiveFailed:
+            saveFailureMessage = String(localized: "storage.save.failed")
+            publishPersistenceFailure()
         case .snapshotCopyFailed,
             .surfaceSnapshotFailed,
             .worldMapArchiveCreated,
             .worldMapArchiveSkipped,
-            .worldMapArchiveFailed,
             .worldMapRestoreLoaded,
             .worldMapRestoreSkipped,
             .worldMapRelocalizationSucceeded,

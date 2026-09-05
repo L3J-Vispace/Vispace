@@ -445,13 +445,13 @@ public final class ARSessionDelegateProxy: NSObject, ARSessionDelegate, @uncheck
             .interruptionEnded,
             .failed,
             .trackingStateChanged,
-            .worldMappingStatusChanged:
+            .worldMappingStatusChanged,
+            .worldMapArchiveFailed:
             break
         case .snapshotCopyFailed,
             .surfaceSnapshotFailed,
             .worldMapArchiveCreated,
             .worldMapArchiveSkipped,
-            .worldMapArchiveFailed,
             .worldMapRestoreLoaded,
             .worldMapRestoreSkipped,
             .worldMapRelocalizationSucceeded,

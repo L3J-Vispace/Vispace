@@ -1,9 +1,12 @@
 import SwiftUI
+import VispaceCore
 
 struct SpatialDataSettingsScreen: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var controller: SpatialDataManagementController
     @State private var confirmsDeletion = false
+    @State private var selectedPlace: MapID?
+    @State private var confirmsPlaceDeletion = false
 
     var body: some View {
         NavigationStack {
@@ -14,13 +17,53 @@ struct SpatialDataSettingsScreen: View {
                     Label("data.storage.retention", systemImage: "clock.arrow.circlepath")
                 }
 
+                if let overview = controller.overview {
+                    Section("data.storage.usage") {
+                        LabeledContent("data.storage.used", value: ByteCountFormatter.string(fromByteCount: overview.usedBytes, countStyle: .file))
+                        LabeledContent("data.storage.available", value: ByteCountFormatter.string(fromByteCount: overview.availableBytes, countStyle: .file))
+                        Text("data.storage.budget")
+                    }
+                    Section("data.places.title") {
+                        ForEach(overview.places) { place in
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text(String(place.id.description.prefix(8)))
+                                    Text(Date(timeIntervalSince1970: place.updatedAt), format: .dateTime)
+                                        .font(.caption)
+                                    Text("\(place.objectCount) objects")
+                                        .font(.caption)
+                                    Button("data.place.select") { controller.selectPlace(place.id) }
+                                        .disabled(controller.isBusy)
+                                }
+                                Spacer()
+                                Button(role: .destructive) {
+                                    selectedPlace = place.id
+                                    confirmsPlaceDeletion = true
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .accessibilityLabel(Text("data.place.delete"))
+                                .disabled(controller.isBusy)
+                            }
+                        }
+                    }
+                } else if controller.overviewFailed {
+                    Section { Text("data.storage.read.failed") }
+                }
+
+                Section("data.support.title") {
+                    Text("data.support.objects")
+                    Text("data.support.device")
+                    Text("data.support.routes")
+                }
+
                 Section {
                     Button(role: .destructive) {
                         confirmsDeletion = true
                     } label: {
                         Label("data.delete.action", systemImage: "trash")
                     }
-                    .disabled(controller.state == .deleting)
+                    .disabled(controller.isBusy)
                     .accessibilityIdentifier("vispace.data.delete")
 
                     if controller.state == .deleting {
@@ -54,7 +97,7 @@ struct SpatialDataSettingsScreen: View {
                     Button("data.done") {
                         dismiss()
                     }
-                    .disabled(controller.state == .deleting)
+                    .disabled(controller.isBusy)
                 }
             }
             .confirmationDialog(
@@ -73,7 +116,14 @@ struct SpatialDataSettingsScreen: View {
             .onDisappear {
                 controller.clearStatus()
             }
-            .interactiveDismissDisabled(controller.state == .deleting)
+            .task { await controller.refreshOverview() }
+            .confirmationDialog("data.place.delete", isPresented: $confirmsPlaceDeletion) {
+                Button("data.place.delete", role: .destructive) {
+                    if let selectedPlace { controller.deletePlace(selectedPlace) }
+                }
+                Button("data.delete.confirm.cancel", role: .cancel) {}
+            } message: { Text("data.place.delete.detail") }
+            .interactiveDismissDisabled(controller.isBusy)
         }
     }
 }

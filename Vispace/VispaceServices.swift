@@ -23,7 +23,10 @@ final class VispaceServices: ObservableObject {
         let repository = WorldMapCheckpointRepository(
             directoryURL: spatialCaptureDirectory
         )
-        let sessionController = ARSessionController.live(repository: repository)
+        let mapSelection = SpatialMapSelection()
+        let sessionController = ARSessionController.live(
+            repository: repository, preferredMapProvider: { await mapSelection.mapID }
+        )
         let placeMemoryRepository = PlaceMemoryRepository(
             directoryURL: spatialCaptureDirectory
         )
@@ -111,8 +114,11 @@ final class VispaceServices: ObservableObject {
             associationWriter: { record in
                 try await placeMemoryRepository.upsertAssociationState(
                     record,
-                    retention: .retireOlderDeferredAttempts
+                    retention: .retireCompletedAttempts
                 )
+            },
+            mutationAcknowledger: { id, revision in
+                try await placeMemoryRepository.acknowledgeAssociationMutation(id: id, revision: revision)
             },
             coordinateCompatibilityProvider: { snapshot, candidate, objects in
                 coordinateAlignmentResolver.resolve(
@@ -163,7 +169,12 @@ final class VispaceServices: ObservableObject {
             }
         )
         let guidanceController = ARGuidanceController(
-            poseStreamProvider: { sessionController.poses }
+            poseStreamProvider: { sessionController.poses },
+            sourceMetadataProvider: { objectID, mapID in
+                try await repository.metadataSnapshot().objects.first {
+                    $0.object.id == objectID && $0.mapID == mapID
+                }
+            }
         )
         let placementController = FurniturePlacementController(
             candidatePositionProvider: { _ in
@@ -182,6 +193,9 @@ final class VispaceServices: ObservableObject {
             controller: placementController
         )
         let navigationEvidenceBuilder = ARVerifiedNavigationEvidenceBuilder()
+        let navigationDepthHistory = ARRecentNavigationDepthHistory(
+            frameStreamProvider: { sessionController.frames }
+        )
         let navigationController = IndoorNavigationController(
             surfaceStreamProvider: { sessionController.surfaces },
             poseStreamProvider: { sessionController.poses },
@@ -189,10 +203,18 @@ final class VispaceServices: ObservableObject {
                 sessionController.captureIdentity
             },
             evidenceProvider: { snapshot, identity in
+                let depthFrame = await sessionController.latestDepthFrame
+                let depthHistory = await navigationDepthHistory.frames(
+                    matching: identity, evaluatedAt: depthFrame?.pose.timestamp ?? .nan
+                )
+                let objects = try await repository.metadataSnapshot().objects
                 let evidenceWork = Task.detached(priority: .userInitiated) {
                     navigationEvidenceBuilder.adapt(
                         snapshot,
-                        currentIdentity: identity
+                        currentIdentity: identity,
+                        currentDepthFrame: depthFrame,
+                        recentDepthFrames: depthHistory,
+                        dynamicObjects: objects
                     )
                 }
                 return await withTaskCancellationHandler {
@@ -237,6 +259,7 @@ final class VispaceServices: ObservableObject {
                 perceptionController.activate()
                 placeRecognitionController.activate()
                 guidanceController.activate()
+                navigationDepthHistory.activate()
                 placementStreamBridge.activate()
                 navigationController.activate()
             },
@@ -245,6 +268,7 @@ final class VispaceServices: ObservableObject {
                 relationQueryController.invalidateForCaptureTransition()
                 placementStreamBridge.deactivate()
                 navigationController.deactivate()
+                navigationDepthHistory.deactivate()
                 guidanceController.deactivate()
                 placeRecognitionController.deactivate()
                 perceptionController.deactivate()
@@ -254,6 +278,7 @@ final class VispaceServices: ObservableObject {
                 sessionController.deactivate()
             },
             quiesce: {
+                await guidanceController.deactivateAndWaitForPendingWork()
                 await queryController.invalidateAndWaitForPendingWork()
                 await relationQueryController.invalidateAndWaitForPendingWork()
                 await placementController.cancelCurrentEvaluationAndWait()
@@ -265,12 +290,57 @@ final class VispaceServices: ObservableObject {
                 await placeRecognitionController.deactivateAndWaitForPendingWork()
             },
             deleteStore: {
+                await mapSelection.select(nil)
+                await temporalMemoryService.reset()
                 try await Task.detached(priority: .utility) {
                     try SpatialDataStoreMaintenance.deleteAll(at: spatialCaptureDirectory)
                 }.value
+                perceptionController.resetPersistenceStatus()
+                sessionController.resetPersistenceStatus()
             }
         )
-        let dataManagementController = SpatialDataManagementController {
+        let dataManagementController = SpatialDataManagementController(
+            overviewProvider: {
+                let document = try await repository.metadataSnapshot()
+                let places = Dictionary(grouping: document.maps, by: \.mapID).map { mapID, maps in
+                    SpatialStoredPlace(
+                        id: mapID, updatedAt: maps.map(\.updatedAt).max() ?? 0,
+                        objectCount: document.objects.filter { $0.mapID == mapID }.count
+                    )
+                }.sorted { $0.updatedAt > $1.updatedAt }
+                return try await Task.detached(priority: .utility) {
+                    let used = try SpatialStorageDirectory.totalBytes(at: spatialCaptureDirectory)
+                    let attributes = try FileManager.default.attributesOfFileSystem(forPath: spatialCaptureDirectory.path)
+                    let available = (attributes[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
+                    return SpatialStorageOverview(usedBytes: used, availableBytes: available, places: places)
+                }.value
+            },
+            deletePlaceAction: { mapID in
+                try await lifecycle.performStorageMaintenance {
+                    await mapSelection.select(nil)
+                    await temporalMemoryService.reset()
+                    try await temporalJournalRepository.deleteMap(mapID: mapID)
+                    try await sceneGraphRepository.deleteMap(mapID: mapID)
+                    try await coordinateAlignmentRepository.deleteMap(mapID: mapID)
+                    try await placeMemoryRepository.deleteMap(mapID: mapID)
+                    // Keep the owning map discoverable until cleanup succeeds,
+                    // so an interrupted deletion remains retryable in settings.
+                    try await repository.deleteMap(mapID: mapID)
+                    perceptionController.resetPersistenceStatus()
+                    sessionController.resetPersistenceStatus()
+                }
+            },
+            selectPlaceAction: { mapID in
+                // Verify availability before interrupting the current capture.
+                guard try await repository.loadLatestValidCheckpoint(mapID: mapID) != nil else {
+                    throw SpatialDataStoreMaintenanceError.placeUnavailable
+                }
+                try await lifecycle.performStorageMaintenance {
+                    await temporalMemoryService.reset()
+                    await mapSelection.select(mapID)
+                }
+            }
+        ) {
             try await lifecycle.deleteSpatialData()
         }
         self.sessionController = sessionController
@@ -284,5 +354,25 @@ final class VispaceServices: ObservableObject {
         self.dataManagementController = dataManagementController
         self.lifecycle = lifecycle
         self.placementStreamBridge = placementStreamBridge
+        guidanceController.onTargetInvalidated = { [weak queryController] in
+            queryController?.invalidateForCaptureTransition()
+        }
+        var lastIdentity = sessionController.captureIdentity
+        sessionController.onCaptureIdentityChange = {
+            [weak queryController, weak relationQueryController, weak guidanceController,
+                weak navigationController, weak placementController] identity in
+            guard identity != lastIdentity else { return }
+            lastIdentity = identity
+            queryController?.invalidateForCaptureTransition()
+            relationQueryController?.invalidateForCaptureTransition()
+            guidanceController?.clear()
+            navigationController?.clearRoute()
+            placementController?.cancelCurrentEvaluation()
+        }
     }
+}
+
+private actor SpatialMapSelection {
+    private(set) var mapID: MapID?
+    func select(_ mapID: MapID?) { self.mapID = mapID }
 }

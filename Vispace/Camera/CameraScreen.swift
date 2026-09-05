@@ -75,7 +75,39 @@ struct CameraScreen: View {
                         showsDataManagement = true
                     }
                 )
-                if isPerceptionUnavailable {
+                if sessionController.persistenceFailureMessage != nil
+                    || perceptionController.persistenceFailureMessage != nil {
+                    VStack {
+                        Button {
+                            showsDataManagement = true
+                        } label: {
+                            Label(
+                                perceptionController.persistenceFailureMessage
+                                    ?? sessionController.persistenceFailureMessage
+                                    ?? String(localized: "storage.save.failed"),
+                                systemImage: "exclamationmark.triangle.fill"
+                            )
+                            .font(.callout)
+                            .padding(12)
+                            .frame(maxWidth: .infinity)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                        }
+                        .accessibilityIdentifier("vispace.storage.failure")
+                        Spacer(minLength: 0)
+                    }
+                    .padding(14)
+                } else if perceptionController.objectCapacityReached {
+                    VStack {
+                        Button { showsDataManagement = true } label: {
+                            Label("storage.objects.full", systemImage: "externaldrive.badge.exclamationmark")
+                                .font(.callout)
+                                .padding(12)
+                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(14)
+                } else if isPerceptionUnavailable {
                     VStack {
                         PerceptionUnavailableBanner()
                         Spacer(minLength: 0)
@@ -135,7 +167,8 @@ struct CameraScreen: View {
                 position: grounded.currentFramePosition,
                 confidenceGrade: grounded.confidenceGrade,
                 representsLastSeenLocation: isLastSeen,
-                resolvedAt: grounded.resolvedAt
+                resolvedAt: grounded.resolvedAt,
+                sourceMetadata: queryController.latestPresentation?.result.selectedCandidate?.record.metadata
             )
         else {
             guidanceController.clear()

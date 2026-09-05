@@ -1,6 +1,380 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "storage.restore.failed": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Saved space could not be restored. Existing files are preserved. Check storage and the app version, then reopen the app to retry." } },
+        "ko": { "stringUnit": { "state": "translated", "value": "저장된 공간을 불러오지 못했어요. 기존 파일은 보존됩니다. 저장 공간과 앱 버전을 확인한 뒤 앱을 다시 열어 주세요." } }
+      }
+    },
+    "storage.save.failed": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Spatial data could not be saved. Open storage settings, free some space and retry scanning."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "공간 정보를 저장하지 못했어요. 저장공간을 확인하고 정리한 뒤 다시 스캔해 주세요."
+        }
+      }
+    }
+  },
+  "storage.objects.full": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Object memory is full. Existing objects still update. Manage saved places to add new objects."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "물체 기록이 가득 찼어요. 기존 물체는 계속 갱신됩니다. 새 물체를 추가하려면 장소를 정리해 주세요."
+        }
+      }
+    }
+  },
+  "placement.dimensions.title": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Furniture dimensions"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "가구 실측 치수"
+        }
+      }
+    }
+  },
+  "placement.dimensions.metres": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Dimensions in metres"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "치수 입력 단위 m"
+        }
+      }
+    }
+  },
+  "placement.dimensions.detail": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Enter the actual product dimensions, between 0.1 and 10 metres. Initial values are examples."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "실제 제품의 치수를 0.1~10m 범위로 입력해 주세요. 처음 표시된 값은 예시입니다."
+        }
+      }
+    }
+  },
+  "placement.width": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Width"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "너비"
+        }
+      }
+    }
+  },
+  "placement.depth": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Depth"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "깊이"
+        }
+      }
+    }
+  },
+  "placement.height": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Height"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "높이"
+        }
+      }
+    }
+  },
+  "placement.evaluate": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Check placement"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "배치 확인"
+        }
+      }
+    }
+  },
+  "data.storage.usage": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Storage usage"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "저장공간 사용량"
+        }
+      }
+    }
+  },
+  "data.storage.used": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Used by Vispace"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Vispace 사용량"
+        }
+      }
+    }
+  },
+  "data.storage.available": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Device space available"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "기기 여유 공간"
+        }
+      }
+    }
+  },
+  "data.storage.budget": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Spatial storage is limited to 512 MB. Saving preserves at least 128 MB of device free space."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "공간 데이터는 최대 512MB로 관리하며, 저장 시 기기 여유 공간 128MB를 확보합니다."
+        }
+      }
+    }
+  },
+  "data.places.title": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Saved places"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "저장된 장소"
+        }
+      }
+    }
+  },
+  "data.place.delete": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Delete this place"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "이 장소 삭제"
+        }
+      }
+    }
+  },
+  "data.place.delete.detail": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "This removes the selected map, objects, history and related alignments. Other places remain available. Use Delete All to also remove unreadable recovery files."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "선택한 지도의 물체, 이력, 관련 좌표 연결을 함께 삭제합니다. 다른 장소는 유지합니다. 해석할 수 없는 복구 파일까지 지우려면 전체 삭제를 이용해 주세요."
+        }
+      }
+    }
+  },
+  "data.place.select": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Restore this place"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "이 장소 복원"
+        }
+      }
+    }
+  },
+  "data.place.select.failed": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "This place could not be restored. Check its saved data and try again."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "장소를 복원하지 못했어요. 저장된 데이터를 확인하고 다시 시도해 주세요."
+        }
+      }
+    }
+  },
+  "data.storage.read.failed": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Saved data could not be read. A newer app version may be required; keep the data until its version is checked."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "저장된 데이터를 읽지 못했어요. 더 최신 앱이 필요할 수 있으니 버전을 확인하기 전에는 데이터를 보존해 주세요."
+        }
+      }
+    }
+  },
+  "data.support.title": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Supported features"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "지원 범위"
+        }
+      }
+    }
+  },
+  "data.support.objects": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Detection supports model classes such as chairs, sofas, beds, desks, bottles and laptops. Keys and wallets are not supported."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "의자, 소파, 침대, 책상, 병, 노트북 등 모델에 포함된 종류를 인식합니다. 열쇠와 지갑은 지원하지 않습니다."
+        }
+      }
+    }
+  },
+  "data.support.device": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Saving new 3D objects requires verified depth. Placement and route guidance require LiDAR."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "새 3D 물체 저장에는 검증된 깊이 정보가 필요합니다. 배치와 경로 안내에는 LiDAR가 필요합니다."
+        }
+      }
+    }
+  },
+  "data.support.routes": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Guidance covers observed indoor floors only. Doors, steps, stairs and unseen areas can prevent a route. Keep checking your surroundings."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "관측한 실내 바닥에서 안내합니다. 문, 단차, 계단, 보이지 않는 구역에서는 경로가 제공되지 않을 수 있습니다. 주변을 직접 확인해 주세요."
+        }
+      }
+    }
+  },
     "command.empty" : {
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Enter an object or a placement question." } },
