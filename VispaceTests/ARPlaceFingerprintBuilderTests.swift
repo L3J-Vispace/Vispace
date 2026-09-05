@@ -5,6 +5,14 @@ import simd
 @testable import Vispace
 
 final class ARPlaceFingerprintBuilderTests: XCTestCase {
+    func testIncludesCameraVisualHistogramWhenProviderSuppliesIt() throws {
+        let visual = try NormalizedPlaceHistogram(values: Array(repeating: 1.0 / 16, count: 16))
+        let fingerprint = try ARPlaceFingerprintBuilder().makeFingerprint(
+            from: makeSnapshot(), objects: [], visualHistogram: visual
+        )
+        XCTAssertEqual(fingerprint.visualHistogram, visual)
+    }
+
     func testRejectsIncompleteSurfaceState() throws {
         let snapshot = makeSnapshot(isCurrentSessionData: false)
 

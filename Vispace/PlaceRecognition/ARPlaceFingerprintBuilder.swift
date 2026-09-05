@@ -19,7 +19,8 @@ public struct ARPlaceFingerprintBuilder: Sendable {
 
     public func makeFingerprint(
         from surfaces: ARSurfaceStateSnapshot,
-        objects: [SpatialObjectMetadata]
+        objects: [SpatialObjectMetadata],
+        visualHistogram: NormalizedPlaceHistogram? = nil
     ) throws -> PlaceFingerprint {
         guard surfaces.isComplete else {
             throw ARPlaceFingerprintBuilderError.incompleteSurfaceSnapshot
@@ -46,7 +47,7 @@ public struct ARPlaceFingerprintBuilder: Sendable {
 
         return try PlaceFingerprint(
             schema: .v1,
-            visualHistogram: nil,
+            visualHistogram: visualHistogram,
             geometryHistogram: geometry,
             structureHistogram: structure,
             objectLayoutHistogram: objectLayout,

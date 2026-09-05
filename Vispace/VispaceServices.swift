@@ -34,7 +34,7 @@ final class VispaceServices: ObservableObject {
         let coordinateAlignmentRepository = CoordinateAlignmentRepository(
             directoryURL: spatialCaptureDirectory
         )
-        let coordinateAlignmentResolver = PlaceCoordinateAlignmentResolver()
+        let placeVisualEvidence = ARPlaceVisualEvidenceProvider(directoryURL: spatialCaptureDirectory)
         let queryRepository = SpatialObjectQueryRepository(
             worldMapRepository: repository,
             coordinateAlignmentRepository: coordinateAlignmentRepository
@@ -112,6 +112,10 @@ final class VispaceServices: ObservableObject {
             metadataWriter: durableMetadataWriter,
             temporalMemoryProcessor: { batch, pose in
                 try await temporalMemoryService.process(batch, pose: pose)
+            },
+            observationSink: { frame, detections in
+                let objects = try await repository.metadataSnapshot().objects
+                try await placeVisualEvidence.ingest(frame: frame, detections: detections, objects: objects)
             }
         )
         let placeRecognitionController = PlaceRecognitionController(
@@ -122,6 +126,7 @@ final class VispaceServices: ObservableObject {
             catalogProvider: {
                 try await placeMemoryRepository.catalogSnapshot()
             },
+            visualHistogramProvider: { await placeVisualEvidence.visualHistogram(matching: $0) },
             fingerprintWriter: { record in
                 try await placeMemoryRepository.upsertFingerprint(record)
             },
@@ -135,7 +140,7 @@ final class VispaceServices: ObservableObject {
                 try await placeMemoryRepository.acknowledgeAssociationMutation(id: id, revision: revision)
             },
             coordinateCompatibilityProvider: { snapshot, candidate, objects in
-                coordinateAlignmentResolver.resolve(
+                try await placeVisualEvidence.resolve(
                     current: snapshot,
                     candidate: candidate,
                     objects: objects
@@ -335,6 +340,7 @@ final class VispaceServices: ObservableObject {
                 sessionController.setSurfaceSnapshotsEnabled(false)
                 await sessionController.prepareForSpatialDataDeletion()
                 await perceptionController.deactivateAndWaitForPendingWork()
+                await placeVisualEvidence.reset()
                 await placeRecognitionController.deactivateAndWaitForPendingWork()
             },
             deleteStore: {
@@ -371,6 +377,7 @@ final class VispaceServices: ObservableObject {
                     try await sceneGraphRepository.deleteMap(mapID: mapID)
                     try await coordinateAlignmentRepository.deleteMap(mapID: mapID)
                     try await placeMemoryRepository.deleteMap(mapID: mapID)
+                    try await placeVisualEvidence.deleteMap(mapID)
                     // Keep the owning map discoverable until cleanup succeeds,
                     // so an interrupted deletion remains retryable in settings.
                     try await repository.deleteMap(mapID: mapID)

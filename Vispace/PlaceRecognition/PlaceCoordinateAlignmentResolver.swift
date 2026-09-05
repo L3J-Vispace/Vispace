@@ -176,6 +176,41 @@ public struct PlaceCoordinateAlignmentResolver: Sendable {
         }
     }
 
+    /// Only the camera evidence provider calls this entry point after its
+    /// freshness, provenance, bidirectional appearance and ambiguity checks.
+    /// The geometric estimator still independently rejects degenerate or
+    /// inconsistent measurements before a transform can leave this boundary.
+    func resolve(
+        current snapshot: ARSurfaceStateSnapshot,
+        candidate: PlaceFingerprintRecord,
+        verifiedVisualCorrespondences: [CoordinateFrameAlignmentCorrespondence]
+    ) -> PlaceCoordinateAlignmentResolution {
+        let unresolved = unresolvedResolution(snapshot: snapshot, candidate: candidate)
+        guard snapshot.isComplete, let sourceMapID = snapshot.mapID,
+            sourceMapID != candidate.mapID
+        else { return unresolved }
+        if snapshot.coordinateFrameID == candidate.coordinateFrameID {
+            return resolve(current: snapshot, candidate: candidate, objects: [])
+        }
+        guard
+            verifiedVisualCorrespondences.allSatisfy({
+                $0.source.coordinateFrameID == snapshot.coordinateFrameID
+                    && $0.target.coordinateFrameID == candidate.coordinateFrameID
+            })
+        else { return unresolved }
+        do {
+            let alignment = try estimator.estimate(correspondences: verifiedVisualCorrespondences)
+            return try PlaceCoordinateAlignmentResolution(
+                sourceMapID: sourceMapID, targetMapID: candidate.mapID,
+                sourceCoordinateFrameID: snapshot.coordinateFrameID,
+                targetCoordinateFrameID: candidate.coordinateFrameID,
+                evidence: .aligned(
+                    sourceToCandidate: alignment.sourceToTarget, confidence: alignment.confidence),
+                validatedAlignment: alignment
+            )
+        } catch { return unresolved }
+    }
+
     private func unresolvedResolution(
         snapshot: ARSurfaceStateSnapshot,
         candidate: PlaceFingerprintRecord

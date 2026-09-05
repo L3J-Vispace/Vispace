@@ -85,6 +85,7 @@ public final class SpatialPerceptionController: ObservableObject {
         @Sendable (
             SpatialObjectMetadata
         ) async throws -> Void
+    public typealias ObservationSink = @Sendable (ARFrameSnapshot, [DetectedObject]) async throws -> Void
     public typealias MetadataProvider = @Sendable () async throws -> [SpatialObjectMetadata]
     public typealias ProcessingBudgetProvider = @MainActor () -> PerceptionProcessingBudget
     public typealias TemporalMemoryProcessor =
@@ -137,6 +138,7 @@ public final class SpatialPerceptionController: ObservableObject {
     private let confirmedIdentityProvider: ConfirmedIdentityProvider
     private let metadataWriter: MetadataWriter
     private let metadataProvider: MetadataProvider
+    private let observationSink: ObservationSink
     private let temporalMemoryProcessor: TemporalMemoryProcessor?
     private let admissionPolicy: FrameAdmissionPolicy
     private let promotionPolicy: ObjectObservationPromotionPolicy
@@ -190,7 +192,8 @@ public final class SpatialPerceptionController: ObservableObject {
         metadataProvider: @escaping MetadataProvider = { [] },
         metadataWriter: @escaping MetadataWriter,
         temporalMemoryProcessor: TemporalMemoryProcessor? = nil,
-        processingBudgetProvider: @escaping ProcessingBudgetProvider = { .current }
+        processingBudgetProvider: @escaping ProcessingBudgetProvider = { .current },
+        observationSink: @escaping ObservationSink = { _, _ in }
     ) {
         self.init(
             frameStreamProvider: { frames },
@@ -205,7 +208,8 @@ public final class SpatialPerceptionController: ObservableObject {
             metadataProvider: metadataProvider,
             metadataWriter: metadataWriter,
             temporalMemoryProcessor: temporalMemoryProcessor,
-            processingBudgetProvider: processingBudgetProvider
+            processingBudgetProvider: processingBudgetProvider,
+            observationSink: observationSink
         )
     }
 
@@ -224,7 +228,8 @@ public final class SpatialPerceptionController: ObservableObject {
         metadataProvider: @escaping MetadataProvider = { [] },
         metadataWriter: @escaping MetadataWriter,
         temporalMemoryProcessor: TemporalMemoryProcessor? = nil,
-        processingBudgetProvider: @escaping ProcessingBudgetProvider = { .current }
+        processingBudgetProvider: @escaping ProcessingBudgetProvider = { .current },
+        observationSink: @escaping ObservationSink = { _, _ in }
     ) {
         self.init(
             frameStreamProvider: frameStreamProvider,
@@ -239,7 +244,8 @@ public final class SpatialPerceptionController: ObservableObject {
             metadataProvider: metadataProvider,
             metadataWriter: metadataWriter,
             temporalMemoryProcessor: temporalMemoryProcessor,
-            processingBudgetProvider: processingBudgetProvider
+            processingBudgetProvider: processingBudgetProvider,
+            observationSink: observationSink
         )
     }
 
@@ -256,7 +262,8 @@ public final class SpatialPerceptionController: ObservableObject {
         metadataProvider: @escaping MetadataProvider,
         metadataWriter: @escaping MetadataWriter,
         temporalMemoryProcessor: TemporalMemoryProcessor?,
-        processingBudgetProvider: @escaping ProcessingBudgetProvider
+        processingBudgetProvider: @escaping ProcessingBudgetProvider,
+        observationSink: @escaping ObservationSink
     ) {
         self.frameStreamProvider = frameStreamProvider
         self.refreshStreamOnActivation = refreshStreamOnActivation
@@ -271,6 +278,7 @@ public final class SpatialPerceptionController: ObservableObject {
             : 0.8
         self.confirmedIdentityProvider = confirmedIdentityProvider
         self.metadataProvider = metadataProvider
+        self.observationSink = observationSink
         self.metadataWriter = metadataWriter
         self.processingBudgetProvider = processingBudgetProvider
         self.temporalMemoryProcessor = temporalMemoryProcessor
@@ -472,6 +480,11 @@ public final class SpatialPerceptionController: ObservableObject {
                     identity: identity,
                     generation: generation
                 )
+                try Task.checkCancellation()
+                guard generation == self.lifecycleGeneration,
+                    self.confirmedIdentityProvider(frame) == identity
+                else { return }
+                try await self.observationSink(frame, frameObservations.observations.map(\.detection))
             } catch is CancellationError {
                 // Lifecycle cancellation is expected and is already accounted
                 // for by the generation/token gate.

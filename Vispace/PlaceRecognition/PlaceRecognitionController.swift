@@ -95,6 +95,8 @@ public final class PlaceRecognitionController: ObservableObject {
         @MainActor @Sendable () -> AsyncStream<ARSurfaceStateSnapshot>
     public typealias ObjectMetadataProvider = @Sendable () async throws -> [SpatialObjectMetadata]
     public typealias CatalogProvider = @Sendable () async throws -> PlaceMemoryCatalogSnapshot
+    public typealias VisualHistogramProvider =
+        @Sendable (ARSurfaceStateSnapshot) async throws -> NormalizedPlaceHistogram?
     public typealias FingerprintWriter = @Sendable (PlaceFingerprintRecord) async throws -> Void
     public typealias AssociationWriter =
         @Sendable (
@@ -147,6 +149,7 @@ public final class PlaceRecognitionController: ObservableObject {
     private let refreshStreamOnActivation: Bool
     private let objectMetadataProvider: ObjectMetadataProvider
     private let catalogProvider: CatalogProvider
+    private let visualHistogramProvider: VisualHistogramProvider
     private let fingerprintWriter: FingerprintWriter
     private let associationWriter: AssociationWriter
     private let mutationAcknowledger: MutationAcknowledger
@@ -185,6 +188,7 @@ public final class PlaceRecognitionController: ObservableObject {
         associationPolicy: PlaceAssociationPolicy = .default,
         objectMetadataProvider: @escaping ObjectMetadataProvider,
         catalogProvider: @escaping CatalogProvider,
+        visualHistogramProvider: @escaping VisualHistogramProvider = { _ in nil },
         fingerprintWriter: @escaping FingerprintWriter,
         associationWriter: @escaping AssociationWriter,
         mutationAcknowledger: @escaping MutationAcknowledger = { _, _ in },
@@ -213,6 +217,7 @@ public final class PlaceRecognitionController: ObservableObject {
             associationPolicy: associationPolicy,
             objectMetadataProvider: objectMetadataProvider,
             catalogProvider: catalogProvider,
+            visualHistogramProvider: visualHistogramProvider,
             fingerprintWriter: fingerprintWriter,
             associationWriter: associationWriter,
             mutationAcknowledger: mutationAcknowledger,
@@ -232,6 +237,7 @@ public final class PlaceRecognitionController: ObservableObject {
         associationPolicy: PlaceAssociationPolicy = .default,
         objectMetadataProvider: @escaping ObjectMetadataProvider,
         catalogProvider: @escaping CatalogProvider,
+        visualHistogramProvider: @escaping VisualHistogramProvider = { _ in nil },
         fingerprintWriter: @escaping FingerprintWriter,
         associationWriter: @escaping AssociationWriter,
         mutationAcknowledger: @escaping MutationAcknowledger = { _, _ in },
@@ -260,6 +266,7 @@ public final class PlaceRecognitionController: ObservableObject {
             associationPolicy: associationPolicy,
             objectMetadataProvider: objectMetadataProvider,
             catalogProvider: catalogProvider,
+            visualHistogramProvider: visualHistogramProvider,
             fingerprintWriter: fingerprintWriter,
             associationWriter: associationWriter,
             mutationAcknowledger: mutationAcknowledger,
@@ -280,6 +287,7 @@ public final class PlaceRecognitionController: ObservableObject {
         associationPolicy: PlaceAssociationPolicy,
         objectMetadataProvider: @escaping ObjectMetadataProvider,
         catalogProvider: @escaping CatalogProvider,
+        visualHistogramProvider: @escaping VisualHistogramProvider = { _ in nil },
         fingerprintWriter: @escaping FingerprintWriter,
         associationWriter: @escaping AssociationWriter,
         mutationAcknowledger: @escaping MutationAcknowledger = { _, _ in },
@@ -297,6 +305,7 @@ public final class PlaceRecognitionController: ObservableObject {
         self.associationPolicy = associationPolicy
         self.objectMetadataProvider = objectMetadataProvider
         self.catalogProvider = catalogProvider
+        self.visualHistogramProvider = visualHistogramProvider
         self.fingerprintWriter = fingerprintWriter
         self.associationWriter = associationWriter
         self.mutationAcknowledger = mutationAcknowledger
@@ -447,9 +456,16 @@ public final class PlaceRecognitionController: ObservableObject {
                     return
                 }
 
+                let visualHistogram = try await self.visualHistogramProvider(snapshot)
+                try Task.checkCancellation()
+                guard self.isCurrent(snapshot, generation: generation) else {
+                    self.metrics.staleResultsRejected &+= 1
+                    return
+                }
                 let builder = self.builder
                 let fingerprint = try await Task.detached(priority: .utility) {
-                    try builder.makeFingerprint(from: snapshot, objects: objects)
+                    try builder.makeFingerprint(
+                        from: snapshot, objects: objects, visualHistogram: visualHistogram)
                 }.value
                 try Task.checkCancellation()
                 guard self.isCurrent(snapshot, generation: generation) else {
