@@ -303,6 +303,106 @@ final class TemporalSpatialMemoryServiceTests: XCTestCase {
         XCTAssertEqual(attemptsAfterClearedPending, 3)
     }
 
+    func testColdRecoveryReplaysWriterAfterObjectCommitBeforeDependentProjection() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(29)
+        let frameID = temporalTestFrameID(29)
+        let objectID = temporalTestObjectID(29)
+        let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)]
+        ))
+        let repository = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let service = makeService(repository: repository, store: store)
+        await store.failAfterNextWrites(1)
+        await assertThrowsServiceError({
+            try await service.process(
+                TemporalSpatialRecognitionBatch(
+                    sequence: 1,
+                    observations: [temporalTestNewObservation(
+                        mapID: mapID, coordinateFrameID: frameID, objectID: objectID, at: 100
+                    )],
+                    expectedVisibleObjectIDs: [objectID]
+                ),
+                pose: temporalTestPose(
+                    mapID: mapID, coordinateFrameID: frameID,
+                    capturedAt: 100, sessionTimestamp: 1, sequence: 1
+                )
+            )
+        }, equals: .committedJournalProjectionPending)
+        let durableBeforeRestart = await store.metadata(for: objectID)
+        XCTAssertNotNil(durableBeforeRestart)
+
+        // A fresh actor has lost the in-memory projectionPending flag.
+        let restarted = makeService(repository: repository, store: store)
+        let restored = try await restarted.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(restored.metadata(for: objectID), durableBeforeRestart)
+        let attemptsAfterRestart = await store.writeAttemptCount()
+        XCTAssertEqual(attemptsAfterRestart, 2)
+        _ = try await restarted.recover(mapID: mapID, coordinateFrameID: frameID)
+        let attemptsAfterCachedRecovery = await store.writeAttemptCount()
+        XCTAssertEqual(attemptsAfterCachedRecovery, 2)
+    }
+
+    func testResetDropsPreviouslySeededMapObjects() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(30)
+        let frameID = temporalTestFrameID(30)
+        let objectID = temporalTestObjectID(30)
+        let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)],
+            objects: [temporalTestMetadata(
+                mapID: mapID, coordinateFrameID: frameID, objectID: objectID, at: 100
+            )]
+        ))
+        let repository = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let service = makeService(repository: repository, store: store)
+        let before = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertNotNil(before.metadata(for: objectID))
+        await service.reset()
+        await store.clearObjects()
+        let after = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertTrue(after.objects.isEmpty)
+        XCTAssertEqual(after.revision, 0)
+        let writes = await store.writeAttemptCount()
+        XCTAssertEqual(writes, 0)
+    }
+
+    func testResetInvalidatesRecoverySuspendedInsideMetadataProvider() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(31)
+        let frameID = temporalTestFrameID(31)
+        let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)]
+        ))
+        let gate = TemporalMetadataReadGate()
+        let service = TemporalSpatialMemoryService(
+            journalRepository: TemporalSpatialMemoryJournalRepository(directoryURL: root),
+            metadataProvider: {
+                await gate.pause()
+                return try await store.snapshot()
+            },
+            metadataWriter: { try await store.upsert($0) }
+        )
+        let recovery = Task { try await service.recover(mapID: mapID, coordinateFrameID: frameID) }
+        for _ in 0..<100 {
+            if await gate.isWaiting { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let isWaiting = await gate.isWaiting
+        XCTAssertTrue(isWaiting)
+        await service.reset()
+        await gate.resume()
+        do {
+            _ = try await recovery.value
+            XCTFail("Reset must invalidate the suspended recovery")
+        } catch is CancellationError {
+            // Expected: old durable state must not be cached after a reset.
+        }
+    }
+
     func testExistingCheckpointMetadataSeedsFirstTemporalJournal() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -461,6 +561,20 @@ final class TemporalSpatialMemoryServiceTests: XCTestCase {
     }
 }
 
+private actor TemporalMetadataReadGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    var isWaiting: Bool { continuation != nil }
+
+    func pause() async {
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func resume() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 private actor TemporalMetadataStore {
     private var document: SpatialMetadataDocument
     private var shouldFailNextWrite = false
@@ -481,6 +595,10 @@ private actor TemporalMetadataStore {
 
     func allObjects() -> [SpatialObjectMetadata] {
         document.objects
+    }
+
+    func clearObjects() {
+        document.objects.removeAll()
     }
 
     func failNextWrite() {

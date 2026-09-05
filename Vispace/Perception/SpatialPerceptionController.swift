@@ -3,6 +3,32 @@ import Foundation
 import VispaceCore
 import simd
 
+public enum PerceptionProcessingBudget: Equatable, Sendable {
+    case normal
+    case lowPower
+    case thermallyConstrained
+    case pausedForThermalPressure
+
+    public static var current: Self {
+        switch ProcessInfo.processInfo.thermalState {
+        case .critical: return .pausedForThermalPressure
+        case .serious: return .thermallyConstrained
+        case .nominal, .fair:
+            return ProcessInfo.processInfo.isLowPowerModeEnabled ? .lowPower : .normal
+        @unknown default: return .thermallyConstrained
+        }
+    }
+
+    var minimumFrameInterval: TimeInterval {
+        switch self {
+        case .normal: 0
+        case .lowPower: 0.5
+        case .thermallyConstrained: 1
+        case .pausedForThermalPressure: .infinity
+        }
+    }
+}
+
 public enum SpatialPerceptionState: Equatable, Sendable {
     case inactive
     case unavailable(reason: String)
@@ -44,6 +70,7 @@ public final class SpatialPerceptionController: ObservableObject {
             SpatialObjectMetadata
         ) async throws -> Void
     public typealias MetadataProvider = @Sendable () async throws -> [SpatialObjectMetadata]
+    public typealias ProcessingBudgetProvider = @MainActor () -> PerceptionProcessingBudget
     public typealias TemporalMemoryProcessor =
         @Sendable (
             TemporalSpatialRecognitionBatch,
@@ -53,6 +80,10 @@ public final class SpatialPerceptionController: ObservableObject {
     @Published public private(set) var state: SpatialPerceptionState = .inactive
     @Published public private(set) var latestDetections: [DetectedObject] = []
     @Published public private(set) var metrics = SpatialPerceptionMetrics()
+    /// Persists across ordinary scanning state changes until a durable write succeeds.
+    @Published public private(set) var persistenceFailureMessage: String?
+    @Published public private(set) var objectCapacityReached = false
+    @Published public private(set) var processingBudget: PerceptionProcessingBudget = .normal
 
     public var isDetectorAvailable: Bool {
         detectorResolution.availability == .available
@@ -84,6 +115,8 @@ public final class SpatialPerceptionController: ObservableObject {
     private let detectorInterval: TimeInterval
     private let reidentificationResolver: PersistentObjectReidentificationResolver
     private let reidentificationContextBuilder: ObjectReidentificationContextBuilder
+    private let processingBudgetProvider: ProcessingBudgetProvider
+    private var lastResourceAcceptedTimestamp: TimeInterval?
 
     private var monitorTask: Task<Void, Never>?
     private var processingTask: Task<Void, Never>?
@@ -118,7 +151,8 @@ public final class SpatialPerceptionController: ObservableObject {
         confirmedIdentityProvider: @escaping ConfirmedIdentityProvider,
         metadataProvider: @escaping MetadataProvider = { [] },
         metadataWriter: @escaping MetadataWriter,
-        temporalMemoryProcessor: TemporalMemoryProcessor? = nil
+        temporalMemoryProcessor: TemporalMemoryProcessor? = nil,
+        processingBudgetProvider: @escaping ProcessingBudgetProvider = { .current }
     ) {
         self.init(
             frameStreamProvider: { frames },
@@ -132,7 +166,8 @@ public final class SpatialPerceptionController: ObservableObject {
             confirmedIdentityProvider: confirmedIdentityProvider,
             metadataProvider: metadataProvider,
             metadataWriter: metadataWriter,
-            temporalMemoryProcessor: temporalMemoryProcessor
+            temporalMemoryProcessor: temporalMemoryProcessor,
+            processingBudgetProvider: processingBudgetProvider
         )
     }
 
@@ -150,7 +185,8 @@ public final class SpatialPerceptionController: ObservableObject {
         confirmedIdentityProvider: @escaping ConfirmedIdentityProvider,
         metadataProvider: @escaping MetadataProvider = { [] },
         metadataWriter: @escaping MetadataWriter,
-        temporalMemoryProcessor: TemporalMemoryProcessor? = nil
+        temporalMemoryProcessor: TemporalMemoryProcessor? = nil,
+        processingBudgetProvider: @escaping ProcessingBudgetProvider = { .current }
     ) {
         self.init(
             frameStreamProvider: frameStreamProvider,
@@ -164,7 +200,8 @@ public final class SpatialPerceptionController: ObservableObject {
             confirmedIdentityProvider: confirmedIdentityProvider,
             metadataProvider: metadataProvider,
             metadataWriter: metadataWriter,
-            temporalMemoryProcessor: temporalMemoryProcessor
+            temporalMemoryProcessor: temporalMemoryProcessor,
+            processingBudgetProvider: processingBudgetProvider
         )
     }
 
@@ -180,7 +217,8 @@ public final class SpatialPerceptionController: ObservableObject {
         confirmedIdentityProvider: @escaping ConfirmedIdentityProvider,
         metadataProvider: @escaping MetadataProvider,
         metadataWriter: @escaping MetadataWriter,
-        temporalMemoryProcessor: TemporalMemoryProcessor?
+        temporalMemoryProcessor: TemporalMemoryProcessor?,
+        processingBudgetProvider: @escaping ProcessingBudgetProvider
     ) {
         self.frameStreamProvider = frameStreamProvider
         self.refreshStreamOnActivation = refreshStreamOnActivation
@@ -196,6 +234,7 @@ public final class SpatialPerceptionController: ObservableObject {
         self.confirmedIdentityProvider = confirmedIdentityProvider
         self.metadataProvider = metadataProvider
         self.metadataWriter = metadataWriter
+        self.processingBudgetProvider = processingBudgetProvider
         self.temporalMemoryProcessor = temporalMemoryProcessor
         reidentificationResolver = PersistentObjectReidentificationResolver()
         reidentificationContextBuilder = ObjectReidentificationContextBuilder()
@@ -260,6 +299,16 @@ public final class SpatialPerceptionController: ObservableObject {
     }
 
     private func offer(_ frame: ARFrameSnapshot) {
+        let nextBudget = processingBudgetProvider()
+        if nextBudget == .pausedForThermalPressure {
+            if processingBudget != .pausedForThermalPressure {
+                resetPipeline(incrementGeneration: true)
+            }
+            processingBudget = nextBudget
+            state = .unavailable(reason: "기기 온도가 높아 공간 인식을 잠시 쉬고 있습니다. 온도가 내려가면 자동으로 다시 시작합니다.")
+            return
+        }
+        processingBudget = nextBudget
         guard let identity = confirmedIdentityProvider(frame) else {
             state = .waitingForStableTracking
             return
@@ -270,6 +319,13 @@ public final class SpatialPerceptionController: ObservableObject {
             activeFrameToken = frame.pose.sessionToken
         }
         state = identity.mapID == nil ? .waitingForMap : .scanning
+
+        if let lastResourceAcceptedTimestamp,
+            frame.pose.timestamp - lastResourceAcceptedTimestamp
+                < nextBudget.minimumFrameInterval
+        {
+            return
+        }
 
         let frameID = FrameID(rawValue: frame.pose.id.rawValue)
         let descriptor: FrameDescriptor
@@ -312,6 +368,7 @@ public final class SpatialPerceptionController: ObservableObject {
         _ frame: ARFrameSnapshot,
         descriptor: FrameDescriptor
     ) {
+        lastResourceAcceptedTimestamp = frame.pose.timestamp
         let generation = lifecycleGeneration
         let taskID = UUID()
         metrics.framesStarted &+= 1
@@ -327,6 +384,9 @@ public final class SpatialPerceptionController: ObservableObject {
                 )
             }
             do {
+                guard self.processingBudgetProvider() != .pausedForThermalPressure else {
+                    return
+                }
                 let frameObservations = try await self.perceptionObservations(
                     in: frame,
                     generation: generation
@@ -553,11 +613,19 @@ public final class SpatialPerceptionController: ObservableObject {
             return
         }
 
-        try await metadataWriter(metadata)
+        do {
+            try await metadataWriter(metadata)
+        } catch {
+            if generation == lifecycleGeneration, !(error is CancellationError) {
+                recordPersistenceFailure(error)
+            }
+            throw error
+        }
         guard !Task.isCancelled, generation == lifecycleGeneration else {
             metrics.staleResultsRejected &+= 1
             return
         }
+        persistenceFailureMessage = nil
         persistedObjectIDs.insert(metadata.object.id)
         promotionEvidenceByObjectID.removeValue(forKey: promotedMetadata.object.id)
         if reusedPersistentIdentity {
@@ -635,7 +703,15 @@ public final class SpatialPerceptionController: ObservableObject {
                 observations: uniqueResolved.map(\.observation),
                 expectedVisibleObjectIDs: expectedVisibleObjectIDs.sorted()
             )
-            let result = try await temporalMemoryProcessor(batch, frame.pose)
+            let result: TemporalSpatialMemoryServiceResult
+            do {
+                result = try await temporalMemoryProcessor(batch, frame.pose)
+            } catch {
+                if generation == lifecycleGeneration, !(error is CancellationError) {
+                    recordPersistenceFailure(error)
+                }
+                throw error
+            }
             guard !Task.isCancelled, generation == lifecycleGeneration,
                 confirmedIdentityProvider(frame) == identity
             else {
@@ -643,8 +719,24 @@ public final class SpatialPerceptionController: ObservableObject {
                 return
             }
 
+            persistenceFailureMessage = nil
             lastTemporalSequenceNumber = sequence
+            let deferredObjectIDs: Set<ObjectID>
+            switch result {
+            case .applied(let delta):
+                deferredObjectIDs = delta.deferredObjectIDs
+                objectCapacityReached = !deferredObjectIDs.isEmpty
+            case .alreadyProcessed(let snapshot):
+                deferredObjectIDs = Set(uniqueResolved.compactMap { value in
+                    snapshot.metadata(for: value.observation.metadata.object.id) == nil
+                        ? value.observation.metadata.object.id : nil
+                })
+                objectCapacityReached = !deferredObjectIDs.isEmpty
+            }
             for value in uniqueResolved {
+                guard !deferredObjectIDs.contains(value.observation.metadata.object.id) else {
+                    continue
+                }
                 if value.establishesIdentity {
                     temporalIdentityByPromotedObjectID[value.promotedObjectID] =
                         value.identityResolution
@@ -667,6 +759,27 @@ public final class SpatialPerceptionController: ObservableObject {
                 state = .failed(message: String(describing: error))
             }
         }
+    }
+
+    /// Clears a storage warning after the user has erased local data.
+    public func resetPersistenceStatus() {
+        persistenceFailureMessage = nil
+        objectCapacityReached = false
+    }
+
+    private func recordPersistenceFailure(_ error: any Error) {
+        if let temporalError = error as? TemporalSpatialMemoryError {
+            switch temporalError {
+            case .outOfOrderTimestamp, .outOfOrderSequence:
+                persistenceFailureMessage =
+                    "기기의 날짜 또는 시간이 이전 기록보다 과거로 변경되어 저장을 멈췄습니다. 설정에서 날짜 및 시간의 자동 설정을 켠 뒤 앱을 다시 열어 주세요. 기존 기록은 보존됩니다."
+                return
+            default:
+                break
+            }
+        }
+        persistenceFailureMessage =
+            "공간 기록을 저장하지 못했습니다. 기기의 저장 공간과 잠금 상태를 확인해 주세요. 다음 관측에서 다시 시도합니다."
     }
 
     private func resolveTemporalObservation(
@@ -1243,6 +1356,7 @@ public final class SpatialPerceptionController: ObservableObject {
         activeFrameToken = nil
         activeTracks.removeAll(keepingCapacity: false)
         lastDetectorTimestamp = nil
+        lastResourceAcceptedTimestamp = nil
     }
 
     private func cancelProcessingTasks() {

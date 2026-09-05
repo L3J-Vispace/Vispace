@@ -4,6 +4,34 @@ import XCTest
 @testable import Vispace
 
 final class ObjectReidentificationContextBuilderTests: XCTestCase {
+    func testUnrelatedLandmarksDoNotConsumeIdentityCandidateBudget() throws {
+        let mapID = MapID()
+        let frameID = CoordinateFrameID()
+        let incoming = try metadata(
+            id: ObjectID(), label: "chair", position: .zero, mapID: mapID, frameID: frameID
+        )
+        let candidate = try metadata(
+            id: ObjectID(), label: "chair", position: Vec3(x: 0.02, y: 0, z: 0),
+            mapID: mapID, frameID: frameID
+        )
+        let landmarks = try (0..<200).map { index in
+            try metadata(
+                id: ObjectID(), label: "table", position: Vec3(x: 1 + Double(index), y: 0, z: 0),
+                mapID: mapID, frameID: frameID
+            )
+        }
+        let bundle = try ObjectReidentificationContextBuilder().makeContexts(
+            for: incoming, existingObjects: landmarks + [candidate]
+        )
+        XCTAssertEqual(bundle.eligibleExistingObjects.map(\.object.id), [candidate.object.id])
+        XCTAssertEqual(bundle.candidates.count, 1)
+        XCTAssertFalse(bundle.incoming.features.isEmpty)
+        XCTAssertLessThanOrEqual(
+            bundle.incoming.features.count,
+            ObjectReidentificationSpatialContext.maximumFeatureCount
+        )
+    }
+
     func testSameClassCandidateCannotActAsItsOwnContextEvidence() throws {
         let mapID = MapID()
         let frameID = CoordinateFrameID()

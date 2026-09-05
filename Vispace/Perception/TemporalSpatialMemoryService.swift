@@ -64,6 +64,7 @@ public actor TemporalSpatialMemoryService {
     private let policy: TemporalSpatialMemoryPolicy
     private var coordinators: [MapFrameKey: TemporalSpatialMemoryCoordinator] = [:]
     private var projectionPending: Set<MapFrameKey> = []
+    private var resetGeneration: UInt64 = 0
 
     public init(
         checkpointRepository: WorldMapCheckpointRepository,
@@ -99,11 +100,13 @@ public actor TemporalSpatialMemoryService {
         mapID: MapID,
         coordinateFrameID: CoordinateFrameID
     ) async throws -> TemporalSpatialMemorySnapshot {
+        let generation = resetGeneration
         let key = MapFrameKey(mapID: mapID, coordinateFrameID: coordinateFrameID)
         let document = try await validatedMetadataDocument(
             mapID: mapID,
             coordinateFrameID: coordinateFrameID
         )
+        try validateGeneration(generation)
         let durableObjects = objects(
             in: document,
             mapID: mapID,
@@ -116,8 +119,9 @@ public actor TemporalSpatialMemoryService {
                 try await reconcile(
                     snapshot: cached.snapshot,
                     durableObjects: durableObjects,
-                    forceProjection: true
+                    generation: generation
                 )
+                try validateGeneration(generation)
                 projectionPending.remove(key)
             }
             return cached.snapshot
@@ -128,6 +132,7 @@ public actor TemporalSpatialMemoryService {
             mapID: mapID,
             coordinateFrameID: coordinateFrameID
         ) {
+            try validateGeneration(generation)
             guard recovery.policy == policy else {
                 throw TemporalSpatialMemoryServiceError.journalPolicyMismatch(mapID)
             }
@@ -137,7 +142,8 @@ public actor TemporalSpatialMemoryService {
             )
             try await reconcile(
                 snapshot: recovery.snapshot,
-                durableObjects: durableObjects
+                durableObjects: durableObjects,
+                generation: generation
             )
         } else {
             coordinator = try TemporalSpatialMemoryCoordinator(
@@ -147,6 +153,7 @@ public actor TemporalSpatialMemoryService {
                 policy: policy
             )
         }
+        try validateGeneration(generation)
         coordinators[key] = coordinator
         projectionPending.remove(key)
         return coordinator.snapshot
@@ -157,6 +164,7 @@ public actor TemporalSpatialMemoryService {
         _ batch: TemporalSpatialRecognitionBatch,
         pose: ARPoseSnapshot
     ) async throws -> TemporalSpatialMemoryServiceResult {
+        let generation = resetGeneration
         try Task.checkCancellation()
         let (mapID, mappingQuality) = try validatedPoseIdentity(pose)
         let key = MapFrameKey(
@@ -167,6 +175,7 @@ public actor TemporalSpatialMemoryService {
             mapID: mapID,
             coordinateFrameID: pose.coordinateFrameID
         )
+        try validateGeneration(generation)
         guard let current = coordinators[key] else {
             throw TemporalSpatialMemoryServiceError.missingMappedIdentity
         }
@@ -212,6 +221,7 @@ public actor TemporalSpatialMemoryService {
             previousSnapshot: current.snapshot,
             resultingSnapshot: next.snapshot
         )
+        try validateGeneration(generation)
         switch appendResult {
         case .appended:
             coordinators[key] = next
@@ -228,14 +238,32 @@ public actor TemporalSpatialMemoryService {
         do {
             try await project(
                 snapshot: next.snapshot,
-                objectIDs: objectIDs(in: delta.spatialDelta.events)
+                objectIDs: objectIDs(in: delta.spatialDelta.events),
+                generation: generation
             )
+            try validateGeneration(generation)
             projectionPending.remove(key)
         } catch {
+            try validateGeneration(generation)
             projectionPending.insert(key)
             throw TemporalSpatialMemoryServiceError.committedJournalProjectionPending
         }
         return .applied(delta)
+    }
+
+    /// Call after ingestion has stopped and before deleting durable storage.
+    /// In-flight recovery cannot repopulate an erased map's in-memory state.
+    public func reset() {
+        resetGeneration &+= 1
+        coordinators.removeAll()
+        projectionPending.removeAll()
+    }
+
+    private func validateGeneration(_ generation: UInt64) throws {
+        try Task.checkCancellation()
+        guard generation == resetGeneration else {
+            throw CancellationError()
+        }
     }
 
     private func validatedPoseIdentity(
@@ -305,7 +333,7 @@ public actor TemporalSpatialMemoryService {
     private func reconcile(
         snapshot: TemporalSpatialMemorySnapshot,
         durableObjects: [SpatialObjectMetadata],
-        forceProjection: Bool = false
+        generation: UInt64
     ) async throws {
         let durableByID = Dictionary(
             uniqueKeysWithValues: durableObjects.map { ($0.object.id, $0) }
@@ -314,11 +342,7 @@ public actor TemporalSpatialMemoryService {
             $0.key < $1.key
         }) {
             if let durable = durableByID[objectID] {
-                if durable == journalMetadata {
-                    if !forceProjection {
-                        continue
-                    }
-                } else {
+                if durable != journalMetadata {
                     guard
                         journalMetadata.object.stateUpdatedAt
                             > durable.object.stateUpdatedAt
@@ -329,8 +353,12 @@ public actor TemporalSpatialMemoryService {
                     }
                 }
             }
-            try Task.checkCancellation()
+            // Equal object metadata does not prove that downstream projections
+            // (such as scene relations) committed before a process interruption.
+            // Reapply the complete idempotent writer on every cold recovery.
+            try validateGeneration(generation)
             try await metadataWriter(journalMetadata)
+            try validateGeneration(generation)
         }
         let journalIDs = Set(snapshot.objects.keys)
         if let untracked = durableObjects.lazy
@@ -345,13 +373,16 @@ public actor TemporalSpatialMemoryService {
 
     private func project(
         snapshot: TemporalSpatialMemorySnapshot,
-        objectIDs: Set<ObjectID>
+        objectIDs: Set<ObjectID>,
+        generation: UInt64
     ) async throws {
         for objectID in objectIDs.sorted() {
+            try validateGeneration(generation)
             guard let metadata = snapshot.metadata(for: objectID) else {
                 continue
             }
             try await metadataWriter(metadata)
+            try validateGeneration(generation)
         }
     }
 

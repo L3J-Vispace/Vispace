@@ -71,7 +71,9 @@ struct ObjectReidentificationContextBuilder: Sendable {
         return ObjectReidentificationContextBundle(
             incoming: incoming,
             candidates: candidateContexts,
-            eligibleExistingObjects: eligible
+            // Landmarks contribute context but do not consume the matcher's
+            // bounded identity-candidate budget in a densely remembered map.
+            eligibleExistingObjects: candidates
         )
     }
 

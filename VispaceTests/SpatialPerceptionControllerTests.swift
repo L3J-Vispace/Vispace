@@ -7,6 +7,56 @@ import simd
 
 @MainActor
 final class SpatialPerceptionControllerTests: XCTestCase {
+    func testResourceBudgetThrottlesInferencePausesAtCriticalAndRecovers() async throws {
+        let channel = LatestValueChannel<ARFrameSnapshot>()
+        let detector = RecordingObjectDetector()
+        let identity = ARCaptureIdentity(mapID: MapID(), status: .confirmed)
+        let budget = ProcessingBudgetBox(.lowPower)
+        let controller = SpatialPerceptionController(
+            frames: channel.stream,
+            detectorResolution: ObjectDetectorResolution(detector: detector, availability: .available),
+            detectorInterval: 0.1,
+            confirmedIdentityProvider: { _ in identity },
+            metadataWriter: { _ in },
+            processingBudgetProvider: { budget.value }
+        )
+        controller.activate()
+        defer { controller.deactivate() }
+        let baseTime = Date().timeIntervalSince1970
+        let baseUptime = ProcessInfo.processInfo.systemUptime
+        func offer(at offset: Double) async throws {
+            channel.send(try makeSnapshot(
+                identity: identity, runGeneration: 1,
+                capturedAt: baseTime + offset, timestamp: baseUptime + offset
+            ))
+            try await Task.sleep(for: .milliseconds(25))
+            try await waitForIdle(controller)
+        }
+
+        try await offer(at: 0)
+        try await waitForDetector(detector, expectedCount: 1)
+        try await offer(at: 0.2)
+        XCTAssertEqual(controller.metrics.framesStarted, 1)
+        try await offer(at: 0.6)
+        try await waitForDetector(detector, expectedCount: 2)
+        budget.value = .thermallyConstrained
+        try await offer(at: 1.2)
+        XCTAssertEqual(controller.metrics.framesStarted, 2)
+        try await offer(at: 1.7)
+        try await waitForDetector(detector, expectedCount: 3)
+
+        budget.value = .pausedForThermalPressure
+        try await offer(at: 3)
+        XCTAssertEqual(controller.processingBudget, .pausedForThermalPressure)
+        XCTAssertEqual(controller.metrics.framesStarted, 3)
+        XCTAssertEqual(controller.bufferedFrameCountForTesting, 0)
+        budget.value = .normal
+        try await offer(at: 3.2)
+        try await waitForDetector(detector, expectedCount: 4)
+        XCTAssertEqual(controller.processingBudget, .normal)
+        XCTAssertEqual(controller.state, .scanning)
+    }
+
     func testNewCadenceArrivalReleasesSupersededCameraBuffer() async throws {
         let channel = LatestValueChannel<ARFrameSnapshot>()
         let detector = RecordingObjectDetector()
@@ -202,6 +252,7 @@ final class SpatialPerceptionControllerTests: XCTestCase {
         let successfulBeforeRetry = await writer.successfulMetadata()
         XCTAssertEqual(failedAttemptCount, 1)
         XCTAssertTrue(successfulBeforeRetry.isEmpty)
+        XCTAssertNotNil(controller.persistenceFailureMessage)
 
         channel.send(
             try makeSnapshot(
@@ -221,6 +272,7 @@ final class SpatialPerceptionControllerTests: XCTestCase {
         XCTAssertEqual(Set(attemptedIDs).count, 1)
         XCTAssertEqual(stored.map(\.object.id), [attemptedIDs[0]])
         XCTAssertEqual(controller.metrics.promotedObjects, 1)
+        XCTAssertNil(controller.persistenceFailureMessage)
         controller.deactivate()
     }
 
@@ -639,6 +691,12 @@ private actor RecordingMetadataWriter {
     func successfulMetadata() -> [SpatialObjectMetadata] {
         successful
     }
+}
+
+@MainActor
+private final class ProcessingBudgetBox {
+    var value: PerceptionProcessingBudget
+    init(_ value: PerceptionProcessingBudget) { self.value = value }
 }
 
 private actor RecordingObjectTracker: ObjectTracking {

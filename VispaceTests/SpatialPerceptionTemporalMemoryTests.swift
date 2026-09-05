@@ -7,6 +7,104 @@ import simd
 
 @MainActor
 final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
+    func testClockRollbackWarningSurvivesAFrameWithoutAStorageAttempt() async throws {
+        let channel = LatestValueChannel<ARFrameSnapshot>()
+        let detector = TemporalSequenceObjectDetector(
+            outputs: [[temporalDetection()], [temporalDetection()], [temporalDetection()], []]
+        )
+        let identity = ARCaptureIdentity(
+            coordinateFrameID: temporalTestFrameID(81), segmentID: CaptureSegmentID(),
+            mapID: temporalTestMapID(81), status: .confirmed
+        )
+        let controller = SpatialPerceptionController(
+            frames: channel.stream,
+            detectorResolution: ObjectDetectorResolution(detector: detector, availability: .available),
+            detectorInterval: 0.1,
+            confirmedIdentityProvider: { _ in identity }, metadataWriter: { _ in },
+            temporalMemoryProcessor: { _, pose in
+                throw TemporalSpatialMemoryError.outOfOrderTimestamp(
+                    previous: pose.capturedAt + 3_600, incoming: pose.capturedAt
+                )
+            },
+            processingBudgetProvider: { .normal }
+        )
+        controller.activate()
+        defer { controller.deactivate() }
+        let baseTime = Date().timeIntervalSince1970
+        let baseUptime = ProcessInfo.processInfo.systemUptime
+        for index in 0..<4 {
+            channel.send(try temporalSnapshot(
+                identity: identity, capturedAt: baseTime + Double(index) * 0.2,
+                timestamp: baseUptime + Double(index) * 0.2, includesDepth: true
+            ))
+            try await waitForTemporalDetector(detector, expectedCount: index + 1)
+            try await waitForTemporalIdle(controller)
+            if index >= 2 {
+                XCTAssertTrue(controller.persistenceFailureMessage?.contains("자동 설정") == true)
+                XCTAssertEqual(controller.metrics.promotedObjects, 0)
+            }
+        }
+        XCTAssertEqual(controller.state, .scanning)
+        controller.resetPersistenceStatus()
+        XCTAssertNil(controller.persistenceFailureMessage)
+    }
+
+    func testDeferredNewIdentityIsNotMarkedPersistedAndRetriesWithoutIdentityConflict() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "vispace-capacity-pipeline-\(UUID().uuidString)", isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(82)
+        let frameID = temporalTestFrameID(82)
+        let identity = ARCaptureIdentity(
+            coordinateFrameID: frameID, segmentID: CaptureSegmentID(),
+            mapID: mapID, status: .confirmed
+        )
+        let existing = temporalTestMetadata(
+            mapID: mapID, coordinateFrameID: frameID, objectID: temporalTestObjectID(82),
+            at: 100, position: temporalTestPosition(10)
+        )
+        let store = TemporalControllerMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)],
+            objects: [existing]
+        ))
+        let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let service = TemporalSpatialMemoryService(
+            journalRepository: journal,
+            policy: try TemporalSpatialMemoryPolicy(maximumObjectCount: 1),
+            metadataProvider: { await store.snapshot() },
+            metadataWriter: { await store.upsert($0) }
+        )
+        let channel = LatestValueChannel<ARFrameSnapshot>()
+        let detector = TemporalSequenceObjectDetector(outputs: Array(repeating: [temporalDetection()], count: 4))
+        let controller = SpatialPerceptionController(
+            frames: channel.stream,
+            detectorResolution: ObjectDetectorResolution(detector: detector, availability: .available),
+            detectorInterval: 0.1, confirmedIdentityProvider: { _ in identity },
+            metadataProvider: { await store.objects() }, metadataWriter: { _ in },
+            temporalMemoryProcessor: { try await service.process($0, pose: $1) },
+            processingBudgetProvider: { .normal }
+        )
+        controller.activate()
+        defer { controller.deactivate() }
+        let baseTime = Date().timeIntervalSince1970
+        let baseUptime = ProcessInfo.processInfo.systemUptime
+        for index in 0..<4 {
+            channel.send(try temporalSnapshot(
+                identity: identity, capturedAt: baseTime + Double(index) * 0.2,
+                timestamp: baseUptime + Double(index) * 0.2, includesDepth: true
+            ))
+            try await waitForTemporalDetector(detector, expectedCount: index + 1)
+            try await waitForTemporalIdle(controller)
+        }
+        let restored = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(restored.objects.count, 1)
+        XCTAssertEqual(restored.revision, 2)
+        XCTAssertEqual(controller.metrics.promotedObjects, 0)
+        XCTAssertTrue(controller.objectCapacityReached)
+        XCTAssertNil(controller.persistenceFailureMessage)
+    }
+
     func testControllerProcessorSeamCommitsThroughTemporalServiceAndJournal()
         async throws
     {
