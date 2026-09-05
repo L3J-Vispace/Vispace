@@ -1068,17 +1068,210 @@ final class FurniturePlacementControllerTests: XCTestCase {
         )
     }
 
+    func testUnrelatedAnchorUpdateCannotRefreshOldFloorOrMeshEvidence() throws {
+        let context = spatialContext()
+        let currentPose = pose(mapID: context.mapID, frameID: context.frameID,
+            segmentID: context.segmentID, timestamp: 1_000)
+        let candidate = try framedPosition(frameID: context.frameID, value: .zero)
+        let anchorIDs = Array(context.surface.planes.keys) + Array(context.surface.meshes.keys)
+        let freshTimes = Dictionary(uniqueKeysWithValues: anchorIDs.map { ($0, 1_000.0) })
+        func snapshot(_ observedAt: [UUID: TimeInterval]) -> ARSurfaceStateSnapshot {
+            ARSurfaceStateSnapshot(coordinateFrameID: context.frameID, segmentID: context.segmentID,
+                mapID: context.mapID, coordinateFrameStatus: .confirmed, revision: 2, timestamp: 1_000,
+                planes: context.surface.planes, meshes: context.surface.meshes,
+                unresolvedFailures: [], isCurrentSessionData: true, anchorObservedAt: observedAt)
+        }
+        for oldAnchor in anchorIDs {
+            var observedAt = freshTimes
+            observedAt[oldAnchor] = 10
+            XCTAssertEqual(try unwrapIssue(builder().build(kind: .sofa, candidatePosition: candidate,
+                surface: snapshot(observedAt), pose: currentPose, capabilities: fullCapabilities(), objects: [])),
+                .surfaceSnapshotStale)
+            observedAt[oldAnchor] = nil
+            XCTAssertEqual(try unwrapIssue(builder().build(kind: .sofa, candidatePosition: candidate,
+                surface: snapshot(observedAt), pose: currentPose, capabilities: fullCapabilities(), objects: [])),
+                .surfaceSnapshotStale)
+        }
+        let prepared = try unwrapReady(builder().build(kind: .sofa, candidatePosition: candidate,
+            surface: snapshot(freshTimes), pose: currentPose, capabilities: fullCapabilities(), objects: []))
+        XCTAssertEqual(FurniturePlacementEvaluator().evaluate(candidate: prepared.candidate,
+            evidence: prepared.evidence).disposition, .feasible)
+    }
+
+    func testDelayedMetadataCannotPublishAfterMonotonicRequestDeadline() async throws {
+        let context = spatialContext()
+        let candidate = try framedPosition(frameID: context.frameID, value: .zero)
+        let metadata = SuspendedPlacementMetadataProvider()
+        let clock = PlacementTestClock()
+        let capabilities = fullCapabilities()
+        let controller = FurniturePlacementController(candidatePositionProvider: { _ in candidate },
+            objectMetadataProvider: { try await metadata.load() }, capabilitiesProvider: { capabilities },
+            evidenceBuilder: builder(), monotonicNow: { clock.uptime })
+        do {
+            controller.update(pose: context.pose)
+            controller.update(surface: context.surface)
+            controller.evaluate(.sofa)
+            for _ in 0..<250 {
+                if await metadata.isWaiting { break }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            let isWaiting = await metadata.isWaiting
+            XCTAssertTrue(isWaiting)
+            clock.uptime = 3
+            await metadata.resume()
+            try await waitForIdle(controller)
+            XCTAssertNil(controller.latestRecommendedPlacement)
+            XCTAssertNil(controller.latestPresentation)
+            XCTAssertEqual(controller.metrics.recommendationsPublished, 0)
+            XCTAssertGreaterThan(controller.metrics.staleResultsRejected, 0)
+        } catch {
+            await metadata.resumeAll()
+            await controller.cancelCurrentEvaluationAndWait()
+            throw error
+        }
+        await metadata.resumeAll()
+        await controller.cancelCurrentEvaluationAndWait()
+    }
+
+    func testPoseOnlyProgressRevokesExpiredRecommendationAndPreventsReplay() async throws {
+        let context = spatialContext()
+        let candidate = try framedPosition(frameID: context.frameID, value: .zero)
+        let clock = PlacementTestClock()
+        let controller = makeController(candidate: candidate, maximumRecommendationAge: 120,
+            monotonicNow: { clock.uptime })
+        controller.update(pose: context.pose)
+        controller.update(surface: context.surface)
+        controller.evaluate(.sofa)
+        try await waitForIdle(controller)
+        XCTAssertNotNil(controller.latestRecommendedPlacement)
+        controller.update(pose: pose(mapID: context.mapID, frameID: context.frameID,
+            segmentID: context.segmentID, timestamp: 71, capturedAt: 161))
+        XCTAssertNil(controller.latestRecommendedPlacement)
+        XCTAssertNil(controller.latestPresentation)
+        XCTAssertEqual(controller.state, .idle)
+        controller.evaluate(.sofa)
+        XCTAssertEqual(controller.latestPresentation?.issue, .surfaceSnapshotStale)
+        XCTAssertNil(controller.latestRecommendedPlacement)
+    }
+
+    func testPublishedRecommendationExpiresWithoutFurtherSnapshots() async throws {
+        let context = spatialContext()
+        let candidate = try framedPosition(frameID: context.frameID, value: .zero)
+        let controller = makeController(candidate: candidate, maximumRecommendationAge: 0.1)
+        controller.update(pose: context.pose)
+        controller.update(surface: context.surface)
+        controller.evaluate(.sofa)
+        try await waitForIdle(controller)
+        XCTAssertNotNil(controller.latestRecommendedPlacement)
+        for _ in 0..<250 where controller.latestRecommendedPlacement != nil {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertNil(controller.latestRecommendedPlacement)
+        XCTAssertNil(controller.latestPresentation)
+        XCTAssertEqual(controller.state, .idle)
+    }
+
+    func testPublishingCannotRenewOldestSurfaceObservationBudget() async throws {
+        let context = spatialContext()
+        let candidate = try framedPosition(frameID: context.frameID, value: .zero)
+        let clock = PlacementTestClock()
+        let timer = SuspendedPlacementExpiration()
+        let controller = makeController(candidate: candidate, monotonicNow: { clock.uptime },
+            expirationSleeper: { try await timer.wait(seconds: $0) })
+        do {
+            controller.update(pose: pose(mapID: context.mapID, frameID: context.frameID,
+                segmentID: context.segmentID, timestamp: 69))
+            controller.update(surface: context.surface) // Observed at 10; expires at 70.
+            controller.evaluate(.sofa)
+            try await waitForIdle(controller)
+            try await waitForExpirationCount(timer, 2)
+            XCTAssertNotNil(controller.latestRecommendedPlacement)
+            let durations = await timer.durations
+            XCTAssertEqual(durations.count, 2)
+            XCTAssertTrue(durations.allSatisfy { abs($0 - 1) < 0.000_001 })
+            await timer.resume(index: 0) // Canceled request timer must not revoke its published lease.
+            for _ in 0..<25 { await Task.yield() }
+            XCTAssertNotNil(controller.latestRecommendedPlacement)
+            await timer.resume(index: 1)
+            for _ in 0..<250 where controller.latestRecommendedPlacement != nil {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertNil(controller.latestRecommendedPlacement)
+        } catch {
+            await timer.resumeAll()
+            await controller.cancelCurrentEvaluationAndWait()
+            throw error
+        }
+        await timer.resumeAll()
+        await controller.cancelCurrentEvaluationAndWait()
+    }
+
+    func testCanceledLeaseCannotRevokeRecommendationFromNextSessionRun() async throws {
+        let context = spatialContext()
+        let candidate = try framedPosition(frameID: context.frameID, value: .zero)
+        let clock = PlacementTestClock()
+        let timer = SuspendedPlacementExpiration()
+        let controller = makeController(candidate: candidate, monotonicNow: { clock.uptime },
+            expirationSleeper: { try await timer.wait(seconds: $0) })
+        do {
+            controller.update(pose: context.pose)
+            controller.update(surface: context.surface)
+            controller.evaluate(.sofa)
+            try await waitForIdle(controller)
+            try await waitForExpirationCount(timer, 2)
+            controller.cancelCurrentEvaluation()
+            controller.update(pose: pose(mapID: context.mapID, frameID: context.frameID,
+                segmentID: context.segmentID, timestamp: 11, runGeneration: 2))
+            controller.evaluate(.desk)
+            try await waitForIdle(controller)
+            try await waitForExpirationCount(timer, 4)
+            XCTAssertEqual(controller.latestRecommendedPlacement?.kind, .desk)
+            // A noncooperative sleeper returns after cancellation. Neither the old
+            // request nor the canceled pre-publication timer may touch this result.
+            for index in 0..<3 { await timer.resume(index: index) }
+            for _ in 0..<25 { await Task.yield() }
+            XCTAssertEqual(controller.latestRecommendedPlacement?.kind, .desk)
+            await timer.resume(index: 3)
+            for _ in 0..<250 where controller.latestRecommendedPlacement != nil {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertNil(controller.latestRecommendedPlacement)
+            XCTAssertNil(controller.latestPresentation)
+        } catch {
+            await timer.resumeAll()
+            await controller.cancelCurrentEvaluationAndWait()
+            throw error
+        }
+        await timer.resumeAll()
+        await controller.cancelCurrentEvaluationAndWait()
+    }
+
+    private func waitForExpirationCount(_ timer: SuspendedPlacementExpiration, _ expected: Int) async throws {
+        for _ in 0..<250 {
+            if await timer.count == expected { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("Expected \(expected) scheduled expiration waits")
+        throw TestFailure.expirationNotScheduled
+    }
+
     private func makeController(
         candidate: FramedPosition?,
         objects: [SpatialObjectMetadata] = [],
-        capabilities: ARCaptureCapabilities? = nil
+        capabilities: ARCaptureCapabilities? = nil,
+        maximumRecommendationAge: TimeInterval = 30,
+        monotonicNow: @escaping @MainActor @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        expirationSleeper: @escaping @Sendable (TimeInterval) async throws -> Void = {
+            try await Task.sleep(for: .seconds($0))
+        }
     ) -> FurniturePlacementController {
         let resolvedCapabilities = capabilities ?? fullCapabilities()
         return FurniturePlacementController(
             candidatePositionProvider: { _ in candidate },
             objectMetadataProvider: { objects },
             capabilitiesProvider: { resolvedCapabilities },
-            evidenceBuilder: builder()
+            evidenceBuilder: builder(), maximumRecommendationAge: maximumRecommendationAge,
+            monotonicNow: monotonicNow, expirationSleeper: expirationSleeper
         )
     }
 
@@ -1133,7 +1326,9 @@ final class FurniturePlacementControllerTests: XCTestCase {
             planes: planes,
             meshes: [resolvedMesh.anchorID: resolvedMesh],
             unresolvedFailures: [],
-            isCurrentSessionData: true
+            isCurrentSessionData: true,
+            anchorObservedAt: Dictionary(uniqueKeysWithValues:
+                (Array(planes.keys) + [resolvedMesh.anchorID]).map { ($0, 10) })
         )
         return PlacementSpatialContext(
             mapID: resolvedMap,
@@ -1204,7 +1399,8 @@ final class FurniturePlacementControllerTests: XCTestCase {
             planes: [floor.anchorID: floor],
             meshes: [localMesh.anchorID: localMesh],
             unresolvedFailures: [],
-            isCurrentSessionData: isCurrent
+            isCurrentSessionData: isCurrent,
+            anchorObservedAt: [floor.anchorID: timestamp, localMesh.anchorID: timestamp]
         )
     }
 
@@ -1436,6 +1632,7 @@ private struct PlacementSpatialContext {
 private enum TestFailure: Error {
     case expectedReady
     case expectedInsufficient
+    case expirationNotScheduled
 }
 
 private actor SuspendedPlacementCandidateProvider {
@@ -1462,5 +1659,62 @@ private actor PlacementDeletionBarrierCompletion {
 
     func markFinished() {
         isFinished = true
+    }
+}
+
+@MainActor
+private final class PlacementTestClock {
+    var uptime: TimeInterval = 0
+}
+
+private actor SuspendedPlacementMetadataProvider {
+    private var continuation: CheckedContinuation<[SpatialObjectMetadata], Error>?
+    private var released = false
+    var isWaiting: Bool { continuation != nil }
+
+    func load() async throws -> [SpatialObjectMetadata] {
+        if released { return [] }
+        return try await withCheckedThrowingContinuation { continuation = $0 }
+    }
+
+    func resume() {
+        resumeAll()
+    }
+
+    func resumeAll() {
+        released = true
+        continuation?.resume(returning: [])
+        continuation = nil
+    }
+}
+
+private actor SuspendedPlacementExpiration {
+    private var continuations: [CheckedContinuation<Void, Error>?] = []
+    private var releasedIndices: Set<Int> = []
+    private var releasedAll = false
+    private(set) var durations: [TimeInterval] = []
+    var count: Int { continuations.count }
+
+    func wait(seconds: TimeInterval) async throws {
+        durations.append(seconds)
+        let index = continuations.count
+        continuations.append(nil)
+        guard !releasedAll, !releasedIndices.contains(index) else { return }
+        try await withCheckedThrowingContinuation { continuations[index] = $0 }
+    }
+
+    func resume(index: Int) {
+        releasedIndices.insert(index)
+        guard continuations.indices.contains(index) else { return }
+        continuations[index]?.resume()
+        continuations[index] = nil
+    }
+
+    func resumeAll() {
+        releasedAll = true
+        for index in continuations.indices {
+            continuations[index]?.resume()
+            continuations[index] = nil
+        }
     }
 }

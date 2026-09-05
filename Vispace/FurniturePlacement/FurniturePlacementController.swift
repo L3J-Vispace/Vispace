@@ -114,10 +114,17 @@ public final class FurniturePlacementController: ObservableObject {
     private let capabilitiesProvider: CapabilitiesProvider
     private let evidenceBuilder: ARFurniturePlacementEvidenceBuilder
     private let evaluator: FurniturePlacementEvaluator
+    private let monotonicNow: @MainActor @Sendable () -> TimeInterval
+    private let maximumRecommendationAge: TimeInterval
+    private let expirationSleeper: @Sendable (TimeInterval) async throws -> Void
 
     private var evaluationTask: Task<Void, Never>?
     private var trackedEvaluationTasks: [UUID: Task<Void, Never>] = [:]
     private var latestRequestID: UInt64 = 0
+    private var latestPoseReceivedUptime: TimeInterval?
+    private var freshness: PlacementFreshnessWindow?
+    private var expirationTask: Task<Void, Never>?
+    private var expirationGeneration: UInt64 = 0
 
     public init(
         candidatePositionProvider: @escaping CandidatePositionProvider,
@@ -125,16 +132,28 @@ public final class FurniturePlacementController: ObservableObject {
         capabilitiesProvider: @escaping CapabilitiesProvider,
         evidenceBuilder: ARFurniturePlacementEvidenceBuilder =
             ARFurniturePlacementEvidenceBuilder(),
-        evaluator: FurniturePlacementEvaluator = FurniturePlacementEvaluator()
+        evaluator: FurniturePlacementEvaluator = FurniturePlacementEvaluator(),
+        maximumRecommendationAge: TimeInterval = 30,
+        monotonicNow: @escaping @MainActor @Sendable () -> TimeInterval = {
+            ProcessInfo.processInfo.systemUptime
+        },
+        expirationSleeper: @escaping @Sendable (TimeInterval) async throws -> Void = { seconds in
+            try await Task.sleep(for: .seconds(seconds))
+        }
     ) {
         self.candidatePositionProvider = candidatePositionProvider
         self.objectMetadataProvider = objectMetadataProvider
         self.capabilitiesProvider = capabilitiesProvider
         self.evidenceBuilder = evidenceBuilder
         self.evaluator = evaluator
+        self.maximumRecommendationAge = maximumRecommendationAge.isFinite
+            ? max(0, maximumRecommendationAge) : 0
+        self.monotonicNow = monotonicNow
+        self.expirationSleeper = expirationSleeper
     }
 
     deinit {
+        expirationTask?.cancel()
         for task in trackedEvaluationTasks.values {
             task.cancel()
         }
@@ -148,13 +167,15 @@ public final class FurniturePlacementController: ObservableObject {
             }
             let contextChanged = !Self.hasStableEvaluationContext(current, pose)
             latestPose = pose
+            latestPoseReceivedUptime = monotonicNow()
             metrics.posesAccepted &+= 1
-            if contextChanged {
+            if contextChanged || (freshness != nil && !evidenceIsFresh()) {
                 invalidateEvaluationContext()
             }
             return
         }
         latestPose = pose
+        latestPoseReceivedUptime = monotonicNow()
         metrics.posesAccepted &+= 1
     }
 
@@ -181,11 +202,13 @@ public final class FurniturePlacementController: ObservableObject {
 
     public func clearSpatialContext() {
         latestPose = nil
+        latestPoseReceivedUptime = nil
         latestSurface = nil
         invalidateEvaluationContext()
     }
 
     public func evaluate(_ kind: FurnitureKind, dimensions: FurnitureDimensions? = nil) {
+        cancelCurrentEvaluation()
         guard let pose = latestPose else {
             publishInsufficient(kind: kind, issue: .poseUnavailable)
             return
@@ -199,9 +222,20 @@ public final class FurniturePlacementController: ObservableObject {
             return
         }
 
-        if evaluationTask != nil {
-            evaluationTask?.cancel()
-            metrics.requestsCancelled &+= 1
+        guard let receivedAt = latestPoseReceivedUptime,
+            let surfaceExpiration = evidenceBuilder.surfaceExpirationTimestamp(surface)
+        else {
+            publishInsufficient(kind: kind, issue: .surfaceSnapshotStale)
+            return
+        }
+        freshness = PlacementFreshnessWindow(
+            referenceTimestamp: pose.timestamp, referenceUptime: receivedAt,
+            surfaceExpiration: surfaceExpiration,
+            expiration: min(surfaceExpiration, pose.timestamp + evidenceBuilder.policy.maximumCandidatePoseAge)
+        )
+        guard evidenceIsFresh() else {
+            publishInsufficient(kind: kind, issue: .surfaceSnapshotStale)
+            return
         }
         latestRequestID &+= 1
         let requestID = latestRequestID
@@ -214,6 +248,7 @@ public final class FurniturePlacementController: ObservableObject {
         latestRecommendedPlacement = nil
         metrics.requestsStarted &+= 1
         state = .evaluating(requestID: requestID, kind: kind)
+        scheduleExpiration()
 
         let candidateProvider = candidatePositionProvider
         let metadataProvider = objectMetadataProvider
@@ -327,23 +362,18 @@ public final class FurniturePlacementController: ObservableObject {
     }
 
     public func cancelCurrentEvaluation(resetToIdle: Bool = true) {
+        if resetToIdle {
+            invalidateEvaluationContext()
+            return
+        }
         guard evaluationTask != nil else {
-            if resetToIdle {
-                state = .idle
-                latestPresentation = nil
-                latestRecommendedPlacement = nil
-            }
             return
         }
         evaluationTask?.cancel()
         evaluationTask = nil
         latestRequestID &+= 1
         metrics.requestsCancelled &+= 1
-        if resetToIdle {
-            state = .idle
-            latestPresentation = nil
-            latestRecommendedPlacement = nil
-        }
+        clearFreshness()
     }
 
     /// Cancels the request and waits for metadata loading and detached geometry
@@ -364,10 +394,11 @@ public final class FurniturePlacementController: ObservableObject {
     }
 
     private func invalidateEvaluationContext() {
+        latestRequestID &+= 1
+        clearFreshness()
         if evaluationTask != nil {
             evaluationTask?.cancel()
             evaluationTask = nil
-            latestRequestID &+= 1
             metrics.requestsCancelled &+= 1
         }
         state = .idle
@@ -380,6 +411,7 @@ public final class FurniturePlacementController: ObservableObject {
         context: EvaluationContext
     ) -> Bool {
         requestID == latestRequestID
+            && evidenceIsFresh()
             && context.matches(
                 pose: latestPose,
                 surface: latestSurface,
@@ -390,6 +422,7 @@ public final class FurniturePlacementController: ObservableObject {
     private func rejectStale(requestID: UInt64) {
         metrics.staleResultsRejected &+= 1
         if requestID == latestRequestID {
+            clearFreshness()
             evaluationTask = nil
             state = .idle
             latestPresentation = nil
@@ -403,6 +436,7 @@ public final class FurniturePlacementController: ObservableObject {
         candidatePosition: FramedPosition? = nil,
         requestID: UInt64? = nil
     ) {
+        clearFreshness()
         let presentation = FurniturePlacementPresentation(
             kind: kind,
             disposition: .insufficientEvidence,
@@ -426,6 +460,17 @@ public final class FurniturePlacementController: ObservableObject {
         evaluation: FurniturePlacementEvaluation,
         requestID: UInt64
     ) {
+        if evaluation.disposition == .feasible {
+            // Publishing starts only a bounded display lease. It cannot
+            // restamp the floor/mesh observations that justified feasibility.
+            guard var window = freshness, let timestamp = currentObservationTimestamp(),
+                evidenceIsFresh(), maximumRecommendationAge > 0 else {
+                rejectStale(requestID: requestID)
+                return
+            }
+            window.expiration = min(window.surfaceExpiration, timestamp + maximumRecommendationAge)
+            freshness = window
+        }
         let issue: ARFurniturePlacementEvidenceIssue? =
             evaluation.disposition == .insufficientEvidence
                 && !prepared.summary.lidarEvidenceComplete
@@ -458,14 +503,61 @@ public final class FurniturePlacementController: ObservableObject {
                 confidenceScore: evaluation.confidenceScore
             )
             metrics.recommendationsPublished &+= 1
+            scheduleExpiration()
         case .rejected:
+            clearFreshness()
             latestRecommendedPlacement = nil
             metrics.rejectionsPublished &+= 1
         case .insufficientEvidence:
+            clearFreshness()
             latestRecommendedPlacement = nil
             metrics.insufficientEvidencePublished &+= 1
         }
         finish(requestID: requestID)
+    }
+
+    private func currentObservationTimestamp() -> TimeInterval? {
+        guard let freshness, let latestPose else { return nil }
+        let uptime = monotonicNow()
+        guard uptime.isFinite, freshness.referenceUptime.isFinite,
+            uptime >= freshness.referenceUptime, latestPose.timestamp.isFinite
+        else { return nil }
+        let timestamp = max(latestPose.timestamp,
+            freshness.referenceTimestamp + (uptime - freshness.referenceUptime))
+        return timestamp.isFinite ? timestamp : nil
+    }
+
+    private func evidenceIsFresh() -> Bool {
+        guard let freshness, let timestamp = currentObservationTimestamp() else { return false }
+        return timestamp >= 0 && timestamp < freshness.expiration
+    }
+
+    private func clearFreshness() {
+        expirationGeneration &+= 1
+        expirationTask?.cancel()
+        expirationTask = nil
+        freshness = nil
+    }
+
+    /// Uses an independent monotonic timer, so paused pose/surface streams and
+    /// wall-clock correction cannot leave an old green recommendation visible.
+    private func scheduleExpiration() {
+        expirationTask?.cancel()
+        expirationGeneration &+= 1
+        guard let freshness, let timestamp = currentObservationTimestamp() else {
+            invalidateEvaluationContext()
+            return
+        }
+        let requestID = latestRequestID
+        let expirationID = expirationGeneration
+        let remaining = max(0, freshness.expiration - timestamp)
+        let sleeper = expirationSleeper
+        expirationTask = Task { @MainActor [weak self] in
+            do { try await sleeper(remaining) } catch { return }
+            guard !Task.isCancelled, let self, self.latestRequestID == requestID,
+                self.expirationGeneration == expirationID else { return }
+            self.invalidateEvaluationContext()
+        }
     }
 
     private func finish(requestID: UInt64?) {
@@ -602,6 +694,13 @@ public final class FurniturePlacementController: ObservableObject {
             && lhs.mapID == rhs.mapID
             && lhs.coordinateFrameStatus == rhs.coordinateFrameStatus
     }
+}
+
+private struct PlacementFreshnessWindow {
+    let referenceTimestamp: TimeInterval
+    let referenceUptime: TimeInterval
+    let surfaceExpiration: TimeInterval
+    var expiration: TimeInterval
 }
 
 private struct EvaluationContext: Equatable, Sendable {

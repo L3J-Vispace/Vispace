@@ -243,7 +243,9 @@ public struct ARFurniturePlacementEvidenceBuilder: Sendable {
             return .insufficient(.candidatePositionStale)
         }
         let surfaceAge = pose.timestamp - surface.timestamp
-        guard surfaceAge >= -0.25, surfaceAge <= policy.maximumSurfacePoseAge else {
+        guard surfaceAge >= -0.25, surfaceAge <= policy.maximumSurfacePoseAge,
+            surface.hasFreshSurfaces(at: pose.timestamp, maximumAge: policy.maximumSurfacePoseAge)
+        else {
             return .insufficient(.surfaceSnapshotStale)
         }
         guard surface.planes.count <= policy.maximumPlanes,
@@ -499,6 +501,21 @@ public struct ARFurniturePlacementEvidenceBuilder: Sendable {
                 summary: summary
             )
         )
+    }
+
+    /// An unrelated anchor delta cannot renew retained geometry. The same
+    /// observation deadline also bounds the controller's published preview.
+    func surfaceExpirationTimestamp(_ surface: ARSurfaceStateSnapshot) -> TimeInterval? {
+        guard surface.timestamp.isFinite, surface.timestamp >= 0 else { return nil }
+        var oldest = surface.timestamp
+        for anchorID in Set(surface.planes.keys).union(surface.meshes.keys) {
+            guard let observedAt = surface.anchorObservedAt[anchorID],
+                observedAt.isFinite, observedAt >= 0, observedAt <= surface.timestamp + 0.25
+            else { return nil }
+            oldest = min(oldest, observedAt)
+        }
+        let expiration = oldest + policy.maximumSurfacePoseAge
+        return expiration.isFinite ? expiration : nil
     }
 
     private func horizontalRegion(
