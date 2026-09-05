@@ -81,7 +81,7 @@ final class TemporalSpatialMemoryServiceTests: XCTestCase {
         let mapID = temporalTestMapID(42)
         let frameID = temporalTestFrameID(42)
         let objectID = temporalTestObjectID(42)
-        let future = try temporalTestMetadata(
+        let future = temporalTestMetadata(
             mapID: mapID, coordinateFrameID: frameID, objectID: objectID, at: 2_000
         )
         let store = TemporalMetadataStore(document: SpatialMetadataDocument(
