@@ -108,6 +108,11 @@ final class CameraOnlyUITests: XCTestCase {
         queryField.typeText("place sofa here")
         app.buttons["vispace.query.submit"].tap()
 
+        let evaluate = app.buttons["vispace.placement.evaluate"]
+        XCTAssertTrue(evaluate.waitForExistence(timeout: 5))
+        XCTAssertTrue(evaluate.isEnabled)
+        evaluate.tap()
+
         let result = app.otherElements["vispace.query.result"]
         XCTAssertTrue(result.waitForExistence(timeout: 5))
         XCTAssertTrue(result.staticTexts.firstMatch.label.contains("공간 정보"))
@@ -151,8 +156,8 @@ final class CameraOnlyUITests: XCTestCase {
         XCTAssertTrue(settings.waitForExistence(timeout: 5))
         settings.tap()
 
-        let delete = app.buttons["vispace.data.delete"]
-        XCTAssertTrue(delete.waitForExistence(timeout: 2))
+        let delete = revealDeleteAction(in: app)
+        XCTAssertTrue(delete.isHittable)
         delete.tap()
 
         let confirm = app.buttons.matching(
@@ -189,8 +194,21 @@ final class CameraOnlyUITests: XCTestCase {
         XCTAssertFalse(app.otherElements["vispace.camera.surface"].exists)
         manageData.tap()
 
-        XCTAssertTrue(app.buttons["vispace.data.delete"].waitForExistence(timeout: 2))
-        XCTAssertTrue(app.navigationBars["공간 데이터"].exists)
+        XCTAssertTrue(app.navigationBars["공간 데이터"].waitForExistence(timeout: 5))
+        XCTAssertTrue(revealDeleteAction(in: app).isHittable)
+    }
+
+    @MainActor
+    private func revealDeleteAction(in app: XCUIApplication) -> XCUIElement {
+        let button = app.buttons["vispace.data.delete"]
+        // Settings now contains supported-device details and a place catalog.
+        // Exercise the real scrollable screen rather than requiring the
+        // destructive action to remain in the initial viewport.
+        for _ in 0..<8 {
+            if button.exists && button.isHittable { return button }
+            app.swipeUp()
+        }
+        return button
     }
 
     @MainActor
