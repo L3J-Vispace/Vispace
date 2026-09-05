@@ -1101,38 +1101,56 @@
     },
     "onboarding.ask.detail" : {
       "localizations" : {
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "Ask things like “Where is my phone?”, “What is on the desk?”, or “Where was my laptop last seen?”" } },
-        "ko" : { "stringUnit" : { "state" : "translated", "value" : "“휴대폰 어디 있어?”, “책상 위에 뭐가 있어?”, “노트북을 마지막으로 어디에서 봤어?”처럼 물어보세요." } }
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Ask “What is on the table?” to explore confirmed relationships between objects." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "“테이블 위에 뭐가 있어?”처럼 물어보세요. 확인된 물체 사이의 관계를 알려드려요." } }
       }
     },
     "onboarding.ask.title" : {
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Ask about your space" } },
-        "ko" : { "stringUnit" : { "state" : "translated", "value" : "공간에 관해 물어보세요" } }
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "공간에 질문하기" } }
+      }
+    },
+    "onboarding.data.title" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "How your data is kept" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "내 데이터는 이렇게 보관해요" } }
+      }
+    },
+    "onboarding.features.title" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "What you can do with Vispace" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "Vispace로 할 수 있는 일" } }
+      }
+    },
+    "onboarding.gettingStarted.title" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "How to get started" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이렇게 시작하세요" } }
       }
     },
     "onboarding.guide.detail" : {
       "localizations" : {
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "Use the furniture button to check a sofa, bed, or desk. Ask to navigate only after the floor and passage have been scanned." } },
-        "ko" : { "stringUnit" : { "state" : "translated", "value" : "가구 버튼으로 소파·침대·책상을 놓을 자리를 확인하세요. 바닥과 통로를 충분히 비춘 뒤 길 안내를 요청할 수 있어요." } }
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Use the furniture button to check a sofa, bed, or desk, or ask for a route to an object. Guidance needs enough information about the floor and passages." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "가구 버튼으로 소파·침대·책상을 놓을 자리를 확인하거나 물건까지 길 안내를 요청해 보세요. 바닥과 통로 정보가 충분할 때 안내할 수 있어요." } }
       }
     },
     "onboarding.guide.title" : {
       "localizations" : {
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "Try placement and safe routes" } },
-        "ko" : { "stringUnit" : { "state" : "translated", "value" : "배치 추천과 안전 경로를 확인하세요" } }
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Check furniture fit and routes" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "가구 배치와 길 안내" } }
       }
     },
     "onboarding.memory.detail" : {
       "localizations" : {
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "Keep an object in view from a few angles. Vispace saves only confirmed spatial facts and clearly marks uncertain results." } },
-        "ko" : { "stringUnit" : { "state" : "translated", "value" : "물체를 여러 각도에서 잠시 비춰 주세요. 확인된 공간 정보만 저장하고 불확실한 결과는 분명히 표시합니다." } }
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Ask “Find my laptop.” Vispace distinguishes confirmed current locations from where an object was last seen." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "“노트북 찾아줘”처럼 물어보세요. 현재 확인된 위치와 마지막으로 본 위치를 구분해 알려드려요." } }
       }
     },
     "onboarding.memory.title" : {
       "localizations" : {
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "Build a reliable spatial memory" } },
-        "ko" : { "stringUnit" : { "state" : "translated", "value" : "공간 기억을 만들어요" } }
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Find things and remember locations" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "물건 찾기와 위치 기억" } }
       }
     },
     "onboarding.permissionNotice" : {
@@ -1204,13 +1222,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Hold your iPhone upright and move slowly to cover your surroundings."
+            "value" : "Hold your iPhone upright and slowly scan the floor, walls, and objects from several angles. Vispace remembers only confirmed spatial information and marks uncertain results."
           }
         },
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "iPhone을 세로로 들고, 주변을 천천히 골고루 비춰 주세요."
+            "value" : "iPhone을 세로로 들고 바닥·벽·물체를 여러 각도에서 천천히 비춰 주세요. 확인된 공간 정보만 기억하고, 불확실한 결과는 따로 알려드려요."
           }
         }
       }
@@ -1252,13 +1270,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Vispace uses your iPhone camera to view the space around you."
+            "value" : "Vispace remembers indoor spaces and object locations observed with your iPhone camera, helping you find things and make use of your space."
           }
         },
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Vispace는 iPhone 카메라로 주변 공간을 살펴보는 앱입니다."
+            "value" : "Vispace는 iPhone 카메라로 확인한 실내 공간과 물건의 위치를 기억해, 물건 찾기와 공간 활용을 도와주는 서비스예요."
           }
         }
       }
@@ -1280,13 +1298,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Show us your surroundings"
+            "value" : "An assistant that remembers your space"
           }
         },
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "주변 공간을 비춰 보세요"
+            "value" : "내 공간을 기억하는 도우미"
           }
         }
       }

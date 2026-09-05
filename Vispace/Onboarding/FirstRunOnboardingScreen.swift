@@ -31,18 +31,16 @@ struct FirstRunOnboardingScreen: View {
                         Text("onboarding.summary")
                             .font(.body)
                             .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("vispace.onboarding.summary")
                     }
 
                     VStack(alignment: .leading, spacing: 24) {
-                        GuidanceRow(
-                            symbol: "iphone",
-                            identifier: "vispace.onboarding.scan.title",
-                            title: "onboarding.scan.title",
-                            detail: "onboarding.scan.detail"
-                        )
+                        Text("onboarding.features.title")
+                            .font(.title3.bold())
+                            .accessibilityAddTraits(.isHeader)
 
                         GuidanceRow(
-                            symbol: "cube.transparent",
+                            symbol: "magnifyingglass",
                             identifier: "vispace.onboarding.memory.title",
                             title: "onboarding.memory.title",
                             detail: "onboarding.memory.detail"
@@ -61,6 +59,25 @@ struct FirstRunOnboardingScreen: View {
                             title: "onboarding.guide.title",
                             detail: "onboarding.guide.detail"
                         )
+                    }
+
+                    VStack(alignment: .leading, spacing: 24) {
+                        Text("onboarding.gettingStarted.title")
+                            .font(.title3.bold())
+                            .accessibilityAddTraits(.isHeader)
+
+                        GuidanceRow(
+                            symbol: "iphone",
+                            identifier: "vispace.onboarding.scan.title",
+                            title: "onboarding.scan.title",
+                            detail: "onboarding.scan.detail"
+                        )
+                    }
+
+                    VStack(alignment: .leading, spacing: 24) {
+                        Text("onboarding.data.title")
+                            .font(.title3.bold())
+                            .accessibilityAddTraits(.isHeader)
 
                         GuidanceRow(
                             symbol: "lock.shield",
