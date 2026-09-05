@@ -628,6 +628,9 @@ final class PlaceRecognitionControllerTests: XCTestCase {
     }
 
     func testDeferredAttemptRotationWithRealRepositorySurvivesHistoryLimitAndBackwardClock() async throws {
+        // This verifies durable ordering, not a two-second storage latency SLA.
+        // CI enables XCTest timeouts so a hung 130-observation run still fails.
+        executionTimeAllowance = 60
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let repository = PlaceMemoryRepository(directoryURL: directory, maximumAssociationStates: 1)
@@ -678,30 +681,36 @@ final class PlaceRecognitionControllerTests: XCTestCase {
             checkpointRequester: { XCTFail("Unresolved coordinates must not request a checkpoint") }
         )
         controller.activate()
-        defer { controller.deactivate() }
-        for revision in 1...130 {
-            channel.send(
-                makeSnapshot(
-                    frameID: sourceFrameID, segmentID: segmentID, mapID: nil,
-                    revision: UInt64(revision)
-                ))
-            try await waitForIdle(
-                controller, persistedAssociations: UInt64(revision),
-                receivedSnapshots: UInt64(revision))
+        do {
+            for revision in 1...130 {
+                channel.send(
+                    makeSnapshot(
+                        frameID: sourceFrameID, segmentID: segmentID, mapID: nil,
+                        revision: UInt64(revision)
+                    ))
+                try await waitForReceivedAssociationCompletion(
+                    controller, observationCount: UInt64(revision))
+            }
+            let catalog = try await PlaceMemoryRepository(
+                directoryURL: directory, maximumAssociationStates: 1
+            ).catalogSnapshot()
+            XCTAssertEqual(catalog.associationStates.count, 1)
+            let retained = try XCTUnwrap(catalog.associationStates.first)
+            XCTAssertNotEqual(retained.id, seed.id)
+            XCTAssertGreaterThan(retained.createdAt, futureTime + 1)
+            XCTAssertEqual(retained.observations.count, 2)
+            XCTAssertEqual(retained.latestDecision.mutation, .deferDecision)
+            XCTAssertGreaterThan(try XCTUnwrap(catalog.retiredAssociationCreatedAtThrough), futureTime)
+            if case .ambiguous = controller.state {
+                // The final durable result must remain unresolved and operational.
+            } else {
+                XCTFail("Sustained deferred recognition must remain operational")
+            }
+        } catch {
+            await controller.deactivateAndWaitForPendingWork()
+            throw error
         }
-        let catalog = try await PlaceMemoryRepository(
-            directoryURL: directory, maximumAssociationStates: 1
-        ).catalogSnapshot()
-        XCTAssertEqual(catalog.associationStates.count, 1)
-        let retained = try XCTUnwrap(catalog.associationStates.first)
-        XCTAssertNotEqual(retained.id, seed.id)
-        XCTAssertGreaterThan(retained.createdAt, futureTime + 1)
-        XCTAssertEqual(retained.observations.count, 2)
-        XCTAssertEqual(retained.latestDecision.mutation, .deferDecision)
-        XCTAssertGreaterThan(try XCTUnwrap(catalog.retiredAssociationCreatedAtThrough), futureTime)
-        guard case .ambiguous = controller.state else {
-            return XCTFail("Sustained deferred recognition must remain operational")
-        }
+        await controller.deactivateAndWaitForPendingWork()
     }
 
     func testIncompleteSurfaceNeverReadsOrWritesPlaceMemory() async throws {
@@ -914,6 +923,37 @@ final class PlaceRecognitionControllerTests: XCTestCase {
         )
     }
 
+    private func waitForReceivedAssociationCompletion(
+        _ controller: PlaceRecognitionController,
+        observationCount: UInt64
+    ) async throws {
+        // Wait for channel delivery, then join the actual processing task.
+        // The enclosing XCTest allowance bounds both without treating shared
+        // Simulator scheduling or filesystem latency as a correctness failure.
+        while controller.metrics.snapshotsReceived < observationCount {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await controller.waitForProcessingCompletionForTesting()
+        try Task.checkCancellation()
+        if case .failed(let message) = controller.state {
+            throw PlaceControllerWaitError.failed(
+                message: message,
+                metrics: controller.metrics,
+                expectedAssociations: observationCount
+            )
+        }
+        guard controller.metrics.snapshotsReceived == observationCount,
+            controller.metrics.associationObservationsPersisted == observationCount,
+            controller.pendingProcessingTaskCountForTesting == 0
+        else {
+            throw PlaceControllerWaitError.incompleteWork(
+                state: controller.state, metrics: controller.metrics,
+                expectedObservations: observationCount
+            )
+        }
+    }
+
     private func waitForIdle(
         _ controller: PlaceRecognitionController,
         persistedFingerprints: UInt64? = nil,
@@ -1085,6 +1125,10 @@ private enum PlaceControllerWaitError: Error {
     case writeDidNotPause
     case newerSnapshotNotReceived
     case failed(message: String, metrics: PlaceRecognitionMetrics, expectedAssociations: UInt64?)
+    case incompleteWork(
+        state: PlaceRecognitionControllerState, metrics: PlaceRecognitionMetrics,
+        expectedObservations: UInt64
+    )
     case timedOut(
         state: PlaceRecognitionControllerState, metrics: PlaceRecognitionMetrics,
         expectedAssociations: UInt64?, expectedSnapshots: UInt64?, pendingTasks: Int

@@ -155,6 +155,7 @@ jobs:
             -destination "platform=iOS Simulator,id=${SIMULATOR_UDID}" \
             -derivedDataPath "${RUNNER_TEMP}/VispaceDerivedData" \
             -resultBundlePath "${RUNNER_TEMP}/VispaceTests.xcresult" \
+            -test-timeouts-enabled YES \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \
@@ -183,6 +184,8 @@ jobs:
             -only-testing:VispaceTests/PlaceRecognitionControllerTests/testDeferredAttemptRotationWithRealRepositorySurvivesHistoryLimitAndBackwardClock \
             -test-iterations 5 \
             -run-tests-until-failure \
+            -test-timeouts-enabled YES \
+            -maximum-test-execution-time-allowance 60 \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \

@@ -51,6 +51,10 @@
 
 후속 검토에서 영구 저장 완료와 writer 반환 사이에 새 프레임이 들어오면 메모리의 이전 revision을 재사용할 수 있는 경합을 확인했다. 실제 저장 후 반환을 차단하는 회귀 2개로 동일 이력의 갱신과 64개 이력 교체 경계를 강제하며, 전체 관측 prefix 보존과 다음 관측의 처리도 확인한다. CI는 130회 관측으로 이력 한도를 넘기는 검사를 추가로 최대 5회 반복하고 첫 실패에서 중단한다. 이 반복은 통과할 때까지 실패를 재시도하는 방식이 아니며 [Apple의 테스트 반복 기능](https://developer.apple.com/videos/play/wwdc2021/10296/)을 사용한다.
 
+`3f02baf`의 [실행](https://github.com/L3J-Vispace/Vispace/actions/runs/33945963853)은 Core 327개와 시뮬레이터 419개를 통과했고 실기기 보호 검사 1개를 건너뛰었다. 별도 반복 검사 첫 회는 125번째 관측을 처리 중인 상태에서 테스트의 관측별 2초 폴링 한도를 넘겨 실패했다. 124회 저장 완료, 미처리 작업 1개, stale·coalesced 0개였으며 저장 오류는 보고되지 않았다. 이 로그만으로 느린 구간이 CPU·파일 I/O·스케줄링 중 어디였는지는 확정하지 않는다.
+
+해당 기능 검사는 관측 수신 후 실제 처리 작업이 끝날 때까지 join하고 완료된 저장 수·오류·최종 영구 이력을 확인하도록 바꿨다. 성공과 실패 모두 작업을 정리한 뒤 임시 저장소를 제거한다. 각 관측의 임의 지연 제한을 대신해 [XCTest 실행 한도](https://developer.apple.com/documentation/xctest/xctestcase/executiontimeallowance)를 활성화하고 130회 전체에 60초 상한을 둔다. 운영 코드의 시간 제한·재시도 정책을 완화한 것은 아니며, 처리 지연과 실기기 성능 합격 근거는 별도다.
+
 시계 자동 복구, 암호화 이전, 물체 선택·이름 지정과 후속 수정의 통합 판정은 [PR #1의 테스트 결과](https://github.com/L3J-Vispace/Vispace/pull/1)와 해당 head에 연결된 [iOS CI 실행 기록](https://github.com/L3J-Vispace/Vispace/actions/workflows/ios-ci.yml)을 따른다. Core, Debug·Release, 리소스, archive, 시뮬레이터 및 Analyze 전체 결과를 함께 확인하며 개별 단계 통과를 전체 통과로 표현하지 않는다. 실기기 합격 근거는 이 CI와 별개다.
 
 ## 영향과 롤백

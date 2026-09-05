@@ -124,6 +124,17 @@ public final class PlaceRecognitionController: ObservableObject {
         processingTask != nil
     }
 
+    #if DEBUG
+    /// Call after the intended snapshot has been received. Join its actual
+    /// processing and any already-coalesced successor without imposing a
+    /// per-observation disk/scheduler latency requirement on correctness tests.
+    func waitForProcessingCompletionForTesting() async {
+        while let current = processingTask {
+            await current.value
+        }
+    }
+    #endif
+
     var pendingProcessingTaskCountForTesting: Int {
         processingTasks.count
     }
