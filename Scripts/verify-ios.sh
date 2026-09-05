@@ -83,6 +83,7 @@ run_preflight() {
     exit 1
   fi
   plutil -lint Vispace/Resources/PrivacyInfo.xcprivacy
+  python3 Scripts/verify-privacy.py
   swift test --package-path Packages/VispaceCore --scratch-path "$core_build" --parallel
   xcodebuild \
     -resolvePackageDependencies \
@@ -133,6 +134,7 @@ run_verification() {
   local release_app="$(dirname "$release_binary")"
   test -f "$release_app/ko.lproj/Localizable.strings"
   test -f "$release_app/ko.lproj/InfoPlist.strings"
+  python3 Scripts/verify-privacy.py --manifest "$release_app/PrivacyInfo.xcprivacy"
   local debug_token
   for debug_token in \
     'VispaceDisableARSession' \
@@ -158,6 +160,8 @@ run_verification() {
     CODE_SIGNING_ALLOWED=NO \
     CODE_SIGNING_REQUIRED=NO \
     archive 2>&1 | tee "$run_root/archive.log"
+
+  python3 Scripts/verify-privacy.py --manifest "$archive/Products/Applications/Vispace.app/PrivacyInfo.xcprivacy"
 
   xcodebuild \
     -project "$project" \

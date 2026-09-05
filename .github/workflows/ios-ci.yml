@@ -76,6 +76,7 @@ jobs:
           grep -q 'UIInterfaceOrientationPortrait' project.yml
           grep -q 'SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated' Config/Shared.xcconfig
           plutil -lint Vispace/Resources/PrivacyInfo.xcprivacy
+          python3 Scripts/verify-privacy.py
           if grep -R --line-number --exclude-dir=.git \
             -E 'NSMicrophoneUsageDescription|INFOPLIST_KEY_NSMicrophoneUsageDescription' \
             project.yml Config Vispace; then
@@ -221,6 +222,7 @@ jobs:
           test -d "${app}/YOLOv3TinyInt8LUT.mlmodelc"
           test -f "${app}/ko.lproj/Localizable.strings"
           test -f "${app}/ko.lproj/InfoPlist.strings"
+          python3 Scripts/verify-privacy.py --manifest "${app}/PrivacyInfo.xcprivacy"
 
       - name: Archive device configuration without signing
         run: |
@@ -236,6 +238,9 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \
             archive
+
+      - name: Verify archived privacy declaration
+        run: python3 Scripts/verify-privacy.py --manifest "${RUNNER_TEMP}/Vispace.xcarchive/Products/Applications/Vispace.app/PrivacyInfo.xcprivacy"
 
       - name: Analyze
         run: |
