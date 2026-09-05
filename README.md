@@ -79,6 +79,8 @@ See `docs/IMPLEMENTATION_PLAN.md` for phase scopes and remaining release gates.
 Latest refactoring, security review, and verification status: [2026-09-05 PR review](docs/PR_REVIEW_2026-09-05.md).
 The review records the tested source manifest separately from historical test runs and physical-device release gates.
 
+Follow-up findings and their implementation, verification, and remaining feature limits are tracked in the [audit remediation record](docs/AUDIT_REMEDIATION_2026-09-05.md).
+
 ## Privacy and retention
 
 - Raw camera frames and raw camera video are processed ephemerally. They are neither persisted nor transmitted by Vispace.
