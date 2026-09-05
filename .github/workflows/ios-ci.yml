@@ -17,10 +17,16 @@ concurrency:
 jobs:
   build-test-analyze:
     name: Build, test, and analyze
-    runs-on: macos-26
+    # This private repository's MacBook accepts only same-repository PRs.
+    # Never run fork-provided code on the owner's persistent machine.
+    if: >-
+      github.repository == 'L3J-Vispace/Vispace' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, macOS, ARM64, vispace-ios]
     timeout-minutes: 45
     env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
       REQUIRED_XCODE_VERSION: 26.6
       XCODEGEN_VERSION: 2.46.0
       XCODEGEN_SHA256: 4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
@@ -255,3 +261,19 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \
             analyze
+
+      - name: Preserve failed test diagnostics on the MacBook
+        if: failure()
+        run: |
+          set -euo pipefail
+          evidence="${HOME}/GitHubActions/vispace-evidence/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${evidence}"
+          printf 'Commit: %s\nRun: %s/%s/actions/runs/%s\n' \
+            "${GITHUB_SHA}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}" \
+            > "${evidence}/run.txt"
+          for bundle in VispaceTests VispacePlaceHistoryTests; do
+            if [[ -d "${RUNNER_TEMP}/${bundle}.xcresult" ]]; then
+              ditto -c -k --keepParent "${RUNNER_TEMP}/${bundle}.xcresult" "${evidence}/${bundle}.zip"
+            fi
+          done
+          echo "Failed test diagnostics saved on the MacBook: ${evidence}"
