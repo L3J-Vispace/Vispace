@@ -17,7 +17,7 @@ function Invoke-Swift {
         'run', '--rm',
         '--volume', "${packageRoot}:/workspace",
         '--workdir', '/workspace',
-        'swift:6.2',
+        'swift:6.2@sha256:29b983751c605c2d3102d2ab93438c6e0cadf110d9d2aa6e929b6dec9dcb7cbc',
         'swift'
     )
     $dockerArguments += $SwiftArguments
