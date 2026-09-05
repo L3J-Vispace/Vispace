@@ -1268,6 +1268,7 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
     }
 
     deinit {
+        temporalCaptureGate.value = false
         activationTask?.cancel()
         eventMonitorTask?.cancel()
         relocalizationTimeoutTask?.cancel()
