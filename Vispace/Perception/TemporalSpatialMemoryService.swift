@@ -267,7 +267,10 @@ public actor TemporalSpatialMemoryService {
             resultingSnapshot: next.snapshot,
             validateBeforeCommit: validateBeforeCommit
         )
-        try validateGeneration(generation)
+        // Once append returns, the journal is durable even if this task was
+        // cancelled during its synchronous file write. Publish recovery state
+        // before observing cancellation, but never cross a real deletion reset.
+        try validateResetGeneration(generation)
         switch appendResult {
         case .appended:
             coordinators[key] = next
@@ -277,6 +280,8 @@ public actor TemporalSpatialMemoryService {
             }
             coordinators[key] = next
         }
+        projectionPending.insert(key)
+        try Task.checkCancellation()
 
         // The protected journal is the commit point. A cancellation or
         // filesystem error after this point is recoverable: the next `recover`
@@ -290,8 +295,8 @@ public actor TemporalSpatialMemoryService {
             try validateGeneration(generation)
             projectionPending.remove(key)
         } catch {
-            try validateGeneration(generation)
-            projectionPending.insert(key)
+            try validateResetGeneration(generation)
+            if error is CancellationError { throw error }
             throw TemporalSpatialMemoryServiceError.committedJournalProjectionPending
         }
         return .applied(delta)
@@ -307,6 +312,10 @@ public actor TemporalSpatialMemoryService {
 
     private func validateGeneration(_ generation: UInt64) throws {
         try Task.checkCancellation()
+        try validateResetGeneration(generation)
+    }
+
+    private func validateResetGeneration(_ generation: UInt64) throws {
         guard generation == resetGeneration else {
             throw CancellationError()
         }

@@ -4,6 +4,121 @@ import XCTest
 @testable import Vispace
 
 final class TemporalSpatialMemoryServiceTests: XCTestCase {
+    func testCancellationAfterDurableAppendRecoversAndContinuesOnSameService() async throws {
+        try await exerciseCommittedCancellation(pauseAfterAppend: true, resetBeforeReturn: false)
+    }
+
+    func testCancellationInsideProjectionRecoversAndContinuesOnSameService() async throws {
+        try await exerciseCommittedCancellation(pauseAfterAppend: false, resetBeforeReturn: false)
+    }
+
+    func testResetAfterDurableAppendPreventsCancelledWorkFromRestoringDeletedState() async throws {
+        try await exerciseCommittedCancellation(pauseAfterAppend: true, resetBeforeReturn: true)
+    }
+
+    func testResetDuringProjectionPreventsCancelledWorkFromRestoringDeletedState() async throws {
+        try await exerciseCommittedCancellation(pauseAfterAppend: false, resetBeforeReturn: true)
+    }
+
+    func testResetAfterAppendFencesUncancelledOldTask() async throws {
+        try await exerciseCommittedCancellation(pauseAfterAppend: true, resetBeforeReturn: true, cancelTask: false)
+    }
+
+    private func exerciseCommittedCancellation(
+        pauseAfterAppend: Bool,
+        resetBeforeReturn: Bool,
+        cancelTask: Bool = true
+    ) async throws {
+        executionTimeAllowance = 60
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(60)
+        let frameID = temporalTestFrameID(60)
+        let objectID = temporalTestObjectID(60)
+        let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)]
+        ))
+        let gate = TemporalOneShotCommitGate()
+        let repository = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        if pauseAfterAppend {
+            await repository.setAfterNextCommitForTesting { await gate.pauseOnce() }
+        }
+        let service = TemporalSpatialMemoryService(
+            journalRepository: repository, policy: temporalTestPolicy(),
+            metadataProvider: { try await store.snapshot() },
+            metadataWriter: { metadata in
+                if !pauseAfterAppend { await gate.pauseOnce() }
+                try Task.checkCancellation()
+                try await store.upsert(metadata)
+            }
+        )
+        let batch = TemporalSpatialRecognitionBatch(
+            sequence: 1,
+            observations: [temporalTestNewObservation(
+                mapID: mapID, coordinateFrameID: frameID, objectID: objectID, at: 100
+            )], expectedVisibleObjectIDs: [objectID]
+        )
+        let pose = temporalTestPose(
+            mapID: mapID, coordinateFrameID: frameID,
+            capturedAt: 100, sessionTimestamp: 1, sequence: 1
+        )
+        let task = Task { try await service.process(batch, pose: pose) }
+        do {
+        for _ in 0..<200 {
+            if await gate.isWaiting { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let paused = await gate.isWaiting
+        guard paused else {
+            task.cancel()
+            await gate.resume()
+            _ = try? await task.value
+            return XCTFail("The real committed write did not reach its gate")
+        }
+        let durableBeforeCancellation = try await repository.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(durableBeforeCancellation?.snapshot.revision, 1)
+        if cancelTask { task.cancel() }
+        if resetBeforeReturn {
+            await service.reset()
+            try await repository.deleteMap(mapID: mapID)
+            await store.clearObjects()
+        }
+        await gate.resume()
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation after the durable commit")
+        } catch is CancellationError {
+            // The cancellation reaches the caller without losing recovery bookkeeping.
+        }
+        let recovered = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(recovered.revision, resetBeforeReturn ? 0 : 1)
+        let durableObjects = await store.allObjects()
+        if resetBeforeReturn {
+            XCTAssertTrue(recovered.objects.isEmpty)
+            XCTAssertTrue(durableObjects.isEmpty)
+        } else {
+            XCTAssertEqual(Dictionary(uniqueKeysWithValues: durableObjects.map { ($0.object.id, $0) }), recovered.objects)
+            XCTAssertNotNil(recovered.metadata(for: objectID))
+        }
+        let following = try await service.process(TemporalSpatialRecognitionBatch(
+            sequence: 2, observations: [], expectedVisibleObjectIDs: []
+        ), pose: temporalTestPose(
+            mapID: mapID, coordinateFrameID: frameID,
+            capturedAt: 101, sessionTimestamp: 2, sequence: 2
+        ))
+        guard case .applied(let delta) = following else { return XCTFail("Next observation must commit") }
+        XCTAssertEqual(delta.newRevision, resetBeforeReturn ? 1 : 2)
+        let finalJournal = try await repository.recover(mapID: mapID, coordinateFrameID: frameID)
+        let finalCache = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(finalJournal?.snapshot, finalCache)
+        } catch {
+            task.cancel()
+            await gate.resume()
+            _ = try? await task.value
+            throw error
+        }
+    }
+
     func testLiveAuthorityRejectsStaleWorkAfterAwaitAndAfterRestart() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -770,6 +885,25 @@ private actor TemporalMetadataReadGate {
     }
 
     func resume() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor TemporalOneShotCommitGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var used = false
+    var isWaiting: Bool { continuation != nil }
+
+    func pauseOnce() async {
+        guard !used else { return }
+        used = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func resume() {
+        // A timeout can release the gate before the writer reaches pauseOnce.
+        used = true
         continuation?.resume()
         continuation = nil
     }

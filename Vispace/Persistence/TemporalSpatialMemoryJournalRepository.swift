@@ -375,6 +375,15 @@ public actor TemporalSpatialMemoryJournalRepository {
     private let maximumJournalCount: Int
     private let maximumEntriesPerJournal: Int
 
+    #if DEBUG
+    private var afterNextCommitForTesting: (@Sendable () async -> Void)?
+
+    /// Suspends only after a real atomic journal publication, never instead of it.
+    func setAfterNextCommitForTesting(_ hook: @escaping @Sendable () async -> Void) {
+        afterNextCommitForTesting = hook
+    }
+    #endif
+
     public init(
         directoryURL: URL,
         maximumJournalCount: Int = TemporalSpatialMemoryJournalRepository
@@ -527,6 +536,11 @@ public actor TemporalSpatialMemoryJournalRepository {
         try Task.checkCancellation()
         try validateBeforeCommit?()
         try commit(catalog)
+        #if DEBUG
+        let hook = afterNextCommitForTesting
+        afterNextCommitForTesting = nil
+        await hook?()
+        #endif
         return .appended(resultingSnapshot)
     }
 
