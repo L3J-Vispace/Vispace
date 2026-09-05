@@ -5,6 +5,57 @@ import XCTest
 @testable import Vispace
 
 final class WorldMapCheckpointRepositoryTests: XCTestCase {
+    func testUserNameSurvivesColdJournalRecoveryAndFollowingObservation() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = makeRepository(root: directory)
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let map = try await repository.saveCheckpoint(archive: Data("named-map".utf8), captureIdentity: identity)
+        let id = ObjectID()
+        let journal = TemporalSpatialMemoryJournalRepository(directoryURL: directory)
+        let service = TemporalSpatialMemoryService(
+            checkpointRepository: repository, journalRepository: journal, policy: temporalTestPolicy()
+        )
+        _ = try await service.process(TemporalSpatialRecognitionBatch(
+            sequence: 1, observations: [temporalTestNewObservation(
+                mapID: map.mapID, coordinateFrameID: identity.coordinateFrameID, objectID: id, at: 100
+            )], expectedVisibleObjectIDs: [id]
+        ), pose: temporalTestPose(
+            mapID: map.mapID, coordinateFrameID: identity.coordinateFrameID,
+            capturedAt: 100, sessionTimestamp: 1, sequence: 1, captureSegmentID: identity.segmentID
+        ))
+        let beforeRename = try await repository.metadataSnapshot()
+        let object = try XCTUnwrap(beforeRename.objects.first)
+        _ = try await repository.renameObject(expected: object, displayName: "창가 의자")
+        let restartedRepository = makeRepository(root: directory)
+        let restarted = TemporalSpatialMemoryService(
+            checkpointRepository: restartedRepository,
+            journalRepository: TemporalSpatialMemoryJournalRepository(directoryURL: directory),
+            policy: temporalTestPolicy()
+        )
+        _ = try await restarted.recover(mapID: map.mapID, coordinateFrameID: identity.coordinateFrameID)
+        let recovered = try await restartedRepository.metadataSnapshot()
+        XCTAssertEqual(recovered.objects.first?.object.displayName, "창가 의자")
+        let observation = try TemporalSpatialObservation(
+            metadata: temporalTestMetadata(mapID: map.mapID, coordinateFrameID: identity.coordinateFrameID, objectID: id, at: 101),
+            promotionEvidence: temporalTestPromotionEvidence(mapID: map.mapID, coordinateFrameID: identity.coordinateFrameID, at: 101),
+            identityDecision: .confirmedExisting(PersistentObjectReidentificationCandidate(
+                objectID: id, score: temporalTestScore(0.95), geometryScore: temporalTestScore(0.95),
+                spatialContextScore: temporalTestScore(0.95), visualSimilarity: nil, positionDistance: 0
+            ))
+        )
+        _ = try await restarted.process(TemporalSpatialRecognitionBatch(
+            sequence: 2, observations: [observation], expectedVisibleObjectIDs: [id]
+        ), pose: temporalTestPose(
+            mapID: map.mapID, coordinateFrameID: identity.coordinateFrameID,
+            capturedAt: 101, sessionTimestamp: 2, sequence: 2, captureSegmentID: identity.segmentID
+        ))
+        let updated = try await restartedRepository.metadataSnapshot()
+        XCTAssertEqual(updated.objects.first?.object.displayName, "창가 의자")
+        XCTAssertEqual(updated.objects.first?.object.lastSeenAt, 101)
+        XCTAssertEqual(updated.objects.first?.object.temporalRevision, 2)
+    }
+
     func testTemporalRevisionAllowsRealClockRollbackAndRejectsOlderRevisionsAfterRestart() async throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

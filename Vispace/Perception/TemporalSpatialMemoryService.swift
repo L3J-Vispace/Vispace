@@ -13,6 +13,8 @@ public enum TemporalSpatialMemoryServiceError: Error, Equatable, Sendable {
     case durableMetadataAheadOfJournal(ObjectID)
     case untrackedDurableObject(ObjectID)
     case committedJournalProjectionPending
+    case captureAuthorityRequired
+    case captureAuthorityMismatch
 }
 
 /// Recognition output accepted by temporal memory. The contained Core
@@ -52,6 +54,7 @@ public actor TemporalSpatialMemoryService {
     public typealias MetadataWriter =
         @Sendable (SpatialObjectMetadata) async throws
         -> Void
+    public typealias PoseValidator = @Sendable (ARPoseSnapshot) -> Bool
 
     private struct MapFrameKey: Hashable, Sendable {
         let mapID: MapID
@@ -62,6 +65,7 @@ public actor TemporalSpatialMemoryService {
     private let metadataProvider: MetadataProvider
     private let metadataWriter: MetadataWriter
     private let policy: TemporalSpatialMemoryPolicy
+    private let poseValidator: PoseValidator?
     private var coordinators: [MapFrameKey: TemporalSpatialMemoryCoordinator] = [:]
     private var projectionPending: Set<MapFrameKey> = []
     private var resetGeneration: UInt64 = 0
@@ -69,7 +73,8 @@ public actor TemporalSpatialMemoryService {
     public init(
         checkpointRepository: WorldMapCheckpointRepository,
         journalRepository: TemporalSpatialMemoryJournalRepository,
-        policy: TemporalSpatialMemoryPolicy = .default
+        policy: TemporalSpatialMemoryPolicy = .default,
+        poseValidator: PoseValidator? = nil
     ) {
         self.journalRepository = journalRepository
         metadataProvider = {
@@ -79,16 +84,19 @@ public actor TemporalSpatialMemoryService {
             try await checkpointRepository.upsertObjectMetadata(metadata)
         }
         self.policy = policy
+        self.poseValidator = poseValidator
     }
 
     public init(
         journalRepository: TemporalSpatialMemoryJournalRepository,
         policy: TemporalSpatialMemoryPolicy = .default,
         metadataProvider: @escaping MetadataProvider,
-        metadataWriter: @escaping MetadataWriter
+        metadataWriter: @escaping MetadataWriter,
+        poseValidator: PoseValidator? = nil
     ) {
         self.journalRepository = journalRepository
         self.policy = policy
+        self.poseValidator = poseValidator
         self.metadataProvider = metadataProvider
         self.metadataWriter = metadataWriter
     }
@@ -174,6 +182,7 @@ public actor TemporalSpatialMemoryService {
     ) async throws -> TemporalSpatialMemoryServiceResult {
         let generation = resetGeneration
         try Task.checkCancellation()
+        try validateCaptureAuthority(pose)
         let (mapID, mappingQuality) = try validatedPoseIdentity(pose)
         let key = MapFrameKey(
             mapID: mapID,
@@ -184,11 +193,15 @@ public actor TemporalSpatialMemoryService {
             coordinateFrameID: pose.coordinateFrameID
         )
         try validateGeneration(generation)
+        try validateCaptureAuthority(pose)
         guard let current = coordinators[key] else {
             throw TemporalSpatialMemoryServiceError.missingMappedIdentity
         }
 
         let previousClock = current.snapshot.latestClock
+        guard poseValidator != nil || previousClock?.authorization != .currentCapture else {
+            throw TemporalSpatialMemoryServiceError.captureAuthorityRequired
+        }
         let epoch: UInt64
         if let previousClock, previousClock.captureSegmentID == pose.segmentID {
             epoch = previousClock.epoch
@@ -201,7 +214,8 @@ public actor TemporalSpatialMemoryService {
             .addingReportingOverflow(1)
         guard !sequenceOverflow else { throw TemporalSpatialMemoryError.revisionOverflow }
         let clock = try TemporalSpatialClock(
-            epoch: epoch, captureSegmentID: pose.segmentID, monotonicTimestamp: pose.timestamp
+            epoch: epoch, captureSegmentID: pose.segmentID, monotonicTimestamp: pose.timestamp,
+            authorization: poseValidator == nil ? .recordedSegments : .currentCapture
         )
 
         let update = try TemporalSpatialUpdate(
@@ -240,11 +254,18 @@ public actor TemporalSpatialMemoryService {
         )
 
         try Task.checkCancellation()
+        try validateCaptureAuthority(pose)
+        let validateBeforeCommit: @Sendable () throws -> Void = { [poseValidator] in
+            if let poseValidator, !poseValidator(pose) {
+                throw TemporalSpatialMemoryServiceError.captureAuthorityMismatch
+            }
+        }
         let appendResult = try await journalRepository.append(
             entry,
             policy: policy,
             previousSnapshot: current.snapshot,
-            resultingSnapshot: next.snapshot
+            resultingSnapshot: next.snapshot,
+            validateBeforeCommit: validateBeforeCommit
         )
         try validateGeneration(generation)
         switch appendResult {
@@ -288,6 +309,12 @@ public actor TemporalSpatialMemoryService {
         try Task.checkCancellation()
         guard generation == resetGeneration else {
             throw CancellationError()
+        }
+    }
+
+    private func validateCaptureAuthority(_ pose: ARPoseSnapshot) throws {
+        if let poseValidator, !poseValidator(pose) {
+            throw TemporalSpatialMemoryServiceError.captureAuthorityMismatch
         }
     }
 

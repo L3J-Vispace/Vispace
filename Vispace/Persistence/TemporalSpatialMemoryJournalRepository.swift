@@ -294,7 +294,7 @@ public struct TemporalSpatialMemoryJournalRecord: Codable, Hashable, Sendable {
 }
 
 public struct TemporalSpatialMemoryJournalCatalog: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 2
+    public static let currentSchemaVersion: UInt16 = 3
     public static let absoluteMaximumJournalCount = 64
 
     public let schemaVersion: UInt16
@@ -434,9 +434,11 @@ public actor TemporalSpatialMemoryJournalRepository {
         _ entry: TemporalSpatialMemoryJournalEntry,
         policy: TemporalSpatialMemoryPolicy,
         previousSnapshot: TemporalSpatialMemorySnapshot,
-        resultingSnapshot: TemporalSpatialMemorySnapshot
+        resultingSnapshot: TemporalSpatialMemorySnapshot,
+        validateBeforeCommit: (@Sendable () throws -> Void)? = nil
     ) async throws -> TemporalSpatialMemoryJournalAppendResult {
         try Task.checkCancellation()
+        try validateBeforeCommit?()
         var catalog = try loadCatalogRecoveringInvalidData()
         try Task.checkCancellation()
         try validateConfiguredCapacity(catalog)
@@ -523,6 +525,7 @@ public actor TemporalSpatialMemoryJournalRepository {
 
         catalog.journals.sort(by: TemporalSpatialMemoryJournalCatalog.journalOrder)
         try Task.checkCancellation()
+        try validateBeforeCommit?()
         try commit(catalog)
         return .appended(resultingSnapshot)
     }
@@ -579,7 +582,7 @@ public actor TemporalSpatialMemoryJournalRepository {
         }
 
         do {
-            try SpatialStorageDirectory.validateJSONSchemas(data, maximumSchemaVersion: 2)
+            try SpatialStorageDirectory.validateJSONSchemas(data, maximumSchemaVersion: 3)
             return try JSONDecoder().decode(
                 TemporalSpatialMemoryJournalCatalog.self,
                 from: data

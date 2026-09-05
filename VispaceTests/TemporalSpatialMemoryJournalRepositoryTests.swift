@@ -4,6 +4,33 @@ import XCTest
 @testable import Vispace
 
 final class TemporalSpatialMemoryJournalRepositoryTests: XCTestCase {
+    func testCaptureAuthorityIsRevalidatedImmediatelyBeforeDurableCommit() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let policy = temporalTestPolicy()
+        var coordinator = TemporalSpatialMemoryCoordinator(
+            mapID: temporalTestMapID(44), coordinateFrameID: temporalTestFrameID(44), policy: policy
+        )
+        let material = try temporalTestJournalMaterial(
+            coordinator: &coordinator, sequence: 1, timestamp: 100, idNumber: 44
+        )
+        let repository = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let authority = TemporalCommitAuthorityGate()
+        do {
+            _ = try await repository.append(
+                material.entry, policy: policy, previousSnapshot: material.previous,
+                resultingSnapshot: material.resulting,
+                validateBeforeCommit: { try authority.validateThenRevoke() }
+            )
+            XCTFail("Authority revoked after admission must prevent the durable commit")
+        } catch {
+            XCTAssertEqual(error as? TemporalSpatialMemoryServiceError, .captureAuthorityMismatch)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: catalogURL(in: root).path))
+        let empty = try await repository.catalogSnapshot()
+        XCTAssertTrue(empty.journals.isEmpty)
+    }
+
     func testRestartReplaysExactBoundedJournalWithoutRawFramePayloads() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -382,6 +409,18 @@ final class TemporalSpatialMemoryJournalRepositoryTests: XCTestCase {
             "vispace-temporal-journal-tests-\(UUID().uuidString)",
             isDirectory: true
         )
+    }
+}
+
+private final class TemporalCommitAuthorityGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isCurrent = true
+
+    func validateThenRevoke() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard isCurrent else { throw TemporalSpatialMemoryServiceError.captureAuthorityMismatch }
+        isCurrent = false
     }
 }
 

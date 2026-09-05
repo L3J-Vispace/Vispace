@@ -4,6 +4,77 @@ import XCTest
 @testable import Vispace
 
 final class TemporalSpatialMemoryServiceTests: XCTestCase {
+    func testLiveAuthorityRejectsStaleWorkAfterAwaitAndAfterRestart() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(43)
+        let frameID = temporalTestFrameID(43)
+        let oldSegment = CaptureSegmentID()
+        let currentSegment = CaptureSegmentID()
+        let authority = TemporalPoseAuthority(segmentID: oldSegment)
+        let gate = TemporalMetadataReadGate()
+        let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)]
+        ))
+        let repository = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let oldService = TemporalSpatialMemoryService(
+            journalRepository: repository, policy: temporalTestPolicy(),
+            metadataProvider: { await gate.pause(); return try await store.snapshot() },
+            metadataWriter: { try await store.upsert($0) }, poseValidator: { authority.permits($0) }
+        )
+        let oldPose = temporalTestPose(
+            mapID: mapID, coordinateFrameID: frameID, capturedAt: 1_000,
+            sessionTimestamp: 100, sequence: 1, captureSegmentID: oldSegment
+        )
+        let stale = Task {
+            try await oldService.process(TemporalSpatialRecognitionBatch(
+                sequence: 1, observations: [], expectedVisibleObjectIDs: []
+            ), pose: oldPose)
+        }
+        for _ in 0..<200 {
+            if await gate.isWaiting { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let wasWaiting = await gate.isWaiting
+        XCTAssertTrue(wasWaiting)
+        authority.select(currentSegment)
+        await gate.resume()
+        do { _ = try await stale.value; XCTFail("Stale capture must not create an epoch after recovery awaits") }
+        catch { XCTAssertEqual(error as? TemporalSpatialMemoryServiceError, .captureAuthorityMismatch) }
+        let empty = try await repository.catalogSnapshot()
+        XCTAssertTrue(empty.journals.isEmpty)
+
+        let active = makeService(repository: repository, store: store, poseValidator: { authority.permits($0) })
+        _ = try await active.process(TemporalSpatialRecognitionBatch(
+            sequence: 1, observations: [], expectedVisibleObjectIDs: []
+        ), pose: temporalTestPose(
+            mapID: mapID, coordinateFrameID: frameID, capturedAt: 100,
+            sessionTimestamp: 1, sequence: 2, captureSegmentID: currentSegment
+        ))
+        let restarted = makeService(repository: repository, store: store, poseValidator: { authority.permits($0) })
+        let before = try await restarted.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(before.latestClock?.authorization, .currentCapture)
+        XCTAssertTrue(before.retiredCaptureSegmentIDs.isEmpty)
+        do {
+            _ = try await restarted.process(TemporalSpatialRecognitionBatch(
+                sequence: 50, observations: [], expectedVisibleObjectIDs: []
+            ), pose: oldPose)
+            XCTFail("Restart must not revive an old capture as a fresh epoch")
+        } catch { XCTAssertEqual(error as? TemporalSpatialMemoryServiceError, .captureAuthorityMismatch) }
+        let after = try await restarted.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(after, before)
+        let withoutAuthority = makeService(repository: repository, store: store)
+        do {
+            _ = try await withoutAuthority.process(TemporalSpatialRecognitionBatch(
+                sequence: 2, observations: [], expectedVisibleObjectIDs: []
+            ), pose: temporalTestPose(
+                mapID: mapID, coordinateFrameID: frameID, capturedAt: 101,
+                sessionTimestamp: 2, sequence: 3, captureSegmentID: currentSegment
+            ))
+            XCTFail("An authority-backed journal must not downgrade to unverified segment admission")
+        } catch { XCTAssertEqual(error as? TemporalSpatialMemoryServiceError, .captureAuthorityRequired) }
+    }
+
     func testFutureLegacySeedReplaysProjectionAtRealTimeBeforeNewObservation() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -647,7 +718,8 @@ final class TemporalSpatialMemoryServiceTests: XCTestCase {
 
     private func makeService(
         repository: TemporalSpatialMemoryJournalRepository,
-        store: TemporalMetadataStore
+        store: TemporalMetadataStore,
+        poseValidator: TemporalSpatialMemoryService.PoseValidator? = nil
     ) -> TemporalSpatialMemoryService {
         TemporalSpatialMemoryService(
             journalRepository: repository,
@@ -657,7 +729,8 @@ final class TemporalSpatialMemoryServiceTests: XCTestCase {
             },
             metadataWriter: { metadata in
                 try await store.upsert(metadata)
-            }
+            },
+            poseValidator: poseValidator
         )
     }
 
@@ -666,6 +739,25 @@ final class TemporalSpatialMemoryServiceTests: XCTestCase {
             "vispace-temporal-service-tests-\(UUID().uuidString)",
             isDirectory: true
         )
+    }
+}
+
+private final class TemporalPoseAuthority: @unchecked Sendable {
+    private let lock = NSLock()
+    private var segmentID: CaptureSegmentID
+
+    init(segmentID: CaptureSegmentID) { self.segmentID = segmentID }
+
+    func select(_ segmentID: CaptureSegmentID) {
+        lock.lock()
+        self.segmentID = segmentID
+        lock.unlock()
+    }
+
+    func permits(_ pose: ARPoseSnapshot) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pose.segmentID == segmentID
     }
 }
 

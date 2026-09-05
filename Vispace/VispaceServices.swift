@@ -66,7 +66,8 @@ final class VispaceServices: ObservableObject {
             metadataProvider: {
                 try await repository.metadataSnapshot()
             },
-            metadataWriter: durableMetadataWriter
+            metadataWriter: durableMetadataWriter,
+            poseValidator: sessionController.makeTemporalPoseValidator()
         )
         let detectorResolution: ObjectDetectorResolution
         #if DEBUG

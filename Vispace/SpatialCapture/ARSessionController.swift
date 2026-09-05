@@ -44,7 +44,9 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
         ) async throws -> SpatialMapMetadata
     public typealias WorldMapRestoreProvider = @Sendable () async throws -> WorldMapRestoreCandidate?
 
-    @Published public private(set) var state: ARSessionControllerState = .detached
+    @Published public private(set) var state: ARSessionControllerState = .detached {
+        didSet { temporalCaptureGate.value = state == .running && sessionIsRunning }
+    }
     @Published public private(set) var capabilities: ARCaptureCapabilities?
     @Published public private(set) var persistenceFailureMessage: String?
     private var restoreFailureMessage: String?
@@ -90,6 +92,27 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
         )
     }
 
+    /// Synchronous authority for the journal commit boundary. Captures only
+    /// thread-safe boxes/proxy, so the service neither retains this controller
+    /// nor hops actors after deciding whether an old capture is still current.
+    public func makeTemporalPoseValidator() -> TemporalSpatialMemoryService.PoseValidator {
+        let proxy = delegateProxy
+        let identityBox = captureIdentityBox
+        let gate = temporalCaptureGate
+        return { pose in
+            guard gate.value else { return false }
+            let token = proxy.currentFrameToken()
+            let identity = identityBox.value
+            guard identity.mapID == pose.mapID,
+                PerceptionFrameValidator().confirmedIdentity(
+                    for: pose, currentToken: token, currentIdentity: identity, sessionIsRunning: true
+                ) != nil else { return false }
+            // A lifecycle transition between the independent locked reads
+            // invalidates admission instead of splicing two run identities.
+            return gate.value && token == proxy.currentFrameToken() && identity == identityBox.value
+        }
+    }
+
     private weak var arView: ARView?
     private let delegateQueue: DispatchQueue
     private let worldMapArchiveQueue: DispatchQueue
@@ -98,6 +121,7 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
     private let displayGeometry: FrameDisplayGeometryBox
     private let captureIdentityBox: ARCaptureIdentityBox
     private let sessionRunContextBox: ARSessionRunContextBox
+    private let temporalCaptureGate = ARTemporalCaptureRunningGate()
     private let configurationOptions: ARWorldTrackingOptions
     private let worldMapArchiveHandler: WorldMapArchiveHandler?
     private let worldMapRestoreProvider: WorldMapRestoreProvider?
@@ -112,7 +136,9 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
     private var eventMonitorTask: Task<Void, Never>?
     private var relocalizationTimeoutTask: Task<Void, Never>?
     private var wantsActivation = false
-    private var sessionIsRunning = false
+    private var sessionIsRunning = false {
+        didSet { temporalCaptureGate.value = state == .running && sessionIsRunning }
+    }
     private var sessionIsInterrupted = false
     private var pendingInitialWorldMap: ARWorldMap?
     private var hasAttemptedRestore = false
@@ -1415,6 +1441,24 @@ private final class FrameImageOrientationBox: @unchecked Sendable {
         set {
             lock.lock()
             storedValue = newValue
+            lock.unlock()
+        }
+    }
+}
+
+private final class ARTemporalCaptureRunningGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isRunning = false
+
+    var value: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return isRunning
+        }
+        set {
+            lock.lock()
+            isRunning = newValue
             lock.unlock()
         }
     }

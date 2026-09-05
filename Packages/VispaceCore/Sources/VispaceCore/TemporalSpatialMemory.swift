@@ -325,26 +325,40 @@ public struct TemporalSpatialObservation: Codable, Hashable, Sendable {
 /// date. A new capture segment starts the next durable epoch; elapsed-time
 /// evidence is never carried across that boundary.
 public struct TemporalSpatialClock: Codable, Hashable, Sendable {
+    public enum Authorization: String, Codable, Hashable, Sendable {
+        /// Standalone reducers remember retired segment identifiers.
+        case recordedSegments
+        /// The ingestion boundary validated the exact currently active AR run.
+        /// Replay trusts this durable admission decision, not a live session.
+        case currentCapture
+    }
+
     public let epoch: UInt64
     public let captureSegmentID: CaptureSegmentID
     public let monotonicTimestamp: TimeInterval
+    public let authorization: Authorization
 
-    public init(epoch: UInt64, captureSegmentID: CaptureSegmentID, monotonicTimestamp: TimeInterval) throws {
+    public init(
+        epoch: UInt64, captureSegmentID: CaptureSegmentID, monotonicTimestamp: TimeInterval,
+        authorization: Authorization = .recordedSegments
+    ) throws {
         guard epoch > 0, monotonicTimestamp.isFinite, monotonicTimestamp >= 0 else {
             throw TemporalSpatialMemoryError.invalidClock
         }
         self.epoch = epoch
         self.captureSegmentID = captureSegmentID
         self.monotonicTimestamp = monotonicTimestamp
+        self.authorization = authorization
     }
 
-    private enum CodingKeys: String, CodingKey { case epoch, captureSegmentID, monotonicTimestamp }
+    private enum CodingKeys: String, CodingKey { case epoch, captureSegmentID, monotonicTimestamp, authorization }
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         try self.init(
             epoch: container.decode(UInt64.self, forKey: .epoch),
             captureSegmentID: container.decode(CaptureSegmentID.self, forKey: .captureSegmentID),
-            monotonicTimestamp: container.decode(TimeInterval.self, forKey: .monotonicTimestamp)
+            monotonicTimestamp: container.decode(TimeInterval.self, forKey: .monotonicTimestamp),
+            authorization: container.decodeIfPresent(Authorization.self, forKey: .authorization) ?? .recordedSegments
         )
     }
 }
@@ -600,7 +614,7 @@ private struct TemporalObjectState: Codable, Hashable, Sendable {
 }
 
 public struct TemporalSpatialMemorySnapshot: Codable, Hashable, Sendable {
-    private static let schemaVersion = 2
+    private static let schemaVersion = 3
 
     public fileprivate(set) var revision: UInt64
     public fileprivate(set) var latestSequence: UInt64?
@@ -678,9 +692,17 @@ public struct TemporalSpatialMemorySnapshot: Codable, Hashable, Sendable {
             forKey: .latestTimestamp
         )
         latestClock = try container.decodeIfPresent(TemporalSpatialClock.self, forKey: .latestClock)
-        retiredCaptureSegmentIDs = try container.decodeIfPresent(
-            Set<CaptureSegmentID>.self, forKey: .retiredCaptureSegmentIDs
-        ) ?? []
+        if version == 1 {
+            retiredCaptureSegmentIDs = []
+        } else {
+            retiredCaptureSegmentIDs = try container.decode(
+                Set<CaptureSegmentID>.self, forKey: .retiredCaptureSegmentIDs
+            )
+        }
+        guard (version > 1 || latestClock == nil),
+            version >= 3 || latestClock?.authorization != .currentCapture else {
+            throw TemporalSpatialMemoryError.invalidSnapshot
+        }
         mapID = try container.decode(MapID.self, forKey: .mapID)
         coordinateFrameID = try container.decode(
             CoordinateFrameID.self,
@@ -700,6 +722,13 @@ public struct TemporalSpatialMemorySnapshot: Codable, Hashable, Sendable {
         )
 
         guard objectStates.count <= TemporalSpatialMemoryPolicy.maximumAllowedObjectCount,
+            retiredCaptureSegmentIDs.count <= 4_096,
+            latestClock.map({ clock in
+                !retiredCaptureSegmentIDs.contains(clock.captureSegmentID)
+                    && (clock.authorization == .currentCapture
+                        ? retiredCaptureSegmentIDs.isEmpty
+                        : clock.epoch == UInt64(retiredCaptureSegmentIDs.count) + 1)
+            }) ?? retiredCaptureSegmentIDs.isEmpty,
             recentDeltas.count
                 <= TemporalSpatialMemoryPolicy.maximumAllowedRetainedDeltaCount,
             rememberedUpdateIDs.count
@@ -891,8 +920,14 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
         }
         let calendarMovedBackward = update.clock != nil
             && snapshot.latestTimestamp.map { update.timestamp < $0 } == true
+        if update.clock?.authorization == .currentCapture {
+            // Live authority supersedes tombstones: old work cannot acquire
+            // a new epoch merely by presenting an unseen segment identifier.
+            working.retiredCaptureSegmentIDs.removeAll()
+        }
         if startsClockEpoch || calendarMovedBackward {
-            if startsClockEpoch, let previous = working.latestClock {
+            if startsClockEpoch, update.clock?.authorization != .currentCapture,
+                let previous = working.latestClock {
                 working.retiredCaptureSegmentIDs.insert(previous.captureSegmentID)
             }
             for objectID in Array(working.objectStates.keys) {
@@ -990,7 +1025,12 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
             }
             return false
         }
-        guard !snapshot.retiredCaptureSegmentIDs.contains(clock.captureSegmentID) else {
+        guard snapshot.latestClock?.authorization != .currentCapture
+            || clock.authorization == .currentCapture else {
+            throw TemporalSpatialMemoryError.clockEpochConflict
+        }
+        guard clock.authorization == .currentCapture
+            || !snapshot.retiredCaptureSegmentIDs.contains(clock.captureSegmentID) else {
             throw TemporalSpatialMemoryError.clockEpochConflict
         }
         guard let previous = snapshot.latestClock else {
@@ -1015,7 +1055,7 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
         }
         // Durable tombstones cannot be silently dropped: doing so would allow
         // old capture segments to be reintroduced as a fresh epoch.
-        guard snapshot.retiredCaptureSegmentIDs.count < 4_096 else {
+        guard clock.authorization == .currentCapture || snapshot.retiredCaptureSegmentIDs.count < 4_096 else {
             throw TemporalSpatialMemoryError.clockEpochCapacityExceeded
         }
         return true
@@ -1395,7 +1435,9 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
             snapshot.retiredCaptureSegmentIDs.count <= 4_096,
             snapshot.latestClock.map({ !snapshot.retiredCaptureSegmentIDs.contains($0.captureSegmentID) }) ?? true,
             snapshot.latestClock.map({
-                snapshot.revision > 0 && $0.epoch == UInt64(snapshot.retiredCaptureSegmentIDs.count) + 1
+                snapshot.revision > 0 && ($0.authorization == .currentCapture
+                    ? snapshot.retiredCaptureSegmentIDs.isEmpty
+                    : $0.epoch == UInt64(snapshot.retiredCaptureSegmentIDs.count) + 1)
             }) ?? snapshot.retiredCaptureSegmentIDs.isEmpty,
             snapshot.recentDeltas.count <= policy.maximumRetainedDeltaCount,
             snapshot.rememberedUpdateIDs.count <= policy.maximumRememberedUpdateCount,

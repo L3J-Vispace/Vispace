@@ -6,6 +6,74 @@ final class TemporalSpatialMemoryTests: XCTestCase {
     private let map = MapID(rawValue: testUUID(81_001))
     private let frame = CoordinateFrameID(rawValue: testUUID(81_002))
 
+    func testCurrentCaptureAuthorityContinuesBeyond4096SessionsWithoutRetiredHistory() throws {
+        var coordinator = makeCoordinator()
+        for epoch in 1...4_100 {
+            _ = try coordinator.apply(update(
+                revision: UInt64(epoch - 1), sequence: UInt64(epoch), at: Double(10_000 - epoch),
+                clock: TemporalSpatialClock(
+                    epoch: UInt64(epoch), captureSegmentID: CaptureSegmentID(), monotonicTimestamp: 1,
+                    authorization: .currentCapture
+                )
+            ))
+        }
+        XCTAssertEqual(coordinator.snapshot.latestClock?.epoch, 4_100)
+        XCTAssertTrue(coordinator.snapshot.retiredCaptureSegmentIDs.isEmpty)
+        let restored = try JSONDecoder().decode(
+            TemporalSpatialMemorySnapshot.self, from: JSONEncoder().encode(coordinator.snapshot)
+        )
+        var restarted = try TemporalSpatialMemoryCoordinator(restoring: restored, policy: testPolicy())
+        _ = try restarted.apply(update(
+            revision: 4_100, sequence: 4_101, at: 100,
+            clock: TemporalSpatialClock(
+                epoch: 4_101, captureSegmentID: CaptureSegmentID(), monotonicTimestamp: 1,
+                authorization: .currentCapture
+            )
+        ))
+        let before = restarted.snapshot
+        XCTAssertThrowsError(try restarted.apply(update(
+            revision: 4_101, sequence: 4_102, at: 101,
+            clock: TemporalSpatialClock(epoch: 4_102, captureSegmentID: CaptureSegmentID(), monotonicTimestamp: 2)
+        )))
+        XCTAssertEqual(restarted.snapshot, before)
+    }
+
+    func testVersionTwoClockMigratesToCurrentCaptureAndRequiresRetiredHistoryWhenDecoding() throws {
+        var coordinator = makeCoordinator()
+        for epoch in 1...2 {
+            _ = try coordinator.apply(update(
+                revision: UInt64(epoch - 1), sequence: UInt64(epoch), at: Double(epoch),
+                clock: TemporalSpatialClock(epoch: UInt64(epoch), captureSegmentID: CaptureSegmentID(), monotonicTimestamp: 1)
+            ))
+        }
+        var versionTwo = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(coordinator.snapshot)
+        ) as? [String: Any])
+        versionTwo["schemaVersion"] = 2
+        let decoded = try JSONDecoder().decode(
+            TemporalSpatialMemorySnapshot.self, from: JSONSerialization.data(withJSONObject: versionTwo)
+        )
+        var restarted = try TemporalSpatialMemoryCoordinator(restoring: decoded, policy: testPolicy())
+        XCTAssertEqual(restarted.snapshot.retiredCaptureSegmentIDs.count, 1)
+        _ = try restarted.apply(update(
+            revision: 2, sequence: 3, at: 1,
+            clock: TemporalSpatialClock(
+                epoch: 3, captureSegmentID: CaptureSegmentID(), monotonicTimestamp: 1,
+                authorization: .currentCapture
+            )
+        ))
+        XCTAssertTrue(restarted.snapshot.retiredCaptureSegmentIDs.isEmpty)
+        XCTAssertEqual(restarted.snapshot.latestClock?.epoch, 3)
+        versionTwo.removeValue(forKey: "retiredCaptureSegmentIDs")
+        XCTAssertThrowsError(try JSONDecoder().decode(
+            TemporalSpatialMemorySnapshot.self, from: JSONSerialization.data(withJSONObject: versionTwo)
+        ))
+        versionTwo["retiredCaptureSegmentIDs"] = []
+        XCTAssertThrowsError(try JSONDecoder().decode(
+            TemporalSpatialMemorySnapshot.self, from: JSONSerialization.data(withJSONObject: versionTwo)
+        ))
+    }
+
     func testLegacyFutureDatesMigrateWithoutRewritingObservationDates() throws {
         let id = objectID(81_140)
         let value = metadata(id: id, at: 1_000)

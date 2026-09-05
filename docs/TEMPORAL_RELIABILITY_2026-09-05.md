@@ -12,13 +12,15 @@
 
 `capturedAt`, `firstSeenAt`, `lastSeenAt`, `stateUpdatedAt`은 실제 관측 당시의 달력 시간을 보존한다. 기기 시간이 정상으로 돌아오면 `lastSeenAt < firstSeenAt`이 될 수 있으며, 날짜를 미래로 올리거나 과거 기록을 다시 쓰지 않는다. v2 물체의 양의 `temporalRevision`이 저장 순서를 결정하므로, 실제 날짜가 이전 값보다 작아도 최신 관측을 저장할 수 있다. 같은 revision의 다른 관측이나 이전 revision은 저장소와 delta reducer에서 거절한다.
 
-각 capture segment는 영구 journal의 clock epoch에 연결된다. 같은 epoch 안에서는 AR 세션의 단조 증가 시간이 엄격히 증가해야 한다. 새 segment는 다음 epoch를 사용하고, 재시작 뒤에도 이전 segment의 재유입을 거절한다. 미관측 유예와 이동 증거 간격은 달력 시간이 아닌 세션 경과 시간으로 계산한다. epoch 전환이나 달력 역행 시 기존 미관측·이동 증거를 초기화하고 새 증거부터 보수적으로 누적한다. 인식 pipeline도 달력 역행 시 진행 중 promotion 창을 초기화한다.
+각 capture segment는 영구 journal의 clock epoch에 연결된다. 같은 epoch 안에서는 AR 세션의 단조 증가 시간이 엄격히 증가해야 한다. 새 segment는 다음 epoch를 사용한다. 실제 앱에서는 현재 실행 중인 ARSession의 attachment/run token, confirmed segment/map/frame을 외부 capture authority가 검증해야 epoch를 만들 수 있다. 서비스 진입, 비동기 복구 이후, journal의 실제 commit 직전에 같은 권한을 다시 확인한다. 이전 segment의 지연 결과는 재시작 뒤에도 현재 권한과 일치하지 않아 거절한다. journal에 수락된 권한과 epoch ordinal을 남기므로 과거 segment ID를 무한히 모으지 않아도 된다.
 
-metadata 문서, temporal journal catalog, snapshot은 명시적으로 schema v2를 기록하며 v1을 읽어 마이그레이션한다. schema probe는 해당 저장소에서만 v2를 허용하므로 구버전 앱의 미래 schema 보존 처리와 호환된다. journal이 없는 가져온 공간은 객체의 최대 temporal revision을 시작점으로 사용하고, 기존 날짜와 사용자 이름을 보존한 채 관계 projection을 복구한다. 첫 새 관측은 이 revision보다 큰 값을 사용한다.
+미관측 유예와 이동 증거 간격은 달력 시간이 아닌 세션 경과 시간으로 계산한다. epoch 전환이나 달력 역행 시 기존 미관측·이동 증거를 초기화하고 새 증거부터 보수적으로 누적한다. 인식 pipeline도 달력 역행 시 진행 중 promotion 창을 초기화한다. 세션 전환으로 무효화된 결과는 저장 장애 배너를 만들지 않고 취소한다.
+
+metadata 문서는 schema v2, temporal journal catalog와 snapshot은 schema v3을 기록한다. v1과 이전 v2를 명시적으로 읽고, v2의 retired segment 필드 누락·epoch 불일치는 거절한다. v2 기록은 첫 현재 capture authority 검증을 통과한 업데이트에서 기존 ordinal을 유지한 채 v3로 전환하고 tombstone 집합을 비운다. 이후 authority 없는 처리로 되돌리는 것은 허용하지 않는다. schema probe는 해당 저장소에서만 새 버전을 허용하므로 구버전 앱의 미래 schema 보존 처리와 호환된다. journal이 없는 가져온 공간은 객체의 최대 temporal revision을 시작점으로 사용하고, 기존 날짜와 사용자 이름을 보존한 채 관계 projection을 복구한다. 첫 새 관측은 이 revision보다 큰 값을 사용한다.
 
 관계는 endpoint의 temporal revision과 실제 생성 날짜를 함께 기록한다. 저장된 graph의 미래 날짜 high-water mark를 새 관계 날짜로 사용하지 않는다. 아직 미래 날짜인 물체의 관계는 보류·제거하고 cold recovery 자체는 정상 완료한다. 해당 물체를 현재 시간에 재관측하면 새 revision으로 관계를 다시 생성한다. metadata 저장과 관계 저장 사이의 조회는 endpoint revision 불일치로 오래된 관계를 거절한다.
 
-과거 관측 당시 기기 시계가 정확했는지는 이 변경만으로 복원할 수 없다. 원래 날짜를 그대로 보존하므로 과거 기록의 절대 날짜는 기기 설정의 영향을 받는다. 재유입 차단용 retired segment ID는 공간당 최대 4,096개를 보존하며, 이 한도를 넘는 새 epoch는 기록을 조용히 버리는 대신 명시적 오류로 중단한다. 이 한계와 실제 iPhone의 시계 변경·앱 재실행 동작은 기기 검증 항목에 포함한다.
+과거 관측 당시 기기 시계가 정확했는지는 이 변경만으로 복원할 수 없다. 원래 날짜를 그대로 보존하므로 과거 기록의 절대 날짜는 기기 설정의 영향을 받는다. 현재 앱의 authority 방식에는 4,096회 세션 전환 한도가 없으며, 4,100회 전환 및 재시작 이후 계속 갱신하는 회귀를 추가했다. authority를 주입하지 않는 독립 Core/legacy 호출자는 종전의 bounded tombstone 방식을 유지한다. 실제 iPhone의 시계 변경·앱 재실행 동작은 기기 검증 항목에 포함한다.
 
 ## B08: 멀리 이동한 물체의 동일성은 미확정
 

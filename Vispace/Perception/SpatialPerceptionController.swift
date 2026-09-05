@@ -718,6 +718,10 @@ public final class SpatialPerceptionController: ObservableObject {
             do {
                 result = try await temporalMemoryProcessor(batch, frame.pose)
             } catch {
+                if error as? TemporalSpatialMemoryServiceError == .captureAuthorityMismatch {
+                    metrics.staleResultsRejected &+= 1
+                    throw CancellationError()
+                }
                 if generation == lifecycleGeneration, !(error is CancellationError) {
                     recordPersistenceFailure(error)
                 }
