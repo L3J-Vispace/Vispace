@@ -81,6 +81,27 @@ public enum SceneGraphError: Error, Equatable, Sendable {
     case duplicateRelation(RelationKey)
 }
 
+public struct SpatialRelationObservationSource: Codable, Hashable, Sendable {
+    public let mapID: MapID
+    public let coordinateFrameID: CoordinateFrameID
+    public let segmentID: CaptureSegmentID
+    public let surfaceRevision: UInt64
+    public let objectRevisionEpoch: UInt64?
+    public let observedAt: TimeInterval
+
+    public init(
+        mapID: MapID, coordinateFrameID: CoordinateFrameID, segmentID: CaptureSegmentID,
+        surfaceRevision: UInt64, observedAt: TimeInterval, objectRevisionEpoch: UInt64? = nil
+    ) {
+        self.mapID = mapID
+        self.coordinateFrameID = coordinateFrameID
+        self.segmentID = segmentID
+        self.surfaceRevision = surfaceRevision
+        self.objectRevisionEpoch = objectRevisionEpoch
+        self.observedAt = observedAt
+    }
+}
+
 public struct SpatialRelation: Codable, Hashable, Sendable {
     public let key: RelationKey
     public let confidence: ConfidenceScore
@@ -89,6 +110,7 @@ public struct SpatialRelation: Codable, Hashable, Sendable {
     public let validUntil: TimeInterval?
     public let subjectTemporalRevision: UInt64?
     public let objectTemporalRevision: UInt64?
+    public let observationSource: SpatialRelationObservationSource?
 
     public init(
         key: RelationKey,
@@ -97,12 +119,15 @@ public struct SpatialRelation: Codable, Hashable, Sendable {
         validFrom: TimeInterval,
         validUntil: TimeInterval? = nil,
         subjectTemporalRevision: UInt64? = nil,
-        objectTemporalRevision: UInt64? = nil
+        objectTemporalRevision: UInt64? = nil,
+        observationSource: SpatialRelationObservationSource? = nil
     ) throws {
         guard validFrom.isFinite, validFrom >= 0,
             validUntil.map({ $0.isFinite && $0 >= validFrom }) ?? true,
             subjectTemporalRevision.map({ $0 > 0 }) ?? true,
-            objectTemporalRevision.map({ $0 > 0 }) ?? true
+            objectTemporalRevision.map({ $0 > 0 }) ?? true,
+            observationSource.map({ $0.observedAt.isFinite && $0.observedAt >= 0 && validUntil != nil })
+                ?? true
         else {
             throw SceneGraphError.invalidValidityRange
         }
@@ -113,6 +138,7 @@ public struct SpatialRelation: Codable, Hashable, Sendable {
         self.validUntil = validUntil
         self.subjectTemporalRevision = subjectTemporalRevision
         self.objectTemporalRevision = objectTemporalRevision
+        self.observationSource = observationSource
     }
 
     public func isValid(at time: TimeInterval) -> Bool {
@@ -127,6 +153,7 @@ public struct SpatialRelation: Codable, Hashable, Sendable {
         case validUntil
         case subjectTemporalRevision
         case objectTemporalRevision
+        case observationSource
     }
 
     public init(from decoder: Decoder) throws {
@@ -139,7 +166,10 @@ public struct SpatialRelation: Codable, Hashable, Sendable {
                 validFrom: container.decode(TimeInterval.self, forKey: .validFrom),
                 validUntil: container.decodeIfPresent(TimeInterval.self, forKey: .validUntil),
                 subjectTemporalRevision: container.decodeIfPresent(UInt64.self, forKey: .subjectTemporalRevision),
-                objectTemporalRevision: container.decodeIfPresent(UInt64.self, forKey: .objectTemporalRevision)
+                objectTemporalRevision: container.decodeIfPresent(
+                    UInt64.self, forKey: .objectTemporalRevision),
+                observationSource: container.decodeIfPresent(
+                    SpatialRelationObservationSource.self, forKey: .observationSource)
             )
         } catch let error as DecodingError {
             throw error
@@ -161,6 +191,7 @@ public struct SpatialRelation: Codable, Hashable, Sendable {
         try container.encodeIfPresent(validUntil, forKey: .validUntil)
         try container.encodeIfPresent(subjectTemporalRevision, forKey: .subjectTemporalRevision)
         try container.encodeIfPresent(objectTemporalRevision, forKey: .objectTemporalRevision)
+        try container.encodeIfPresent(observationSource, forKey: .observationSource)
     }
 }
 

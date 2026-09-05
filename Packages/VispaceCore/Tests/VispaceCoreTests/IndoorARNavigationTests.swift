@@ -843,7 +843,7 @@ final class IndoorARNavigationTests: XCTestCase {
         )
     }
 
-    func testDoorMustReferenceExistingFloorCellsInDifferentZones() throws {
+    func testDoorMustReferenceExistingFloorCellsAndCanConstrainSameZone() throws {
         let door = try IndoorNavigationDoorEvidence(
             identifier: "orphan",
             firstCell: cell(0),
@@ -868,8 +868,59 @@ final class IndoorARNavigationTests: XCTestCase {
                 to: try destination(column: 1),
                 using: sameZone
             ).reason,
-            .inconsistentDoorEvidence
+            .routeFound
         )
+    }
+
+    func testSameZoneDoorStatesConstrainCrossingWithoutBlockingUnrelatedRoute() throws {
+        for state: IndoorNavigationDoorState in [.open, .closed, .unknown] {
+            let door = try IndoorNavigationDoorEvidence(
+                identifier: "within-room",
+                firstCell: cell(1), secondCell: cell(2), state: state, confidence: score(0.9))
+            let evidence = try makeEvidence(cells: lineCells(0...3), doors: [door])
+            let crossing = IndoorARNavigationEngine().route(
+                from: try start(column: 0),
+                to: try destination(column: 3), using: evidence)
+            XCTAssertEqual(
+                crossing.status,
+                state == .open ? .success : (state == .closed ? .unreachable : .insufficientEvidence))
+            XCTAssertEqual(
+                IndoorARNavigationEngine().route(
+                    from: try start(column: 0),
+                    to: try destination(column: 1), using: evidence
+                ).status, .success)
+        }
+    }
+
+    func testExpiredOpenDoorRevokesOnlyCrossingAndSurvivesCodingRoundTrip() throws {
+        let door = try IndoorNavigationDoorEvidence(
+            identifier: "fresh-door",
+            firstCell: cell(1), secondCell: cell(2), state: .open, confidence: score(0.9),
+            observedAt: 100, validUntil: 100.75)
+        let encoded = try JSONEncoder().encode(try makeEvidence(cells: lineCells(0...3), doors: [door]))
+        let evidence = try JSONDecoder().decode(IndoorNavigationEvidence.self, from: encoded)
+        XCTAssertEqual(evidence.doors.first?.validUntil, 100.75)
+        let engine = IndoorARNavigationEngine()
+        XCTAssertEqual(
+            engine.route(
+                from: try start(column: 0), to: try destination(column: 3),
+                using: evidence, evaluatedAt: 100.5
+            ).status, .success)
+        XCTAssertEqual(
+            engine.route(
+                from: try start(column: 0), to: try destination(column: 3),
+                using: evidence, evaluatedAt: 100.75
+            ).status, .insufficientEvidence)
+        XCTAssertEqual(
+            engine.route(
+                from: try start(column: 0), to: try destination(column: 1),
+                using: evidence, evaluatedAt: 100.75
+            ).status, .success)
+        XCTAssertThrowsError(
+            try IndoorNavigationDoorEvidence(
+                identifier: "invalid-lease",
+                firstCell: cell(0), secondCell: cell(1), state: .open, confidence: score(0.9),
+                observedAt: 100, validUntil: 99))
     }
 
     func testInputExplorationAndWaypointCapacityLimitsFailClosed() throws {

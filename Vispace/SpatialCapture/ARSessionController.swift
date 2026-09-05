@@ -58,6 +58,14 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
     public var surfaces: AsyncStream<ARSurfaceStateSnapshot> { delegateProxy.surfaces }
     public var events: AsyncStream<ARSessionEvent> { delegateProxy.events }
     public var captureIdentity: ARCaptureIdentity { captureIdentityBox.value }
+    public var latestSurfaceSnapshot: ARSurfaceStateSnapshot? {
+        guard let frame = latestDepthFrame, let surface = delegateProxy.surfaceChannel.latest,
+            surface.mapID == frame.pose.mapID, surface.coordinateFrameID == frame.pose.coordinateFrameID,
+            surface.segmentID == frame.pose.segmentID,
+            surface.hasFreshSurfaces(at: frame.pose.timestamp, maximumAge: 5)
+        else { return nil }
+        return surface
+    }
     public var latestDepthFrame: ARFrameSnapshot? {
         guard state == .running, let frame = delegateProxy.frameChannel.latest,
             confirmedCaptureIdentity(for: frame) == captureIdentity,

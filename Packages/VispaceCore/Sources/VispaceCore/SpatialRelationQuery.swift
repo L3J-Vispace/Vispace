@@ -29,10 +29,20 @@ public enum SpatialRelationQueryIssue: String, Codable, Hashable, Sendable {
 public struct SpatialRelationQueryEntity: Codable, Hashable, Sendable {
     public let objectID: ObjectID
     public let semanticLabel: String
+    public let displayName: String?
+    public let lastSeenAt: TimeInterval?
+    public let position: Vec3?
+    public var name: String { displayName ?? semanticLabel }
 
-    public init(objectID: ObjectID, semanticLabel: String) {
+    public init(
+        objectID: ObjectID, semanticLabel: String, displayName: String? = nil,
+        lastSeenAt: TimeInterval? = nil, position: Vec3? = nil
+    ) {
         self.objectID = objectID
         self.semanticLabel = semanticLabel
+        self.displayName = displayName
+        self.lastSeenAt = lastSeenAt
+        self.position = position
     }
 }
 
@@ -58,6 +68,16 @@ public struct GroundedSpatialRelationMatch: Codable, Hashable, Sendable {
     }
 }
 
+public struct SpatialRelationQueryTarget: Codable, Hashable, Sendable {
+    public let mention: String
+    public let candidates: [SpatialRelationQueryEntity]
+
+    public init(mention: String, candidates: [SpatialRelationQueryEntity]) {
+        self.mention = mention
+        self.candidates = candidates
+    }
+}
+
 public struct SpatialRelationQueryResult: Codable, Hashable, Sendable {
     public let mode: SpatialRelationQueryMode?
     public let status: SpatialRelationQueryStatus
@@ -67,6 +87,7 @@ public struct SpatialRelationQueryResult: Codable, Hashable, Sendable {
     /// Non-nil only for an unambiguous two-object verification request.
     public let isAffirmative: Bool?
     public let issues: [SpatialRelationQueryIssue]
+    public let ambiguousTargets: [SpatialRelationQueryTarget]
 
     public init(
         mode: SpatialRelationQueryMode?,
@@ -75,7 +96,8 @@ public struct SpatialRelationQueryResult: Codable, Hashable, Sendable {
         referenceObject: SpatialRelationQueryEntity?,
         matches: [GroundedSpatialRelationMatch],
         isAffirmative: Bool?,
-        issues: [SpatialRelationQueryIssue]
+        issues: [SpatialRelationQueryIssue],
+        ambiguousTargets: [SpatialRelationQueryTarget] = []
     ) {
         self.mode = mode
         self.status = status
@@ -84,6 +106,26 @@ public struct SpatialRelationQueryResult: Codable, Hashable, Sendable {
         self.matches = matches
         self.isAffirmative = isAffirmative
         self.issues = issues
+        self.ambiguousTargets = ambiguousTargets
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case mode, status, predicate, referenceObject, matches, isAffirmative, issues, ambiguousTargets
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            mode: try container.decodeIfPresent(SpatialRelationQueryMode.self, forKey: .mode),
+            status: try container.decode(SpatialRelationQueryStatus.self, forKey: .status),
+            predicate: try container.decodeIfPresent(SpatialRelationPredicate.self, forKey: .predicate),
+            referenceObject: try container.decodeIfPresent(
+                SpatialRelationQueryEntity.self, forKey: .referenceObject),
+            matches: try container.decode([GroundedSpatialRelationMatch].self, forKey: .matches),
+            isAffirmative: try container.decodeIfPresent(Bool.self, forKey: .isAffirmative),
+            issues: try container.decode([SpatialRelationQueryIssue].self, forKey: .issues),
+            ambiguousTargets: try container.decodeIfPresent(
+                [SpatialRelationQueryTarget].self, forKey: .ambiguousTargets) ?? [])
     }
 }
 
@@ -124,13 +166,24 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
 
     public func geometryScope(
         for utterance: String,
-        records: [StoredSpatialObjectRecord]
+        records: [StoredSpatialObjectRecord],
+        selections: [String: ObjectID] = [:]
     ) -> SpatialRelationQueryGeometryScope? {
-        guard let predicate = detectedPredicate(in: utterance), predicate.isGeometryDerived else { return nil }
+        guard let scope = targetScope(for: utterance, records: records, selections: selections),
+            scope.predicate.isGeometryDerived
+        else { return nil }
+        return scope
+    }
+
+    public func targetScope(
+        for utterance: String, records: [StoredSpatialObjectRecord], selections: [String: ObjectID] = [:]
+    ) -> SpatialRelationQueryGeometryScope? {
+        guard let predicate = detectedPredicate(in: utterance) else { return nil }
         let eligible = eligibleRecords(records)
-        let labels = orderedDistinctLabels(semanticMentions(in: utterance, records: eligible))
+        let targets = groundedTargets(in: utterance, records: eligible, selections: selections)
+        let labels = targets.map(\.mention)
         guard (1...2).contains(labels.count) else { return nil }
-        let byLabel = Dictionary(grouping: eligible) { normalize($0.metadata.object.semanticLabel) }
+        let byLabel = Dictionary(uniqueKeysWithValues: targets.map { ($0.mention, $0.records) })
         var objectIDs: Set<ObjectID> = []
         for label in labels {
             guard let matches = byLabel[label], matches.count == 1 else { return nil }
@@ -143,7 +196,8 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
         _ utterance: String,
         records: [StoredSpatialObjectRecord],
         graph: SceneGraph,
-        at currentTime: TimeInterval
+        at currentTime: TimeInterval,
+        selections: [String: ObjectID] = [:]
     ) throws -> SpatialRelationQueryResult {
         guard currentTime.isFinite, currentTime >= 0 else {
             throw SpatialRelationQueryError.invalidCurrentTime
@@ -156,8 +210,8 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
         }
 
         let eligible = eligibleRecords(records)
-        let mentions = semanticMentions(in: utterance, records: eligible)
-        let orderedLabels = orderedDistinctLabels(mentions)
+        let targets = groundedTargets(in: utterance, records: eligible, selections: selections)
+        let orderedLabels = targets.map(\.mention)
         guard !orderedLabels.isEmpty else {
             return SpatialRelationQueryResult(
                 mode: nil,
@@ -170,8 +224,18 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
             )
         }
 
-        let entitiesByLabel = Dictionary(grouping: eligible) {
-            normalize($0.metadata.object.semanticLabel)
+        let entitiesByLabel = Dictionary(uniqueKeysWithValues: targets.map { ($0.mention, $0.records) })
+        let ambiguous = targets.filter { $0.records.count != 1 }.map {
+            SpatialRelationQueryTarget(
+                mention: $0.mention, candidates: $0.records.map { entity($0.metadata.object) })
+        }
+        if !ambiguous.isEmpty {
+            return SpatialRelationQueryResult(
+                mode: targets.count == 1 ? .listRelatedObjects : .verifyRelation,
+                status: .ambiguous, predicate: predicate, referenceObject: nil,
+                matches: [], isAffirmative: nil, issues: [.multipleTargetInstances],
+                ambiguousTargets: ambiguous
+            )
         }
         guard orderedLabels.count <= 2 else {
             // Do not answer a different two-object question by silently
@@ -230,6 +294,11 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
         }
         let subject = subjects[0].metadata.object
         let object = objects[0].metadata.object
+        guard subject.id != object.id else {
+            return emptyResult(
+                mode: .verifyRelation, predicate: predicate, status: .ambiguous,
+                issue: .multipleSemanticTargets)
+        }
         let relations = matchingRelations(
             predicate: predicate,
             subjectID: subject.id,
@@ -246,7 +315,7 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
             predicate: predicate,
             referenceObject: entity(object),
             matches: Array(matches),
-            isAffirmative: !matches.isEmpty,
+            isAffirmative: matches.isEmpty ? nil : true,
             issues: matches.isEmpty ? [.noConfirmedRelation] : []
         )
     }
@@ -357,9 +426,9 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
         }
         var mentions: [RelationSemanticMention] = []
         for record in records {
-            let canonical = normalize(record.metadata.object.semanticLabel)
             let terms = Set(
-                ([record.metadata.object.semanticLabel] + record.semanticAliases)
+                ([record.metadata.object.semanticLabel, record.metadata.object.displayName ?? ""]
+                    + record.semanticAliases)
                     .map(normalize)
                     .filter { !$0.isEmpty }
             )
@@ -380,9 +449,10 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
                     }
                     mentions.append(
                         RelationSemanticMention(
-                            canonicalLabel: canonical,
+                            canonicalLabel: term,
+                            objectID: record.metadata.object.id,
                             range: range,
-                            specificity: termTokens.count
+                            specificity: termTokens.joined().count
                         )
                     )
                 }
@@ -399,22 +469,36 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
         }
     }
 
-    private func orderedDistinctLabels(
-        _ mentions: [RelationSemanticMention]
-    ) -> [String] {
-        var labels: [String] = []
-        for mention in mentions where !labels.contains(mention.canonicalLabel) {
-            let isShadowed = mentions.contains { other in
-                other.canonicalLabel != mention.canonicalLabel
-                    && other.specificity > mention.specificity
+    /// Keep IDs attached to the actual name span instead of widening a user
+    /// name back into all instances of its detector class.
+    private func groundedTargets(
+        in utterance: String,
+        records: [StoredSpatialObjectRecord],
+        selections: [String: ObjectID]
+    ) -> [(mention: String, records: [StoredSpatialObjectRecord])] {
+        let mentions = semanticMentions(in: utterance, records: records)
+        let retained = mentions.filter { mention in
+            !mentions.contains { other in
+                other.specificity > mention.specificity
                     && other.range.lowerBound <= mention.range.lowerBound
                     && other.range.upperBound >= mention.range.upperBound
             }
-            if !isShadowed {
-                labels.append(mention.canonicalLabel)
-            }
         }
-        return labels
+        var result: [(mention: String, records: [StoredSpatialObjectRecord])] = []
+        for mention in retained {
+            if result.contains(where: { $0.mention == mention.canonicalLabel }) { continue }
+            let ids = Set(
+                retained.filter {
+                    $0.canonicalLabel == mention.canonicalLabel
+                }.map(\.objectID))
+            var candidates = records.filter { ids.contains($0.metadata.object.id) }
+            if let selected = selections[mention.canonicalLabel] {
+                // A stale choice must not silently select a replacement.
+                candidates = candidates.filter { $0.metadata.object.id == selected }
+            }
+            result.append((mention.canonicalLabel, candidates))
+        }
+        return result
     }
 
     private func detectedPredicate(
@@ -465,7 +549,10 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
     private func entity(_ object: SpatialObject) -> SpatialRelationQueryEntity {
         SpatialRelationQueryEntity(
             objectID: object.id,
-            semanticLabel: object.semanticLabel
+            semanticLabel: object.semanticLabel,
+            displayName: object.displayName,
+            lastSeenAt: object.lastSeenAt,
+            position: object.position
         )
     }
 
@@ -557,6 +644,7 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
 
 private struct RelationSemanticMention: Hashable, Sendable {
     let canonicalLabel: String
+    let objectID: ObjectID
     let range: Range<Int>
     let specificity: Int
 }

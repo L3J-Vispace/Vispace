@@ -87,7 +87,7 @@ final class SceneGraphRepositoryTests: XCTestCase {
             $0.subject.objectID == table.object.id ? $0.object.objectID : $0.subject.objectID
         })
         XCTAssertEqual(relatedIDs, Set([cup.object.id]))
-        XCTAssertEqual(presentation.message, "‘table’ 근처에 확인된 물체는 ‘cup’예요.")
+        XCTAssertEqual(presentation.message, "확정된 기록상 ‘table’ 근처에 확인된 물체는 ‘cup’예요.")
     }
 
     func testSustainedUpdatesRollDeduplicationWindowAndRejectEvictedReplay() async throws {

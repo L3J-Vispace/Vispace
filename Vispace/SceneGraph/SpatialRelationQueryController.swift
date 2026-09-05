@@ -68,6 +68,12 @@ public final class SpatialRelationQueryController: ObservableObject {
             _ currentMapID: MapID
         ) async throws -> SpatialRelationQuerySnapshot?
     public typealias CurrentIdentityProvider = @MainActor @Sendable () -> ARCaptureIdentity
+    public typealias ObservationProvider =
+        @Sendable (
+            SpatialRelationQueryGeometryScope, [StoredSpatialObjectRecord], ARCaptureIdentity, TimeInterval
+        ) async throws -> SceneGraph
+    public var observationProvider: ObservationProvider?
+    public var observationValidator: (@MainActor @Sendable (SpatialRelationObservationSource) -> Bool)?
 
     @Published public private(set) var state: SpatialRelationQueryControllerState = .idle
     @Published public private(set) var latestPresentation: SpatialRelationQueryPresentation?
@@ -84,6 +90,9 @@ public final class SpatialRelationQueryController: ObservableObject {
     private var queryTask: Task<Void, Never>?
     private var trackedQueryTasks: [UUID: Task<Void, Never>] = [:]
     private var latestRequestID: UInt64 = 0
+    private var currentUtterance = ""
+    private var targetSelections: [String: ObjectID] = [:]
+    private var observationExpiryTask: Task<Void, Never>?
 
     public init(
         objectRepository: SpatialObjectQueryRepository,
@@ -129,6 +138,7 @@ public final class SpatialRelationQueryController: ObservableObject {
     }
 
     deinit {
+        observationExpiryTask?.cancel()
         for task in trackedQueryTasks.values {
             task.cancel()
         }
@@ -136,8 +146,13 @@ public final class SpatialRelationQueryController: ObservableObject {
 
     public func submit(
         _ utterance: String,
-        now: TimeInterval = Date().timeIntervalSince1970
+        now: TimeInterval = Date().timeIntervalSince1970,
+        selections: [String: ObjectID] = [:]
     ) {
+        currentUtterance = Self.boundedQuery(utterance)
+        targetSelections = selections
+        observationExpiryTask?.cancel()
+        observationExpiryTask = nil
         guard now.isFinite, now >= 0 else {
             cancelCurrentQuery(resetToIdle: false)
             publishFailure()
@@ -203,19 +218,36 @@ public final class SpatialRelationQueryController: ObservableObject {
                         && $0.metadata.position.coordinateFrameID
                             == identity.coordinateFrameID
                 }
-                let graph = try Self.freshnessFencedGraph(
+                var graph = try Self.freshnessFencedGraph(
                     snapshot.graph,
                     records: eligibleRecords
                 )
+                var observedRelations: [SpatialRelation] = []
+                if let provider = self.observationProvider,
+                    let scope = engine.targetScope(
+                        for: query, records: eligibleRecords, selections: selections),
+                    !scope.predicate.isGeometryDerived
+                {
+                    let observed = try await provider(scope, eligibleRecords, identity, now)
+                    try Task.checkCancellation()
+                    // Live spatial facts require this capture's current proof.
+                    for relation in graph.relations(includeProvisional: true)
+                    where !relation.key.predicate.isGeometryDerived { graph.remove(relation.key) }
+                    observedRelations = observed.relations(includeProvisional: false)
+                    for relation in observedRelations { try graph.upsert(relation) }
+                }
+                let groundedGraph = graph
                 let result = try await Task.detached(priority: .userInitiated) {
-                    var queryGraph = graph
+                    var queryGraph = groundedGraph
                     if snapshot.geometryProjection == .onDemand,
-                        let scope = engine.geometryScope(for: query, records: eligibleRecords) {
+                        let scope = engine.geometryScope(
+                            for: query, records: eligibleRecords, selections: selections)
+                    {
                         for relation in queryGraph.relations(includeProvisional: true)
                         where relation.key.predicate == scope.predicate { queryGraph.remove(relation.key) }
                         let geometry = try SpatialSceneGraphService.geometryGraphForQuery(
                             scope: scope, objects: eligibleRecords.map(\.metadata), at: now,
-                            confidencePolicy: graph.confidencePolicy
+                            confidencePolicy: groundedGraph.confidencePolicy
                         )
                         for relation in geometry.relations(includeProvisional: true) { try queryGraph.upsert(relation) }
                     }
@@ -223,12 +255,20 @@ public final class SpatialRelationQueryController: ObservableObject {
                         query,
                         records: eligibleRecords,
                         graph: queryGraph,
-                        at: now
+                        at: now,
+                        selections: selections
                     )
                 }.value
                 try Task.checkCancellation()
                 guard self.isCurrent(requestID: requestID, identity: identity) else {
                     self.rejectStaleResult(requestID: requestID)
+                    self.finish(requestID: requestID)
+                    return
+                }
+                if !observedRelations.isEmpty,
+                    !self.observationsAreCurrent(observedRelations, at: Date().timeIntervalSince1970)
+                {
+                    self.publishUnavailable("공간 관측이 바뀌었거나 오래되어 관계를 다시 확인해야 해요.")
                     self.finish(requestID: requestID)
                     return
                 }
@@ -246,6 +286,7 @@ public final class SpatialRelationQueryController: ObservableObject {
                 self.latestPresentation = presentation
                 self.state = .result(presentation)
                 self.metrics.resultsPublished &+= 1
+                self.scheduleObservationExpiry(observedRelations, requestID: requestID, identity: identity)
                 self.finish(requestID: requestID)
             } catch is CancellationError {
                 self?.rejectStaleResult(requestID: requestID)
@@ -267,6 +308,8 @@ public final class SpatialRelationQueryController: ObservableObject {
     }
 
     public func cancelCurrentQuery(resetToIdle: Bool = true) {
+        observationExpiryTask?.cancel()
+        observationExpiryTask = nil
         if queryTask != nil {
             queryTask?.cancel()
             queryTask = nil
@@ -274,8 +317,45 @@ public final class SpatialRelationQueryController: ObservableObject {
             metrics.requestsCancelled &+= 1
         }
         if resetToIdle {
+            targetSelections = [:]
+            currentUtterance = ""
             state = .idle
             latestPresentation = nil
+        }
+    }
+
+    public func selectTarget(mention: String, objectID: ObjectID) {
+        guard
+            let target = latestPresentation?.result.ambiguousTargets.first(where: { $0.mention == mention }),
+            target.candidates.contains(where: { $0.objectID == objectID })
+        else { return }
+        var selections = targetSelections
+        selections[mention] = objectID
+        submit(currentUtterance, selections: selections)
+    }
+
+    private func observationsAreCurrent(_ relations: [SpatialRelation], at timestamp: TimeInterval) -> Bool {
+        relations.allSatisfy { relation in
+            guard let source = relation.observationSource, relation.isValid(at: timestamp) else {
+                return false
+            }
+            return observationValidator?(source) ?? false
+        }
+    }
+
+    private func scheduleObservationExpiry(
+        _ relations: [SpatialRelation], requestID: UInt64, identity: ARCaptureIdentity
+    ) {
+        guard !relations.isEmpty else { return }
+        observationExpiryTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+                guard let self, self.isCurrent(requestID: requestID, identity: identity) else { return }
+                if !self.observationsAreCurrent(relations, at: Date().timeIntervalSince1970) {
+                    self.publishUnavailable("공간이 바뀌었거나 관측이 만료됐어요. 관계를 다시 물어봐 주세요.")
+                    return
+                }
+            }
         }
     }
 
@@ -389,19 +469,26 @@ public final class SpatialRelationQueryController: ObservableObject {
         let predicate = koreanPredicate(result.predicate)
         switch result.status {
         case .answered:
+            let evidenceScope = result.predicate?.isGeometryDerived == false ? "현재 관측한 통로에서는" : "확정된 기록상"
             if result.mode == .verifyRelation,
                 let match = result.matches.first
             {
                 return
-                    "확정된 기록상 ‘\(match.subject.semanticLabel)’은(는) ‘\(match.object.semanticLabel)’ \(predicate) 있어요."
+                    "\(evidenceScope) ‘\(match.subject.name)’은(는) ‘\(match.object.name)’ \(predicate) 있어요."
             }
-            let reference = result.referenceObject?.semanticLabel ?? "해당 물체"
+            let reference = result.referenceObject?.name ?? "해당 물체"
             let related = relatedLabels(in: result)
-            return "‘\(reference)’ \(predicate) 확인된 물체는 \(related)예요."
+            return "\(evidenceScope) ‘\(reference)’ \(predicate) 확인된 물체는 \(related)예요."
         case .noConfirmedRelation:
             return "현재 확정된 기록에서는 해당 \(predicate) 관계를 확인하지 못했어요."
         case .ambiguous:
-            return "같은 종류의 물체가 여러 개라 관계를 하나로 확정할 수 없어요. 주변 특징을 더 보여 주세요."
+            if result.ambiguousTargets.contains(where: { $0.candidates.isEmpty }) {
+                return "선택한 물체의 기록이 바뀌었어요. 현재 이름으로 다시 물어봐 주세요."
+            }
+            if result.issues.contains(.multipleSemanticTargets) {
+                return "한 번에 물체 한 개 또는 두 개의 관계를 물어봐 주세요."
+            }
+            return "이 이름에 해당하는 물체가 여러 개예요. 관계를 확인할 물체를 선택해 주세요."
         case .notGrounded:
             return "관계를 확인할 물체 이름을 찾지 못했어요. 물체 두 개와 관계를 함께 말해 주세요."
         case .unsupported:
@@ -415,8 +502,8 @@ public final class SpatialRelationQueryController: ObservableObject {
         let referenceID = result.referenceObject?.objectID
         let labels = result.matches.map { match in
             match.subject.objectID == referenceID
-                ? match.object.semanticLabel
-                : match.subject.semanticLabel
+                ? match.object.name
+                : match.subject.name
         }
         let unique = Array(Set(labels)).sorted()
         return unique.map { "‘\($0)’" }.joined(separator: ", ")

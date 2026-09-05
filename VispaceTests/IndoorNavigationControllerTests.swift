@@ -44,6 +44,33 @@ final class IndoorNavigationControllerTests: XCTestCase {
         await harness.controller.deactivateAndWaitForPendingWork()
     }
 
+    func testDoorLeaseRevokesPublishedCrossingBeforeFloorEvidenceExpires() async throws {
+        let fixture = NavigationAppFixture()
+        let original = try fixture.evidence(revision: 1)
+        let door = try IndoorNavigationDoorEvidence(
+            identifier: "short-door-lease",
+            firstCell: IndoorNavigationCell(column: 0, row: 0),
+            secondCell: IndoorNavigationCell(column: 1, row: 0), state: .open,
+            confidence: .one, observedAt: 10, validUntil: 10.15)
+        let evidence = try IndoorNavigationEvidence(
+            mapID: original.mapID,
+            coordinateFrameID: original.coordinateFrameID, revision: original.revision,
+            observedAt: original.observedAt, gridOrigin: original.gridOrigin,
+            cellSize: original.cellSize, floors: original.floors, mesh: original.mesh,
+            doors: [door], walls: original.walls, obstacles: original.obstacles,
+            completeness: original.completeness)
+        let harness = makeHarness(fixture: fixture, evidence: evidence)
+        harness.controller.activate()
+        harness.surfaceContinuation.yield(fixture.surface(revision: 1))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10))
+        harness.controller.navigate(to: try fixture.metadata(x: 2))
+        await eventually { harness.controller.renderablePath != nil }
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertNil(harness.controller.renderablePath)
+        XCTAssertGreaterThanOrEqual(harness.controller.metrics.routeInvalidations, 1)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
     func testWalkingInvalidatesPreviousOriginAndReevaluates() async throws {
         let fixture = NavigationAppFixture()
         let harness = makeHarness(fixture: fixture)

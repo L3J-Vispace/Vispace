@@ -54,7 +54,8 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
         recentDepthFrames: [ARNavigationDepthFrame] = [],
         dynamicObjects: [SpatialObjectMetadata] = []
     ) -> ARIndoorNavigationEvidenceAdaptation {
-        let staticResult = adaptStaticGeometry(snapshot, currentIdentity: currentIdentity)
+        let staticResult = adaptStaticGeometry(
+            snapshot, currentIdentity: currentIdentity, deferDoorBlocking: true)
         guard case .ready(let candidate) = staticResult else { return staticResult }
         guard let frame = currentDepthFrame,
             frame.pose.coordinateFrameStatus == .confirmed,
@@ -93,7 +94,7 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
 
         var checks = 0
         let elevations = Dictionary(uniqueKeysWithValues: candidate.floors.map { ($0.cell, $0.elevation) })
-        let mesh = candidate.mesh.map { cell -> IndoorNavigationMeshEvidence in
+        var mesh = candidate.mesh.map { cell -> IndoorNavigationMeshEvidence in
             guard cell.occupancy == .free, let elevation = elevations[cell.cell] else { return cell }
             var state: IndoorNavigationMeshOccupancy = .unknown
             for occupancy in occupancies {
@@ -113,6 +114,14 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
             }
             return IndoorNavigationMeshEvidence(cell: cell.cell, occupancy: state, confidence: cell.confidence)
         }
+        guard let geometry = makeGeometry(from: snapshot),
+            let doorResult = ARObservedDoorEvidenceProvider().observe(
+                surfaces: geometry.doorSurfaces, gridOrigin: candidate.gridOrigin,
+                cellSize: cellSize, floors: candidate.floors, mesh: mesh,
+                frames: Array(frames), confidence: evidenceConfidence
+            )
+        else { return .insufficientEvidence(.coverageAttestationUnavailable) }
+        mesh = doorResult.mesh
         guard mesh.contains(where: { $0.occupancy == .free }) else {
             return .insufficientEvidence(.dynamicOccupancyUnavailable)
         }
@@ -142,8 +151,8 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
             mapID: candidate.mapID, coordinateFrameID: candidate.coordinateFrameID,
             revision: candidate.revision, observedAt: candidate.observedAt,
             gridOrigin: candidate.gridOrigin, cellSize: candidate.cellSize,
-            floors: candidate.floors, mesh: mesh, doors: candidate.doors,
-            walls: candidate.walls, obstacles: obstacles, completeness: .complete
+                floors: candidate.floors, mesh: mesh, doors: doorResult.doors,
+                walls: candidate.walls, obstacles: obstacles, completeness: .complete
         ) else { return .insufficientEvidence(.coverageAttestationUnavailable) }
         return ARSurfaceIndoorNavigationEvidenceAdapter().adapt(
             snapshot, currentIdentity: currentIdentity, verifiedEvidence: verified
@@ -154,7 +163,8 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
     /// coverage and current object obstacles; static floors do not prove this.
     func adaptStaticGeometry(
         _ snapshot: ARSurfaceStateSnapshot,
-        currentIdentity: ARCaptureIdentity
+        currentIdentity: ARCaptureIdentity,
+        deferDoorBlocking: Bool = false
     ) -> ARIndoorNavigationEvidenceAdaptation {
         guard !Task.isCancelled else {
             return .insufficientEvidence(.coverageAttestationUnavailable)
@@ -199,7 +209,15 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
             return .insufficientEvidence(.coverageAttestationUnavailable)
         }
 
-        guard
+        let doorResult =
+            deferDoorBlocking
+            ? ARObservedDoorEvidenceProvider.Result(mesh: grid.mesh, doors: [])
+            : ARObservedDoorEvidenceProvider().observe(
+                surfaces: geometry.doorSurfaces, gridOrigin: grid.origin,
+                cellSize: cellSize, floors: grid.floors, mesh: grid.mesh,
+                frames: [], confidence: evidenceConfidence
+            )
+        guard let doorResult,
             let evidence = try? IndoorNavigationEvidence(
                 mapID: mapID,
                 coordinateFrameID: snapshot.coordinateFrameID,
@@ -208,8 +226,8 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
                 gridOrigin: grid.origin,
                 cellSize: cellSize,
                 floors: grid.floors,
-                mesh: grid.mesh,
-                doors: [],
+                mesh: doorResult.mesh,
+                doors: doorResult.doors,
                 walls: walls,
                 obstacles: [],
                 completeness: .complete
@@ -230,6 +248,7 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
         var floorPlanes: [WorldFloorPlane] = []
         var planeBlockingTriangles: [WorldTriangle] = []
         var barrierSegments: [WorldBarrierSegment] = []
+        var doorSurfaces: [ARObservedDoorSurface] = []
         var triangleCount = 0
         for plane in snapshot.planes.values.sorted(by: {
             $0.anchorID.uuidString < $1.anchorID.uuidString
@@ -264,9 +283,16 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
                     barrierSegments.append(segment)
                 }
             case .door:
-                // ARKit identifies door geometry, not a verified open/closed
-                // traversal state. A route cannot claim complete portal evidence.
-                return nil
+                guard let polygon = WorldPlanePolygon(plane),
+                    let triangles = polygon.triangles(classification: .door),
+                    triangles.count <= maximumTriangleCount - triangleCount,
+                    let door = ARObservedDoorSurface(
+                        identifier: "door-plane-\(plane.anchorID.uuidString)",
+                        vertices: polygon.vertices, supportsOpeningMeasurement: plane.alignment == .vertical
+                    )
+                else { return nil }
+                triangleCount += triangles.count
+                doorSurfaces.append(door)
             case .none, .unknown:
                 // An unclassified plane can conceal an obstacle. Do not attest
                 // the surrounding cells as free until ARKit classifies it.
@@ -326,7 +352,16 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
                     }
                     barrierSegments.append(segment)
                 case .door:
-                    return nil
+                    // A mesh face localizes a possible door, but a triangle
+                    // alone cannot measure a complete aperture. It stays local
+                    // and closed to traversal until a full plane can verify it.
+                    guard
+                        let door = ARObservedDoorSurface(
+                            identifier: "door-mesh-\(mesh.anchorID.uuidString)-\(faceIndex)",
+                            vertices: triangle.vertices, supportsOpeningMeasurement: false
+                        )
+                    else { return nil }
+                    doorSurfaces.append(door)
                 case .table, .seat, .ceiling:
                     blockingTriangles.append(triangle)
                 case .none, .unknown:
@@ -341,7 +376,8 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
             floorPlanes: floorPlanes,
             floorTriangles: floorTriangles,
             blockingTriangles: blockingTriangles,
-            barrierSegments: barrierSegments
+            barrierSegments: barrierSegments,
+            doorSurfaces: doorSurfaces
         )
     }
 
@@ -757,6 +793,7 @@ private struct NavigationGeometry {
     let floorTriangles: [WorldTriangle]
     let blockingTriangles: [WorldTriangle]
     let barrierSegments: [WorldBarrierSegment]
+    let doorSurfaces: [ARObservedDoorSurface]
 }
 
 private struct NavigationGrid {

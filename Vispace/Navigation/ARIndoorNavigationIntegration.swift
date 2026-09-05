@@ -326,7 +326,8 @@ public struct ARIndoorNavigationTargetAdapter: Sendable {
                 lastSeenAt: original.lastSeenAt,
                 stateUpdatedAt: original.stateUpdatedAt,
                 displayName: original.displayName,
-                temporalRevision: original.temporalRevision
+                temporalRevision: original.temporalRevision,
+                detectorSemanticLabel: original.detectorSemanticLabel
             ),
             let transformedMetadata = try? SpatialObjectMetadata(
                 mapID: currentMapID,
@@ -1093,8 +1094,17 @@ public final class IndoorNavigationController: ObservableObject {
                 let currentEvaluationTime = self.currentEvaluationTime(
                     fallback: evaluatedAt + max(0, ProcessInfo.processInfo.systemUptime - evaluationUptime)
                 )
+                let pathCells = result.path?.waypoints.map(\.cell) ?? []
+                let usedDoorExpiry =
+                    evidence.doors.filter { door in
+                        zip(pathCells, pathCells.dropFirst()).contains { first, second in
+                            (door.firstCell == first && door.secondCell == second)
+                                || (door.firstCell == second && door.secondCell == first)
+                        }
+                    }.compactMap(\.validUntil).min() ?? .infinity
                 guard result.status != .success || (currentEvaluationTime.isFinite &&
-                    currentEvaluationTime - evidence.observedAt <= engine.policy.maximumEvidenceAge &&
+                        currentEvaluationTime < usedDoorExpiry
+                            && currentEvaluationTime - evidence.observedAt <= engine.policy.maximumEvidenceAge &&
                     currentEvaluationTime - startPosition.observedAt <= engine.policy.maximumStartAge &&
                     self.latestPose.map({ self.horizontalDistance(pose, $0) < self.movementReevaluationDistance }) == true)
                 else {
@@ -1111,7 +1121,8 @@ public final class IndoorNavigationController: ObservableObject {
                 if self.renderablePath != nil {
                     self.startRouteLease(duration: min(
                         1,
-                        engine.policy.maximumEvidenceAge - (currentEvaluationTime - evidence.observedAt),
+                            usedDoorExpiry - currentEvaluationTime,
+                            engine.policy.maximumEvidenceAge - (currentEvaluationTime - evidence.observedAt),
                         engine.policy.maximumStartAge - (currentEvaluationTime - startPosition.observedAt)
                     ))
                 }

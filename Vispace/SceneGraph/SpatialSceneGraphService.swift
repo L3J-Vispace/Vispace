@@ -35,6 +35,55 @@ public actor SpatialSceneGraphService {
         self.confidencePolicy = confidencePolicy
     }
 
+    /// Replaces only live navigation observations. Optimistic revision checks
+    /// preserve concurrent metadata-derived writes; failure never publishes an
+    /// uncommitted positive observation to the caller.
+    public func replaceObservedRelations(
+        mapID: MapID, coordinateFrameID: CoordinateFrameID,
+        graph observed: SceneGraph, at timestamp: TimeInterval
+    ) async throws {
+        guard timestamp.isFinite, timestamp >= 0 else { throw SpatialSceneGraphServiceError.invalidTimestamp }
+        for attempt in 0..<3 {
+            try Task.checkCancellation()
+            let existing = try await repository.load(mapID: mapID)
+            guard existing?.coordinateFrameID == nil || existing?.coordinateFrameID == coordinateFrameID
+            else {
+                throw SpatialSceneGraphServiceError.mapCoordinateFrameMismatch
+            }
+            var graph = existing?.graph ?? SceneGraph(confidencePolicy: confidencePolicy)
+            var history = existing?.expiredRelationHistory ?? []
+            for relation in graph.relations(includeProvisional: true) where relation.observationSource != nil
+            {
+                try archive(relation, at: timestamp, into: &history)
+                graph.remove(relation.key)
+            }
+            for relation in observed.relations(includeProvisional: true) {
+                guard let source = relation.observationSource,
+                    source.mapID == mapID, source.coordinateFrameID == coordinateFrameID,
+                    relation.isValid(at: timestamp)
+                else { throw SpatialSceneGraphServiceError.outOfOrderObservation }
+                if let old = graph.relations(includeProvisional: true).first(where: { $0.key == relation.key }
+                ) {
+                    try archive(old, at: timestamp, into: &history)
+                    graph.remove(old.key)
+                }
+                try graph.upsert(relation)
+            }
+            compactHistory(&history)
+            let update = SceneGraphMapUpdate(
+                mapID: mapID, coordinateFrameID: coordinateFrameID,
+                baseRevision: existing?.revision ?? 0, graph: graph, expiredRelationHistory: history,
+                timestamp: max(timestamp, existing?.updatedAt ?? timestamp))
+            do {
+                _ = try await repository.apply(update)
+                return
+            } catch let error as SceneGraphRepositoryError {
+                if case .revisionConflict = error, attempt < 2 { continue }
+                throw error
+            }
+        }
+    }
+
     /// The caller commits the complete metadata batch before rebuilding this
     /// optional cache. Once the map uses on-demand geometry (or records a
     /// capacity deferral), all queryable source objects are already durable;
@@ -350,7 +399,7 @@ public actor SpatialSceneGraphService {
         at timestamp: TimeInterval,
         into history: inout [SpatialRelation]
     ) throws {
-        let end = max(relation.validFrom, timestamp)
+        let end = max(relation.validFrom, min(timestamp, relation.validUntil ?? timestamp))
         history.append(
             try SpatialRelation(
                 key: relation.key,
@@ -359,7 +408,8 @@ public actor SpatialSceneGraphService {
                 validFrom: relation.validFrom,
                 validUntil: end,
                 subjectTemporalRevision: relation.subjectTemporalRevision,
-                objectTemporalRevision: relation.objectTemporalRevision
+                objectTemporalRevision: relation.objectTemporalRevision,
+                observationSource: relation.observationSource
             )
         )
     }

@@ -6,6 +6,317 @@ import XCTest
 
 @MainActor
 final class SpatialRelationQueryControllerTests: XCTestCase {
+    func testSourceSnapshotFenceRejectsAdditionsRemovalsAndChanges() throws {
+        let map = mapID(571), frame = frameID(571)
+        let first = try record(id: objectID(571), mapID: map, frameID: frame, label: "table")
+        let added = try record(id: objectID(572), mapID: map, frameID: frame, label: "chair")
+        let otherFrame = try record(id: objectID(573), mapID: map, frameID: frameID(572), label: "chair")
+        let changed = try record(
+            id: first.metadata.object.id, mapID: map, frameID: frame,
+            label: "table", stateUpdatedAt: 11)
+        XCTAssertTrue(
+            SpatialObjectMutationFence.representsSameSnapshot(
+                records: [first],
+                currentObjects: [otherFrame.metadata, first.metadata], mapID: map, coordinateFrameID: frame))
+        XCTAssertFalse(
+            SpatialObjectMutationFence.representsSameSnapshot(
+                records: [first],
+                currentObjects: [first.metadata, added.metadata], mapID: map, coordinateFrameID: frame))
+        XCTAssertFalse(
+            SpatialObjectMutationFence.representsSameSnapshot(
+                records: [first, added],
+                currentObjects: [first.metadata], mapID: map, coordinateFrameID: frame))
+        XCTAssertFalse(
+            SpatialObjectMutationFence.representsSameSnapshot(
+                records: [first],
+                currentObjects: [changed.metadata], mapID: map, coordinateFrameID: frame))
+    }
+
+    func testMutationFenceRemainsUnstableUntilAllWritersFinish() {
+        let fence = SpatialObjectMutationFence()
+        let initial = fence.stableVersion
+        fence.begin()
+        fence.begin()
+        XCTAssertNil(fence.stableVersion)
+        fence.end()
+        XCTAssertNil(fence.stableVersion)
+        fence.end()
+        XCTAssertNotNil(fence.stableVersion)
+        XCTAssertNotEqual(fence.stableVersion, initial)
+    }
+
+    func testWriterStartingDuringObservedDerivationPreventsPositivePublication() async throws {
+        let map = mapID(581), frame = frameID(581), now = Date().timeIntervalSince1970
+        let table = try record(id: objectID(581), mapID: map, frameID: frame, label: "table")
+        let cup = try record(id: objectID(582), mapID: map, frameID: frame, label: "cup")
+        let fence = SpatialObjectMutationFence()
+        let source = SpatialRelationObservationSource(
+            mapID: map, coordinateFrameID: frame,
+            segmentID: segmentID(1), surfaceRevision: 1, observedAt: 10,
+            objectRevisionEpoch: try XCTUnwrap(fence.stableVersion))
+        var observed = SceneGraph()
+        try observed.upsert(
+            relation(
+                subject: cup, predicate: .connectedTo, object: table,
+                validFrom: now, validUntil: now + 5, observationSource: source))
+        let provider = SuspendedRelationObservationProvider()
+        let identityBox = RelationIdentityBox(identity(mapID: map, frameID: frame))
+        let controller = controller(
+            identityBox: identityBox,
+            snapshot: snapshot(mapID: map, frameID: frame, records: [table, cup], graph: SceneGraph()))
+        controller.observationProvider = { _, _, _, _ in await provider.load() }
+        controller.observationValidator = {
+            $0.objectRevisionEpoch != nil && fence.stableVersion == $0.objectRevisionEpoch
+        }
+        controller.submit("cup connected to table", now: now)
+        for _ in 0..<250 {
+            if await provider.isWaiting { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        fence.begin()
+        defer { fence.end() }
+        await provider.resume(with: observed)
+        try await waitForIdle(controller)
+        XCTAssertNil(controller.latestPresentation)
+        XCTAssertEqual(controller.metrics.resultsPublished, 0)
+        XCTAssertEqual(controller.metrics.unavailableResultsPublished, 1)
+    }
+
+    func testWriterStartingAfterObservedPublicationWithdrawsAnswer() async throws {
+        let map = mapID(591), frame = frameID(591), now = Date().timeIntervalSince1970
+        let table = try record(id: objectID(591), mapID: map, frameID: frame, label: "table")
+        let cup = try record(id: objectID(592), mapID: map, frameID: frame, label: "cup")
+        let fence = SpatialObjectMutationFence()
+        let source = SpatialRelationObservationSource(
+            mapID: map, coordinateFrameID: frame,
+            segmentID: segmentID(1), surfaceRevision: 1, observedAt: 10,
+            objectRevisionEpoch: try XCTUnwrap(fence.stableVersion))
+        var observed = SceneGraph()
+        try observed.upsert(
+            relation(
+                subject: cup, predicate: .accessibleFrom, object: table,
+                validFrom: now, validUntil: now + 5, observationSource: source))
+        let readyObservation = observed
+        let identityBox = RelationIdentityBox(identity(mapID: map, frameID: frame))
+        let controller = controller(
+            identityBox: identityBox,
+            snapshot: snapshot(mapID: map, frameID: frame, records: [table, cup], graph: SceneGraph()))
+        controller.observationProvider = { _, _, _, _ in readyObservation }
+        controller.observationValidator = {
+            $0.objectRevisionEpoch != nil && fence.stableVersion == $0.objectRevisionEpoch
+        }
+        controller.submit("cup accessible from table", now: now)
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.latestPresentation?.result.isAffirmative, true)
+        fence.begin()
+        defer { fence.end() }
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertNil(controller.latestPresentation)
+        XCTAssertGreaterThanOrEqual(controller.metrics.unavailableResultsPublished, 1)
+    }
+
+    func testObservedRelationPublicationExpiresWithItsEvidenceLease() async throws {
+        let map = mapID(531), frame = frameID(531), now = Date().timeIntervalSince1970
+        let table = try record(id: objectID(531), mapID: map, frameID: frame, label: "table")
+        let cup = try record(id: objectID(532), mapID: map, frameID: frame, label: "cup")
+        let source = SpatialRelationObservationSource(
+            mapID: map, coordinateFrameID: frame,
+            segmentID: segmentID(1), surfaceRevision: 1, observedAt: 10)
+        var observed = SceneGraph()
+        try observed.upsert(
+            relation(
+                subject: cup, predicate: .accessibleFrom, object: table,
+                validFrom: now, validUntil: now + 0.20, observationSource: source))
+        let readyObservation = observed
+        let identityBox = RelationIdentityBox(identity(mapID: map, frameID: frame))
+        let controller = controller(
+            identityBox: identityBox,
+            snapshot: snapshot(mapID: map, frameID: frame, records: [table, cup], graph: SceneGraph()))
+        controller.observationProvider = { _, _, _, _ in readyObservation }
+        controller.observationValidator = { $0 == source }
+        controller.submit("cup accessible from table", now: now)
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.latestPresentation?.result.isAffirmative, true)
+        try await Task.sleep(for: .milliseconds(350))
+        XCTAssertNil(controller.latestPresentation)
+        XCTAssertGreaterThanOrEqual(controller.metrics.unavailableResultsPublished, 1)
+    }
+
+    func testSurfaceRevisionChangeWithdrawsObservedRelationBeforeTTL() async throws {
+        let map = mapID(541), frame = frameID(541), now = Date().timeIntervalSince1970
+        let table = try record(id: objectID(541), mapID: map, frameID: frame, label: "table")
+        let cup = try record(id: objectID(542), mapID: map, frameID: frame, label: "cup")
+        let source = SpatialRelationObservationSource(
+            mapID: map, coordinateFrameID: frame,
+            segmentID: segmentID(1), surfaceRevision: 1, observedAt: 10)
+        var observed = SceneGraph()
+        try observed.upsert(
+            relation(
+                subject: cup, predicate: .connectedTo, object: table,
+                validFrom: now, validUntil: now + 5, observationSource: source))
+        let readyObservation = observed
+        let revision = RelationObservationRevisionBox()
+        let identityBox = RelationIdentityBox(identity(mapID: map, frameID: frame))
+        let controller = controller(
+            identityBox: identityBox,
+            snapshot: snapshot(mapID: map, frameID: frame, records: [table, cup], graph: SceneGraph()))
+        controller.observationProvider = { _, _, _, _ in readyObservation }
+        controller.observationValidator = { $0.surfaceRevision == revision.value }
+        controller.submit("cup connected to table", now: now)
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.latestPresentation?.result.isAffirmative, true)
+        revision.value = 2
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertNil(controller.latestPresentation)
+        XCTAssertGreaterThanOrEqual(controller.metrics.unavailableResultsPublished, 1)
+    }
+
+    func testMissingLiveEvidenceCannotReusePersistedPositiveOrClaimNegative() async throws {
+        let map = mapID(551), frame = frameID(551)
+        let table = try record(id: objectID(551), mapID: map, frameID: frame, label: "table")
+        let cup = try record(id: objectID(552), mapID: map, frameID: frame, label: "cup")
+        var persisted = SceneGraph()
+        try persisted.upsert(relation(subject: cup, predicate: .accessibleFrom, object: table))
+        let identityBox = RelationIdentityBox(identity(mapID: map, frameID: frame))
+        let controller = controller(
+            identityBox: identityBox,
+            snapshot: snapshot(mapID: map, frameID: frame, records: [table, cup], graph: persisted))
+        controller.observationProvider = { _, _, _, _ in SceneGraph() }
+        controller.observationValidator = { _ in true }
+        controller.submit("cup accessible from table", now: 20)
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.latestPresentation?.result.status, .noConfirmedRelation)
+        XCTAssertNil(controller.latestPresentation?.result.isAffirmative)
+        XCTAssertTrue(controller.latestPresentation?.result.matches.isEmpty == true)
+    }
+
+    func testDeletionBarrierWaitsForCancelledObservationProvider() async throws {
+        let map = mapID(561), frame = frameID(561)
+        let table = try record(id: objectID(561), mapID: map, frameID: frame, label: "table")
+        let cup = try record(id: objectID(562), mapID: map, frameID: frame, label: "cup")
+        let identityBox = RelationIdentityBox(identity(mapID: map, frameID: frame))
+        let controller = controller(
+            identityBox: identityBox,
+            snapshot: snapshot(mapID: map, frameID: frame, records: [table, cup], graph: SceneGraph()))
+        let provider = SuspendedRelationObservationProvider()
+        controller.observationProvider = { _, _, _, _ in await provider.load() }
+        controller.submit("cup accessible from table", now: 20)
+        for _ in 0..<250 {
+            if await provider.isWaiting { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let providerIsWaiting = await provider.isWaiting
+        XCTAssertTrue(providerIsWaiting)
+        let completion = RelationDeletionBarrierCompletion()
+        let barrier = Task {
+            await controller.invalidateAndWaitForPendingWork(); await completion.markFinished()
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        let finishedWhileWaiting = await completion.isFinished
+        XCTAssertFalse(finishedWhileWaiting)
+        await provider.resume()
+        await barrier.value
+        XCTAssertNil(controller.latestPresentation)
+        XCTAssertEqual(controller.metrics.resultsPublished, 0)
+    }
+
+    func testDistinctUserNamesKeepSameClassRelationsSeparate() async throws {
+        let map = mapID(501), frame = frameID(501)
+        let first = try record(
+            id: objectID(501), mapID: map, frameID: frame, label: "table", displayName: "책상A")
+        let second = try record(
+            id: objectID(502), mapID: map, frameID: frame, label: "table", displayName: "책상B")
+        let cup = try record(id: objectID(503), mapID: map, frameID: frame, label: "cup")
+        let book = try record(id: objectID(504), mapID: map, frameID: frame, label: "book")
+        var graph = SceneGraph()
+        try graph.upsert(relation(subject: cup, predicate: .on, object: first))
+        try graph.upsert(relation(subject: book, predicate: .on, object: second))
+        let identityBox = RelationIdentityBox(identity(mapID: map, frameID: frame))
+        let controller = controller(
+            identityBox: identityBox,
+            snapshot: snapshot(mapID: map, frameID: frame, records: [first, second, cup, book], graph: graph))
+        controller.submit("책상A 위에 뭐 있어?", now: 20)
+        try await waitForIdle(controller)
+        XCTAssertEqual(
+            controller.latestPresentation?.result.referenceObject?.objectID, first.metadata.object.id)
+        XCTAssertEqual(
+            controller.latestPresentation?.result.matches.map(\.subject.objectID), [cup.metadata.object.id])
+        controller.submit("책상B 위에 뭐 있어?", now: 20)
+        try await waitForIdle(controller)
+        XCTAssertEqual(
+            controller.latestPresentation?.result.referenceObject?.objectID, second.metadata.object.id)
+        XCTAssertEqual(
+            controller.latestPresentation?.result.matches.map(\.subject.objectID), [book.metadata.object.id])
+    }
+
+    func testDuplicateNameSelectionReloadsAndNeverSubstitutesDisappearedID() async throws {
+        let map = mapID(511), frame = frameID(511)
+        let first = try record(
+            id: objectID(511), mapID: map, frameID: frame, label: "table", displayName: "작업대")
+        let second = try record(
+            id: objectID(512), mapID: map, frameID: frame, label: "table", displayName: "작업대")
+        let cup = try record(id: objectID(513), mapID: map, frameID: frame, label: "cup")
+        var graph = SceneGraph()
+        try graph.upsert(relation(subject: cup, predicate: .on, object: second))
+        let original = snapshot(mapID: map, frameID: frame, records: [first, second, cup], graph: graph)
+        let identityBox = RelationIdentityBox(identity(mapID: map, frameID: frame))
+        let provider = SuspendedRelationSnapshotProvider()
+        let controller = SpatialRelationQueryController(
+            snapshotProvider: { map in try await provider.load(mapID: map) },
+            currentIdentityProvider: { identityBox.value })
+        controller.submit("작업대 위에 뭐 있어?", now: 20)
+        try await waitForRequestCount(provider, 1)
+        await provider.resume(index: 0, with: original)
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.latestPresentation?.result.ambiguousTargets.first?.candidates.count, 2)
+        controller.selectTarget(mention: "작업대", objectID: second.metadata.object.id)
+        try await waitForRequestCount(provider, 2)
+        await provider.resume(index: 1, with: original)
+        try await waitForIdle(controller)
+        XCTAssertEqual(
+            controller.latestPresentation?.result.referenceObject?.objectID, second.metadata.object.id)
+        XCTAssertEqual(
+            controller.latestPresentation?.result.matches.map(\.subject.objectID), [cup.metadata.object.id])
+
+        controller.submit("작업대 위에 뭐 있어?", now: 20)
+        try await waitForRequestCount(provider, 3)
+        await provider.resume(index: 2, with: original)
+        try await waitForIdle(controller)
+        controller.selectTarget(mention: "작업대", objectID: second.metadata.object.id)
+        try await waitForRequestCount(provider, 4)
+        await provider.resume(
+            index: 3, with: snapshot(mapID: map, frameID: frame, records: [first, cup], graph: graph))
+        try await waitForIdle(controller)
+        XCTAssertNotEqual(controller.latestPresentation?.result.status, .answered)
+        XCTAssertNil(controller.latestPresentation?.result.referenceObject)
+        XCTAssertTrue(controller.latestPresentation?.result.matches.isEmpty == true)
+    }
+
+    func testCaptureChangeWhileSelectedRelationReloadsRejectsOldAnswer() async throws {
+        let map = mapID(521), frame = frameID(521)
+        let first = try record(
+            id: objectID(521), mapID: map, frameID: frame, label: "table", displayName: "작업대")
+        let second = try record(
+            id: objectID(522), mapID: map, frameID: frame, label: "table", displayName: "작업대")
+        let original = snapshot(mapID: map, frameID: frame, records: [first, second], graph: SceneGraph())
+        let identityBox = RelationIdentityBox(identity(mapID: map, frameID: frame))
+        let provider = SuspendedRelationSnapshotProvider()
+        let controller = SpatialRelationQueryController(
+            snapshotProvider: { map in try await provider.load(mapID: map) },
+            currentIdentityProvider: { identityBox.value })
+        controller.submit("작업대 위에 뭐 있어?", now: 20)
+        try await waitForRequestCount(provider, 1)
+        await provider.resume(index: 0, with: original)
+        try await waitForIdle(controller)
+        controller.selectTarget(mention: "작업대", objectID: second.metadata.object.id)
+        try await waitForRequestCount(provider, 2)
+        identityBox.value = identity(mapID: mapID(522), frameID: frameID(522))
+        await provider.resume(index: 1, with: original)
+        try await waitForIdle(controller)
+        XCTAssertNil(controller.latestPresentation)
+        XCTAssertEqual(controller.metrics.staleResultsRejected, 1)
+    }
+
     func testConfirmedCurrentMapAndFramePublishOnlyGroundedRelation() async throws {
         let map = mapID(1)
         let frame = frameID(1)
@@ -232,7 +543,7 @@ final class SpatialRelationQueryControllerTests: XCTestCase {
 
         let presentation = try XCTUnwrap(controller.latestPresentation)
         XCTAssertEqual(presentation.result.status, .noConfirmedRelation)
-        XCTAssertEqual(presentation.result.isAffirmative, false)
+        XCTAssertNil(presentation.result.isAffirmative)
         XCTAssertTrue(presentation.result.matches.isEmpty)
     }
 
@@ -758,7 +1069,8 @@ final class SpatialRelationQueryControllerTests: XCTestCase {
         confidence: Double = 0.95,
         certainty: RelationCertainty = .confirmed,
         validFrom: TimeInterval = 10,
-        validUntil: TimeInterval? = nil
+        validUntil: TimeInterval? = nil,
+        observationSource: SpatialRelationObservationSource? = nil
     ) throws -> SpatialRelation {
         try SpatialRelation(
             key: RelationKey(
@@ -769,7 +1081,8 @@ final class SpatialRelationQueryControllerTests: XCTestCase {
             confidence: ConfidenceScore(validating: confidence),
             certainty: certainty,
             validFrom: validFrom,
-            validUntil: validUntil
+            validUntil: validUntil,
+            observationSource: observationSource
         )
     }
 
@@ -779,7 +1092,8 @@ final class SpatialRelationQueryControllerTests: XCTestCase {
         frameID: CoordinateFrameID,
         label: String,
         aliases: [String] = [],
-        stateUpdatedAt: TimeInterval = 10
+        stateUpdatedAt: TimeInterval = 10,
+        displayName: String? = nil
     ) throws -> StoredSpatialObjectRecord {
         let position = Vec3.zero
         let object = try SpatialObject(
@@ -800,7 +1114,8 @@ final class SpatialRelationQueryControllerTests: XCTestCase {
             ),
             firstSeenAt: 1,
             lastSeenAt: stateUpdatedAt,
-            stateUpdatedAt: stateUpdatedAt
+            stateUpdatedAt: stateUpdatedAt,
+            displayName: displayName
         )
         let metadata = try SpatialObjectMetadata(
             mapID: mapID,
@@ -920,5 +1235,24 @@ private actor RelationDeletionBarrierCompletion {
 
     func markFinished() {
         isFinished = true
+    }
+}
+
+@MainActor
+private final class RelationObservationRevisionBox {
+    var value: UInt64 = 1
+}
+
+private actor SuspendedRelationObservationProvider {
+    private var continuation: CheckedContinuation<SceneGraph, Never>?
+    var isWaiting: Bool { continuation != nil }
+
+    func load() async -> SceneGraph {
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func resume(with graph: SceneGraph = SceneGraph()) {
+        continuation?.resume(returning: graph)
+        continuation = nil
     }
 }

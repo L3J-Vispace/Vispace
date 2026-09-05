@@ -53,7 +53,7 @@ final class SpatialRelationQueryTests: XCTestCase {
             at: 20
         )
         XCTAssertEqual(absent.status, .noConfirmedRelation)
-        XCTAssertEqual(absent.isAffirmative, false)
+        XCTAssertNil(absent.isAffirmative)
 
         try graph.upsert(relation(subject: sofa, predicate: .blocking, object: door))
         let present = try engine.query(
@@ -227,6 +227,54 @@ final class SpatialRelationQueryTests: XCTestCase {
     }
 
     private let engine = DeterministicSpatialRelationQueryEngine()
+
+    func testNamesKeepIndividualObjectIDsForListAndVerification() throws {
+        let tableA = try makeRecord(label: "table", aliases: ["책상A"])
+        let tableB = try makeRecord(label: "table", aliases: ["책상B"], x: 2)
+        let cup = try makeRecord(label: "cup", aliases: ["컵"])
+        var graph = SceneGraph()
+        try graph.upsert(relation(subject: cup, predicate: .on, object: tableA))
+        let records = [tableA, tableB, cup]
+        let first = try engine.query("책상A 위에 뭐 있어?", records: records, graph: graph, at: 20)
+        XCTAssertEqual(first.referenceObject?.objectID, tableA.metadata.object.id)
+        XCTAssertEqual(first.matches.map(\.subject.objectID), [cup.metadata.object.id])
+        XCTAssertEqual(
+            engine.geometryScope(for: "책상A 위에 뭐 있어?", records: records)?.objectIDs,
+            [tableA.metadata.object.id])
+        let second = try engine.query("책상B 위에 뭐 있어?", records: records, graph: graph, at: 20)
+        XCTAssertEqual(second.referenceObject?.objectID, tableB.metadata.object.id)
+        XCTAssertTrue(second.matches.isEmpty)
+        let pair = try engine.query("책상A 근처 책상B", records: records, graph: graph, at: 20)
+        XCTAssertEqual(pair.mode, .verifyRelation)
+        XCTAssertEqual(pair.status, .noConfirmedRelation)
+    }
+
+    func testDuplicateNameSelectionRevalidatesCurrentCandidates() throws {
+        let tableA = try makeRecord(label: "table", aliases: ["업무책상"])
+        let tableB = try makeRecord(label: "table", aliases: ["업무책상"], x: 2)
+        let cup = try makeRecord(label: "cup")
+        var graph = SceneGraph()
+        try graph.upsert(relation(subject: cup, predicate: .on, object: tableB))
+        let records = [tableA, tableB, cup]
+        let query = "업무책상 위에 뭐 있어?"
+        let ambiguous = try engine.query(query, records: records, graph: graph, at: 20)
+        XCTAssertEqual(ambiguous.status, .ambiguous)
+        XCTAssertEqual(ambiguous.ambiguousTargets.first?.candidates.count, 2)
+        let selected = try engine.query(
+            query, records: records, graph: graph, at: 20,
+            selections: ["업무책상": tableB.metadata.object.id])
+        XCTAssertEqual(selected.referenceObject?.objectID, tableB.metadata.object.id)
+        XCTAssertEqual(selected.matches.count, 1)
+        let stale = try engine.query(
+            query, records: [tableA, cup], graph: graph, at: 20,
+            selections: ["업무책상": tableB.metadata.object.id])
+        XCTAssertEqual(stale.status, .ambiguous)
+        XCTAssertTrue(stale.matches.isEmpty)
+        XCTAssertNil(
+            engine.geometryScope(
+                for: query, records: [tableA, cup],
+                selections: ["업무책상": tableB.metadata.object.id]))
+    }
 
     private func relation(
         subject: StoredSpatialObjectRecord,

@@ -97,6 +97,7 @@ public enum IndoorNavigationDoorState: String, Codable, Hashable, Sendable {
 
 /// A portal is the only way an edge may cross two different observed zones.
 /// Portal endpoints must be horizontally adjacent cells on the same level.
+/// An observed door also constrains those cells when they share a zone label.
 public struct IndoorNavigationDoorEvidence: Codable, Hashable, Sendable {
     public let identifier: String
     public let firstCell: IndoorNavigationCell
@@ -104,6 +105,10 @@ public struct IndoorNavigationDoorEvidence: Codable, Hashable, Sendable {
     public let state: IndoorNavigationDoorState
     public let confidence: ConfidenceScore
     public let clearWidth: Double
+    /// Live door observations have a shorter lease than retained floor geometry.
+    /// Nil preserves the enclosing evidence timestamp for legacy producers.
+    public let observedAt: TimeInterval?
+    public let validUntil: TimeInterval?
 
     public init(
         identifier: String,
@@ -111,19 +116,33 @@ public struct IndoorNavigationDoorEvidence: Codable, Hashable, Sendable {
         secondCell: IndoorNavigationCell,
         state: IndoorNavigationDoorState,
         confidence: ConfidenceScore,
-        clearWidth: Double = 0.90
+        clearWidth: Double = 0.90,
+        observedAt: TimeInterval? = nil,
+        validUntil: TimeInterval? = nil
     ) throws {
         guard firstCell.isHorizontalNeighbor(of: secondCell) else {
             throw IndoorNavigationInputError.invalidPortal
         }
         guard clearWidth.isFinite else { throw IndoorNavigationInputError.nonFiniteValue }
         guard clearWidth > 0 else { throw IndoorNavigationInputError.nonPositiveValue }
+        guard (observedAt == nil) == (validUntil == nil) else {
+            throw IndoorNavigationInputError.invalidTimestamp
+        }
+        if let observedAt, let validUntil {
+            guard observedAt.isFinite, validUntil.isFinite,
+                observedAt >= 0, validUntil > observedAt
+            else {
+                throw IndoorNavigationInputError.invalidTimestamp
+            }
+        }
         self.identifier = try indoorNavigationIdentifier(identifier)
         self.firstCell = firstCell
         self.secondCell = secondCell
         self.state = state
         self.confidence = confidence
         self.clearWidth = clearWidth
+        self.observedAt = observedAt
+        self.validUntil = validUntil
     }
 
     fileprivate func connects(_ lhs: IndoorNavigationCell, _ rhs: IndoorNavigationCell) -> Bool {
@@ -210,7 +229,7 @@ public struct IndoorNavigationEvidenceCompleteness: Codable, Hashable, Sendable 
         obstaclesAroundObservedCellsMapped: false
     )
 
-    fileprivate var isComplete: Bool {
+    var isComplete: Bool {
         wallsAroundObservedCellsMapped && doorwayStatesMapped
             && obstaclesAroundObservedCellsMapped
     }
@@ -550,9 +569,10 @@ public struct IndoorARNavigationEngine: Sendable {
     public func route(
         from start: FramedPosition,
         to destination: SpatialObjectMetadata,
-        using evidence: IndoorNavigationEvidence,
+        using suppliedEvidence: IndoorNavigationEvidence,
         evaluatedAt: TimeInterval
     ) -> IndoorNavigationResult {
+        let evidence = expiringDoors(in: suppliedEvidence, evaluatedAt: evaluatedAt)
         if Task.isCancelled {
             return result(.insufficientEvidence, .evidenceCoverageIncomplete)
         }
@@ -744,6 +764,29 @@ public struct IndoorARNavigationEngine: Sendable {
         return nil
     }
 
+    private func expiringDoors(
+        in evidence: IndoorNavigationEvidence, evaluatedAt: TimeInterval
+    ) -> IndoorNavigationEvidence {
+        guard evidence.doors.count <= policy.maximumDoors else { return evidence }
+        let doors = evidence.doors.map { door -> IndoorNavigationDoorEvidence in
+            guard let observedAt = door.observedAt, let validUntil = door.validUntil,
+                evaluatedAt < observedAt || evaluatedAt >= validUntil
+            else { return door }
+            return try! IndoorNavigationDoorEvidence(
+                identifier: door.identifier, firstCell: door.firstCell, secondCell: door.secondCell,
+                state: .unknown, confidence: door.confidence, clearWidth: door.clearWidth,
+                observedAt: observedAt, validUntil: validUntil
+            )
+        }
+        return try! IndoorNavigationEvidence(
+            mapID: evidence.mapID, coordinateFrameID: evidence.coordinateFrameID,
+            revision: evidence.revision, observedAt: evidence.observedAt,
+            gridOrigin: evidence.gridOrigin, cellSize: evidence.cellSize,
+            floors: evidence.floors, mesh: evidence.mesh, doors: doors,
+            walls: evidence.walls, obstacles: evidence.obstacles, completeness: evidence.completeness
+        )
+    }
+
     private func validateEvidence(_ evidence: IndoorNavigationEvidence) -> EvidenceValidation {
         let floors = Dictionary(grouping: evidence.floors, by: \.cell)
         let mesh = Dictionary(grouping: evidence.mesh, by: \.cell)
@@ -767,9 +810,8 @@ public struct IndoorARNavigationEngine: Sendable {
                     reason: .nonFiniteDerivedCoordinate
                 )
             }
-            guard let first = flatFloors[door.firstCell],
-                let second = flatFloors[door.secondCell],
-                first.zoneIdentifier != second.zoneIdentifier
+            guard flatFloors[door.firstCell] != nil,
+                flatFloors[door.secondCell] != nil
             else {
                 return EvidenceValidation(
                     floors: flatFloors,
@@ -839,7 +881,7 @@ public struct IndoorARNavigationEngine: Sendable {
                     .sorted { $0.identifier < $1.identifier }
                     .first
                 let crossesZone = source.zoneIdentifier != target.zoneIdentifier
-                if crossesZone {
+                if crossesZone || portal != nil {
                     guard let portal else { continue }
                     let requiredDoorWidth = 2 * (policy.agentRadius + policy.obstacleClearance)
                     if allowUncertain {
@@ -856,7 +898,7 @@ public struct IndoorARNavigationEngine: Sendable {
                         else { continue }
                     }
                 }
-                let trustedPortal = crossesZone ? portal : nil
+                let trustedPortal = portal
                 guard
                     isEdgeClear(
                         from: source.position,
@@ -949,6 +991,37 @@ public struct IndoorARNavigationEngine: Sendable {
         excludingObstacleIdentifiers: Set<String> = []
     ) -> Bool {
         let segment = Segment2D(start: start, end: end)
+        // Endpoint connectors must obey portals too. Otherwise a same-zone
+        // destination snap could skip the graph edge of a closed door.
+        for door in evidence.doors {
+            let permitsPassage =
+                door.state == .open
+                && door.confidence >= policy.minimumEvidenceConfidence
+                && door.clearWidth >= 2 * (policy.agentRadius + policy.obstacleClearance)
+            if permitsPassage
+                || (allowUncertainPortal && door.state != .closed
+                    && (door.state == .unknown || door.confidence < policy.minimumEvidenceConfidence))
+            {
+                continue
+            }
+            guard let first = derivedPosition(cell: door.firstCell, elevation: start.y, evidence: evidence),
+                let second = derivedPosition(cell: door.secondCell, elevation: start.y, evidence: evidence),
+                let barrierStart = try? Vec3(
+                    x: (first.x + second.x) / 2 - (second.z - first.z) / 2,
+                    y: start.y,
+                    z: (first.z + second.z) / 2 + (second.x - first.x) / 2),
+                let barrierEnd = try? Vec3(
+                    x: (first.x + second.x) / 2 + (second.z - first.z) / 2,
+                    y: start.y,
+                    z: (first.z + second.z) / 2 - (second.x - first.x) / 2)
+            else { return false }
+            if IndoorNavigationGeometry.segmentDistance(
+                segment, Segment2D(start: barrierStart, end: barrierEnd))
+                < policy.agentRadius + policy.obstacleClearance - IndoorNavigationGeometry.epsilon
+            {
+                return false
+            }
+        }
         for wall in evidence.walls {
             let barrier = Segment2D(start: wall.start, end: wall.end)
             let required = policy.agentRadius + wall.thickness / 2
@@ -1312,7 +1385,7 @@ extension IndoorNavigationFloorEvidence {
 
 extension IndoorNavigationDoorEvidence {
     private enum CodingKeys: String, CodingKey {
-        case identifier, firstCell, secondCell, state, confidence, clearWidth
+        case identifier, firstCell, secondCell, state, confidence, clearWidth, observedAt, validUntil
     }
 
     public init(from decoder: Decoder) throws {
@@ -1324,7 +1397,9 @@ extension IndoorNavigationDoorEvidence {
                 secondCell: container.decode(IndoorNavigationCell.self, forKey: .secondCell),
                 state: container.decode(IndoorNavigationDoorState.self, forKey: .state),
                 confidence: container.decode(ConfidenceScore.self, forKey: .confidence),
-                clearWidth: container.decode(Double.self, forKey: .clearWidth)
+                clearWidth: container.decode(Double.self, forKey: .clearWidth),
+                observedAt: container.decodeIfPresent(TimeInterval.self, forKey: .observedAt),
+                validUntil: container.decodeIfPresent(TimeInterval.self, forKey: .validUntil)
             )
         } catch let error as DecodingError { throw error } catch {
             throw invalidIndoorNavigationDecoding(.identifier, in: container)

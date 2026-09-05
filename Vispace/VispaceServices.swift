@@ -45,8 +45,11 @@ final class VispaceServices: ObservableObject {
         let sceneGraphService = SpatialSceneGraphService(
             repository: sceneGraphRepository
         )
+        let objectMutationFence = SpatialObjectMutationFence()
         let durableMetadataWriter: @Sendable (SpatialObjectMetadata) async throws -> Void = {
             metadata in
+            objectMutationFence.begin()
+            defer { objectMutationFence.end() }
             let document = try await repository.upsertObjectMetadataBatch([metadata])
             try Task.checkCancellation()
             let now = Date().timeIntervalSince1970
@@ -59,6 +62,8 @@ final class VispaceServices: ObservableObject {
             )
         }
         let durableMetadataBatchWriter: TemporalSpatialMemoryService.MetadataBatchWriter = { metadata in
+            objectMutationFence.begin()
+            defer { objectMutationFence.end() }
             let document = try await repository.upsertObjectMetadataBatch(metadata)
             try Task.checkCancellation()
             guard let first = metadata.first else { return }
@@ -180,7 +185,9 @@ final class VispaceServices: ObservableObject {
                 sessionController.captureIdentity
             },
             renameProvider: { expected, displayName in
-                try await repository.renameObject(expected: expected, displayName: displayName)
+                objectMutationFence.begin()
+                defer { objectMutationFence.end() }
+                return try await repository.renameObject(expected: expected, displayName: displayName)
             },
             classificationCorrectionProvider: { expected, label in
                 guard let frame = await sessionController.latestDepthFrame,
@@ -249,33 +256,34 @@ final class VispaceServices: ObservableObject {
         let navigationDepthHistory = ARRecentNavigationDepthHistory(
             frameStreamProvider: { sessionController.frames }
         )
+        let navigationEvidenceProvider: IndoorNavigationController.EvidenceProvider = { snapshot, identity in
+            let depthFrame = await sessionController.latestDepthFrame
+            let depthHistory = await navigationDepthHistory.frames(
+                matching: identity, evaluatedAt: depthFrame?.pose.timestamp ?? .nan
+            )
+            let objects = try await repository.metadataSnapshot().objects
+            let evidenceWork = Task.detached(priority: .userInitiated) {
+                navigationEvidenceBuilder.adapt(
+                    snapshot,
+                    currentIdentity: identity,
+                    currentDepthFrame: depthFrame,
+                    recentDepthFrames: depthHistory,
+                    dynamicObjects: objects
+                )
+            }
+            return await withTaskCancellationHandler {
+                await evidenceWork.value
+            } onCancel: {
+                evidenceWork.cancel()
+            }
+        }
         let navigationController = IndoorNavigationController(
             surfaceStreamProvider: { sessionController.surfaces },
             poseStreamProvider: { sessionController.poses },
             currentIdentityProvider: {
                 sessionController.captureIdentity
             },
-            evidenceProvider: { snapshot, identity in
-                let depthFrame = await sessionController.latestDepthFrame
-                let depthHistory = await navigationDepthHistory.frames(
-                    matching: identity, evaluatedAt: depthFrame?.pose.timestamp ?? .nan
-                )
-                let objects = try await repository.metadataSnapshot().objects
-                let evidenceWork = Task.detached(priority: .userInitiated) {
-                    navigationEvidenceBuilder.adapt(
-                        snapshot,
-                        currentIdentity: identity,
-                        currentDepthFrame: depthFrame,
-                        recentDepthFrames: depthHistory,
-                        dynamicObjects: objects
-                    )
-                }
-                return await withTaskCancellationHandler {
-                    await evidenceWork.value
-                } onCancel: {
-                    evidenceWork.cancel()
-                }
-            },
+            evidenceProvider: navigationEvidenceProvider,
             startPositionProvider: { stalePose, identity in
                 guard
                     let evidence =
@@ -301,6 +309,65 @@ final class VispaceServices: ObservableObject {
             surfaceStabilityDelay: .milliseconds(250),
             evaluationTimestampProvider: { sessionController.navigationEvaluationTimestamp }
         )
+        relationQueryController.observationProvider = { scope, records, identity, wallTime in
+            guard let mapID = identity.mapID, let sourceVersion = objectMutationFence.stableVersion else {
+                return SceneGraph()
+            }
+            let latestObjects = try await repository.metadataSnapshot().objects
+            guard
+                SpatialObjectMutationFence.representsSameSnapshot(
+                    records: records, currentObjects: latestObjects,
+                    mapID: mapID, coordinateFrameID: identity.coordinateFrameID),
+                objectMutationFence.stableVersion == sourceVersion
+            else { return SceneGraph() }
+            let capture = await MainActor.run {
+                (
+                    sessionController.latestSurfaceSnapshot,
+                    sessionController.navigationEvaluationTimestamp
+                )
+            }
+            guard let snapshot = capture.0, let evaluatedAt = capture.1,
+                let floor = await sessionController.currentVerifiedCameraFloorPoseEvidence(
+                    matching: identity),
+                case .ready(let evidence) = try await navigationEvidenceProvider(snapshot, identity)
+            else {
+                try await sceneGraphService.replaceObservedRelations(
+                    mapID: mapID,
+                    coordinateFrameID: identity.coordinateFrameID, graph: SceneGraph(), at: wallTime)
+                return SceneGraph()
+            }
+            let graph = try await Task.detached(priority: .userInitiated) {
+                try ObservedNavigationRelationDeriver().derive(
+                    scope: scope,
+                    objects: records.map(\.metadata), evidence: evidence, cameraStart: floor.floorPosition,
+                    segmentID: identity.segmentID, evaluatedAt: evaluatedAt, wallTime: wallTime,
+                    objectRevisionEpoch: sourceVersion)
+            }.value
+            try Task.checkCancellation()
+            let isCurrent = await MainActor.run {
+                sessionController.captureIdentity == identity
+                    && sessionController.latestSurfaceSnapshot?.revision == snapshot.revision
+                    && sessionController.navigationEvaluationTimestamp.map {
+                        $0 >= evaluatedAt && $0 - evaluatedAt <= 0.5
+                    } == true
+            }
+            guard isCurrent, objectMutationFence.stableVersion == sourceVersion else { return SceneGraph() }
+            try await sceneGraphService.replaceObservedRelations(
+                mapID: mapID,
+                coordinateFrameID: identity.coordinateFrameID, graph: graph, at: Date().timeIntervalSince1970)
+            guard objectMutationFence.stableVersion == sourceVersion else { return SceneGraph() }
+            return graph
+        }
+        relationQueryController.observationValidator = { source in
+            guard let current = sessionController.latestSurfaceSnapshot,
+                let now = sessionController.navigationEvaluationTimestamp
+            else { return false }
+            return current.mapID == source.mapID && current.coordinateFrameID == source.coordinateFrameID
+                && current.segmentID == source.segmentID && current.revision == source.surfaceRevision
+                && source.objectRevisionEpoch != nil
+                && objectMutationFence.stableVersion == source.objectRevisionEpoch
+                && now >= source.observedAt && now - source.observedAt <= 0.75
+        }
         let lifecycle = SpatialApplicationLifecycle(
             prepareStorage: {
                 try SpatialStorageDirectory.prepare(at: spatialCaptureDirectory)

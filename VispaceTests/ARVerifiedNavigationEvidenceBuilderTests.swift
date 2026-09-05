@@ -280,7 +280,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         XCTAssertFalse(evidence.walls.isEmpty)
     }
 
-    func testDoorGeometryFailsUntilTraversalStateCanBeVerified() throws {
+    func testUnverifiedDoorGeometryBlocksLocallyAndPreservesOtherCells() throws {
         let context = makeContext()
         let doorPlaneSnapshot = surface(
             mapID: context.mapID,
@@ -306,16 +306,112 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         )
 
         for snapshot in [doorPlaneSnapshot, doorMeshSnapshot] {
-            XCTAssertEqual(
-                try unwrapIssue(
-                    ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
-                        snapshot,
-                        currentIdentity: context.identity
-                    )
-                ),
-                .coverageAttestationUnavailable
-            )
+            let evidence = try unwrapReady(
+                ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
+                    snapshot, currentIdentity: context.identity))
+            XCTAssertFalse(evidence.doors.isEmpty)
+            XCTAssertTrue(evidence.doors.allSatisfy { $0.state == .unknown })
+            XCTAssertTrue(evidence.mesh.contains { $0.occupancy == .unknown })
+            XCTAssertTrue(evidence.mesh.contains { $0.occupancy == .free })
         }
+    }
+
+    func testDoorRequiresCurrentDepthAndIndependentRecentView() throws {
+        let context = makeContext()
+        let snapshot = surface(
+            mapID: context.mapID, frameID: context.frameID,
+            segmentID: context.segmentID, planes: [floorPlane(), verticalPlane(classification: .door)])
+        let current = try depthFrame(identity: context.identity, timestamp: 10, cameraZ: 3, meters: 5)
+        let previous = try depthFrame(identity: context.identity, timestamp: 9.5, cameraZ: 3.2, meters: 5)
+        let builder = ARVerifiedNavigationEvidenceBuilder()
+        let open = try unwrapReady(
+            builder.adapt(
+                snapshot, currentIdentity: context.identity,
+                currentDepthFrame: current,
+                recentDepthFrames: [try XCTUnwrap(ARNavigationDepthFrame(previous))]))
+        XCTAssertTrue(open.doors.contains { $0.state == .open })
+        XCTAssertEqual(
+            try routeFromCurrentFootprint(evidence: open, identity: context.identity).status, .success)
+        XCTAssertTrue(open.doors.allSatisfy { $0.observedAt == 10 && $0.validUntil == 10.75 })
+        XCTAssertEqual(
+            open.doors.filter { $0.state == .open }.map(\.clearWidth).min() ?? 0, 1.4, accuracy: 0.0001)
+        let single = try unwrapReady(
+            builder.adapt(snapshot, currentIdentity: context.identity, currentDepthFrame: current))
+        XCTAssertTrue(single.doors.allSatisfy { $0.state == .unknown })
+        XCTAssertNil(try routeFromCurrentFootprint(evidence: single, identity: context.identity).path)
+        XCTAssertEqual(
+            try routeFromCurrentFootprint(
+                evidence: single, identity: context.identity,
+                from: vec(-0.75, 0, 0.25), to: vec(-0.75, 0, -0.25)
+            ).status, .success)
+        let duplicatePose = try depthFrame(identity: context.identity, timestamp: 9.5, cameraZ: 3, meters: 5)
+        let stationary = try unwrapReady(
+            builder.adapt(
+                snapshot, currentIdentity: context.identity,
+                currentDepthFrame: current,
+                recentDepthFrames: [try XCTUnwrap(ARNavigationDepthFrame(duplicatePose))]))
+        XCTAssertTrue(stationary.doors.allSatisfy { $0.state == .unknown })
+        let expired = try depthFrame(identity: context.identity, timestamp: 8.9, cameraZ: 3.2, meters: 5)
+        let stale = try unwrapReady(
+            builder.adapt(
+                snapshot, currentIdentity: context.identity,
+                currentDepthFrame: current,
+                recentDepthFrames: [try XCTUnwrap(ARNavigationDepthFrame(expired))]))
+        XCTAssertTrue(stale.doors.allSatisfy { $0.state == .unknown })
+    }
+
+    func testCurrentDoorBlockerOverridesOpenHistoryAtSameSurfaceRevision() throws {
+        let context = makeContext()
+        let snapshot = surface(
+            mapID: context.mapID, frameID: context.frameID,
+            segmentID: context.segmentID, planes: [floorPlane(), verticalPlane(classification: .door)])
+        let previous = try depthFrame(identity: context.identity, timestamp: 9.5, cameraZ: 3.2, meters: 5)
+        let current = try depthFrame(
+            identity: context.identity, timestamp: 10, cameraZ: 3,
+            meters: 5, blockedDoorPixel: true)
+        let result = try unwrapReady(
+            ARVerifiedNavigationEvidenceBuilder().adapt(
+                snapshot,
+                currentIdentity: context.identity, currentDepthFrame: current,
+                recentDepthFrames: [try XCTUnwrap(ARNavigationDepthFrame(previous))]))
+        XCTAssertTrue(result.doors.allSatisfy { $0.state == .closed })
+        XCTAssertTrue(result.mesh.contains { $0.occupancy == .blocked })
+        XCTAssertTrue(result.mesh.contains { $0.occupancy == .free })
+        XCTAssertNil(try routeFromCurrentFootprint(evidence: result, identity: context.identity).path)
+        XCTAssertEqual(
+            try routeFromCurrentFootprint(
+                evidence: result, identity: context.identity,
+                from: vec(-0.75, 0, 0.25), to: vec(-0.75, 0, -0.25)
+            ).status, .success)
+    }
+
+    func testRotatedDoorMeasuresBothCrossingGridDirections() throws {
+        let context = makeContext()
+        let candidate = try unwrapReady(
+            ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
+                context.snapshot, currentIdentity: context.identity))
+        let door = try XCTUnwrap(
+            ARObservedDoorSurface(
+                identifier: "rotated-door",
+                vertices: [vec(-0.8, 0, -0.8), vec(0.8, 0, 0.8), vec(0.8, 2, 0.8), vec(-0.8, 2, -0.8)],
+                supportsOpeningMeasurement: true))
+        XCTAssertTrue(door.supportsOpeningMeasurement)
+        XCTAssertEqual(door.width, sqrt(2) * 1.6, accuracy: 0.0001)
+        let current = try depthFrame(identity: context.identity, timestamp: 10, cameraZ: 3, meters: 5)
+        let previous = try depthFrame(identity: context.identity, timestamp: 9.5, cameraZ: 3.2, meters: 5)
+        let result = try XCTUnwrap(
+            ARObservedDoorEvidenceProvider().observe(
+                surfaces: [door],
+                gridOrigin: candidate.gridOrigin, cellSize: candidate.cellSize,
+                floors: candidate.floors, mesh: candidate.mesh,
+                frames: [
+                    try XCTUnwrap(ARNavigationDepthFrame(current)),
+                    try XCTUnwrap(ARNavigationDepthFrame(previous)),
+                ],
+                confidence: .one))
+        XCTAssertTrue(
+            result.doors.contains { $0.state == .open && $0.firstCell.column != $0.secondCell.column })
+        XCTAssertTrue(result.doors.contains { $0.state == .open && $0.firstCell.row != $0.secondCell.row })
     }
 
     func testMultipleFloorElevationsFailClosed() throws {
@@ -651,7 +747,8 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
     }
 
     private func depthFrame(identity: ARCaptureIdentity, timestamp: TimeInterval,
-                            cameraZ: Float, meters: Float) throws -> ARFrameSnapshot {
+        cameraZ: Float, meters: Float, blockedDoorPixel: Bool = false
+    ) throws -> ARFrameSnapshot {
         var pixelBuffer: CVPixelBuffer?
         XCTAssertEqual(CVPixelBufferCreate(kCFAllocatorDefault, 1, 1,
             kCVPixelFormatType_32BGRA, nil, &pixelBuffer), kCVReturnSuccess)
@@ -663,19 +760,24 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
             mapID: identity.mapID, coordinateFrameStatus: .confirmed, capturedAt: 100,
             timestamp: timestamp, cameraTransform: Matrix4x4Snapshot(camera),
             trackingState: .normal, worldMappingStatus: .mapped)
+        var depths = Array(repeating: meters, count: 10_000)
+        if blockedDoorPixel { depths[50 * 100 + 45] = 2.8 }
         return ARFrameSnapshot(pose: pose, imageOrientation: .up,
             capturedImage: ImmutablePixelBuffer(pixelBuffer: try XCTUnwrap(pixelBuffer)),
             cameraIntrinsics: Matrix3x3Snapshot(simd_float3x3(columns: (
                 SIMD3<Float>(50, 0, 0), SIMD3<Float>(0, 50, 0), SIMD3<Float>(50, 50, 1)))),
             cameraImageDimensions: ImageDimensions(width: 100, height: 100), displayTransform: nil,
             sceneDepth: ARDepthSnapshot(dimensions: ImageDimensions(width: 100, height: 100),
-                depthMeters: Array(repeating: meters, count: 10_000),
+                depthMeters: depths,
                 confidence: Array(repeating: 2, count: 10_000)), smoothedSceneDepth: nil)
     }
 
     private func routeFromCurrentFootprint(evidence: IndoorNavigationEvidence,
-                                          identity: ARCaptureIdentity) throws -> IndoorNavigationResult {
-        let destinationPosition = vec(-0.25, 0, -0.25)
+        identity: ARCaptureIdentity,
+        from startPosition: Vec3? = nil,
+        to targetPosition: Vec3? = nil
+    ) throws -> IndoorNavigationResult {
+        let destinationPosition = targetPosition ?? vec(-0.25, 0, -0.25)
         let confidence = ConfidenceScore(clamping: 0.9)
         let destination = try SpatialObjectMetadata(mapID: XCTUnwrap(identity.mapID),
             object: SpatialObject(semanticLabel: "chair", position: destinationPosition,
@@ -686,8 +788,8 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
                 value: destinationPosition, observedAt: 10, trackingQuality: .normal,
                 uncertainty: .highConfidenceDepth))
         return IndoorARNavigationEngine().route(from: try FramedPosition(
-            coordinateFrameID: identity.coordinateFrameID, value: vec(0.25, 0, 0.25),
-            observedAt: 10, trackingQuality: .normal, uncertainty: .raycastEstimate),
+                coordinateFrameID: identity.coordinateFrameID, value: startPosition ?? vec(0.25, 0, 0.25),
+                observedAt: 10, trackingQuality: .normal, uncertainty: .raycastEstimate),
             to: destination, using: evidence, evaluatedAt: 10)
     }
 

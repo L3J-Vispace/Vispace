@@ -44,10 +44,36 @@ struct SpatialQueryPanel: View {
                 )
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             } else if let presentation = relationQueryController.latestPresentation {
-                messageCard(
-                    message: presentation.message,
-                    systemImage: "point.3.connected.trianglepath.dotted"
-                )
+                VStack(alignment: .leading, spacing: 8) {
+                    messageCard(
+                        message: presentation.message,
+                        systemImage: "point.3.connected.trianglepath.dotted"
+                    )
+                    if let target = presentation.result.ambiguousTargets.first {
+                        ForEach(Array(target.candidates.enumerated()), id: \.element.objectID) {
+                            index, candidate in
+                            Button {
+                                relationQueryController.selectTarget(
+                                    mention: target.mention, objectID: candidate.objectID)
+                            } label: {
+                                VStack(alignment: .leading) {
+                                    Text("\(candidate.name) · 후보 \(index + 1)")
+                                    if let position = candidate.position {
+                                        Text(distanceDescription(position)).font(.caption)
+                                    }
+                                    if let time = candidate.lastSeenAt {
+                                        Text(
+                                            "마지막 관측 \(Date(timeIntervalSince1970: time).formatted(date: .abbreviated, time: .shortened))"
+                                        )
+                                        .font(.caption)
+                                    }
+                                }.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                            }
+                            .buttonStyle(.bordered)
+                            .accessibilityIdentifier("vispace.relation.candidate.\(index)")
+                        }
+                    }
+                }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             } else if let relationMessage = relationStateMessage {
                 messageCard(
