@@ -67,6 +67,23 @@ public actor TemporalSpatialMemoryService {
         let coordinateFrameID: CoordinateFrameID
     }
 
+    private struct OperationLease: Sendable {
+        let id: UUID
+        let key: MapFrameKey
+        let generation: UInt64
+    }
+
+    private struct OperationWaiter {
+        let lease: OperationLease
+        let continuation: CheckedContinuation<OperationLease, any Error>
+    }
+
+    // Actor isolation alone does not protect read/commit/project transactions
+    // across awaits. Each map/frame keeps one owner through journal publication
+    // and projection so an older recovery cannot replace a newer coordinator.
+    private var activeOperations: [MapFrameKey: UUID] = [:]
+    private var waitingOperations: [MapFrameKey: [OperationWaiter]] = [:]
+
     private let journalRepository: TemporalSpatialMemoryJournalRepository
     private let metadataProvider: MetadataProvider
     private let metadataWriter: MetadataWriter
@@ -120,7 +137,17 @@ public actor TemporalSpatialMemoryService {
         mapID: MapID,
         coordinateFrameID: CoordinateFrameID
     ) async throws -> TemporalSpatialMemorySnapshot {
-        let generation = resetGeneration
+        let key = MapFrameKey(mapID: mapID, coordinateFrameID: coordinateFrameID)
+        let lease = try await acquireOperation(for: key)
+        defer { releaseOperation(lease) }
+        try validateGeneration(lease.generation)
+        return try await recoverWhileOwningOperation(
+            mapID: mapID, coordinateFrameID: coordinateFrameID, generation: lease.generation)
+    }
+
+    private func recoverWhileOwningOperation(
+        mapID: MapID, coordinateFrameID: CoordinateFrameID, generation: UInt64
+    ) async throws -> TemporalSpatialMemorySnapshot {
         let key = MapFrameKey(mapID: mapID, coordinateFrameID: coordinateFrameID)
         let document = try await validatedMetadataDocument(
             mapID: mapID,
@@ -192,8 +219,21 @@ public actor TemporalSpatialMemoryService {
         _ batch: TemporalSpatialRecognitionBatch,
         pose: ARPoseSnapshot
     ) async throws -> TemporalSpatialMemoryServiceResult {
-        let generation = resetGeneration
         try Task.checkCancellation()
+        try validateCaptureAuthority(pose)
+        let (mapID, _) = try validatedPoseIdentity(pose)
+        let lease = try await acquireOperation(
+            for: MapFrameKey(
+                mapID: mapID, coordinateFrameID: pose.coordinateFrameID))
+        defer { releaseOperation(lease) }
+        try validateGeneration(lease.generation)
+        return try await processWhileOwningOperation(batch, pose: pose, generation: lease.generation)
+    }
+
+    private func processWhileOwningOperation(
+        _ batch: TemporalSpatialRecognitionBatch, pose: ARPoseSnapshot, generation: UInt64
+    ) async throws -> TemporalSpatialMemoryServiceResult {
+        try validateGeneration(generation)
         try validateCaptureAuthority(pose)
         let (mapID, mappingQuality) = try validatedPoseIdentity(pose)
         let key = MapFrameKey(
@@ -207,9 +247,10 @@ public actor TemporalSpatialMemoryService {
                 throw TemporalSpatialMemoryError.promotionEvidenceMismatch(observation.metadata.object.id)
             }
         }
-        _ = try await recover(
+        _ = try await recoverWhileOwningOperation(
             mapID: mapID,
-            coordinateFrameID: pose.coordinateFrameID
+            coordinateFrameID: pose.coordinateFrameID,
+            generation: generation
         )
         try validateGeneration(generation)
         try validateCaptureAuthority(pose)
@@ -332,9 +373,15 @@ public actor TemporalSpatialMemoryService {
     {
         try validateCaptureAuthority(pose)
         let (mapID, _) = try validatedPoseIdentity(pose)
+        let lease = try await acquireOperation(
+            for: MapFrameKey(
+                mapID: mapID, coordinateFrameID: pose.coordinateFrameID))
+        defer { releaseOperation(lease) }
+        try validateGeneration(lease.generation)
         let document = try await validatedMetadataDocument(
             mapID: mapID,
             coordinateFrameID: pose.coordinateFrameID)
+        try validateGeneration(lease.generation)
         guard let metadata = document.objects.first(where: { $0.object.id == objectID }),
             metadata.mapID == mapID,
             metadata.position.coordinateFrameID == pose.coordinateFrameID,
@@ -345,10 +392,11 @@ public actor TemporalSpatialMemoryService {
             expectedSemanticLabel: metadata.object.semanticLabel,
             expectedTemporalRevision: expectedTemporalRevision,
             semanticLabel: semanticLabel, displayName: metadata.object.displayName)
-        return try await process(
+        return try await processWhileOwningOperation(
             TemporalSpatialRecognitionBatch(
                 sequence: 0, observations: [],
-                expectedVisibleObjectIDs: [], classificationCorrections: [correction]), pose: pose)
+                expectedVisibleObjectIDs: [], classificationCorrections: [correction]),
+            pose: pose, generation: lease.generation)
     }
 
     /// Call after ingestion has stopped and before deleting durable storage.
@@ -357,6 +405,53 @@ public actor TemporalSpatialMemoryService {
         resetGeneration &+= 1
         coordinators.removeAll()
         projectionPending.removeAll()
+        activeOperations.removeAll()
+        let cancelled = waitingOperations.values.flatMap { $0 }
+        waitingOperations.removeAll()
+        for waiter in cancelled { waiter.continuation.resume(throwing: CancellationError()) }
+    }
+
+    private func acquireOperation(for key: MapFrameKey) async throws -> OperationLease {
+        let lease = OperationLease(id: UUID(), key: key, generation: resetGeneration)
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                if activeOperations[key] == nil {
+                    activeOperations[key] = lease.id
+                    continuation.resume(returning: lease)
+                } else {
+                    waitingOperations[key, default: []].append(
+                        OperationWaiter(lease: lease, continuation: continuation))
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaitingOperation(lease) }
+        }
+    }
+
+    private func cancelWaitingOperation(_ lease: OperationLease) {
+        guard let index = waitingOperations[lease.key]?.firstIndex(where: { $0.lease.id == lease.id }) else {
+            return
+        }
+        let waiter = waitingOperations[lease.key]!.remove(at: index)
+        if waitingOperations[lease.key]?.isEmpty == true { waitingOperations.removeValue(forKey: lease.key) }
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    private func releaseOperation(_ lease: OperationLease) {
+        guard resetGeneration == lease.generation, activeOperations[lease.key] == lease.id else { return }
+        if var waiting = waitingOperations[lease.key], !waiting.isEmpty {
+            let next = waiting.removeFirst()
+            waitingOperations[lease.key] = waiting.isEmpty ? nil : waiting
+            activeOperations[lease.key] = next.lease.id
+            next.continuation.resume(returning: next.lease)
+        } else {
+            activeOperations.removeValue(forKey: lease.key)
+        }
+    }
+
+    var pendingOperationCountForTesting: Int {
+        waitingOperations.values.reduce(0) { $0 + $1.count }
     }
 
     private func validateGeneration(_ generation: UInt64) throws {

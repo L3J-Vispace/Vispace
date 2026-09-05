@@ -4,6 +4,247 @@ import XCTest
 @testable import Vispace
 
 final class TemporalSpatialMemoryServiceTests: XCTestCase {
+    func testColdRecoverySerializesCorrectionAndRecognitionWithoutRegressingCache() async throws {
+        executionTimeAllowance = 60
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(101), frameID = temporalTestFrameID(101)
+        let objectID = temporalTestObjectID(101), newObjectID = temporalTestObjectID(102)
+        let seed = temporalTestMetadata(mapID: mapID, coordinateFrameID: frameID, objectID: objectID, at: 90)
+        let store = TemporalMetadataStore(
+            document: SpatialMetadataDocument(
+                maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)], objects: [seed]))
+        let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let gate = TemporalBatchRecoveryGate(), batches = TemporalBatchProjectionRecorder()
+        let service = TemporalSpatialMemoryService(
+            journalRepository: journal, policy: temporalTestPolicy(),
+            metadataProvider: { try await store.snapshot() }, metadataWriter: { try await store.upsert($0) },
+            metadataBatchWriter: { objects in
+                for object in objects { try await store.upsert(object) }
+                await batches.record(objects)
+                await gate.pauseOnce()
+                try Task.checkCancellation()
+            })
+        let recovery = gatedRecovery(service, mapID: mapID, frameID: frameID, gate: gate)
+        guard await gate.waitUntilPausedOrFinished() else {
+            _ = try await recovery.value
+            throw TemporalMetadataStoreError.batchProjectionWasNotReached
+        }
+        let correction = Task {
+            try await service.correctClassification(
+                objectID: objectID, semanticLabel: "table",
+                expectedTemporalRevision: nil,
+                pose: temporalTestPose(
+                    mapID: mapID, coordinateFrameID: frameID,
+                    capturedAt: 100, sessionTimestamp: 1, sequence: 1))
+        }
+        try await waitForPendingOperations(service, count: 1)
+        let recognition = Task {
+            try await service.process(
+                TemporalSpatialRecognitionBatch(
+                    sequence: 2,
+                    observations: [
+                        temporalTestNewObservation(
+                            mapID: mapID, coordinateFrameID: frameID,
+                            objectID: newObjectID, at: 101)
+                    ], expectedVisibleObjectIDs: []),
+                pose: temporalTestPose(
+                    mapID: mapID, coordinateFrameID: frameID,
+                    capturedAt: 101, sessionTimestamp: 2, sequence: 2))
+        }
+        try await waitForPendingOperations(service, count: 2)
+        let beforeResume = try await journal.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertNil(beforeResume, "No transaction may overtake unfinished initial projection")
+        await gate.resume()
+        let seedSnapshot = try await recovery.value
+        XCTAssertEqual(seedSnapshot.revision, 0)
+        let correctionResult = try await correction.value
+        let recognitionResult = try await recognition.value
+        guard case .applied(let corrected) = correctionResult,
+            case .applied(let recognized) = recognitionResult
+        else {
+            XCTFail("Both queued transactions must commit in order"); return
+        }
+        XCTAssertEqual(corrected.newRevision, 1)
+        XCTAssertEqual(recognized.newRevision, 2)
+        let batchCalls = await batches.objectIDs
+        XCTAssertEqual(batchCalls, [[objectID]], "Initial recovery must project only once")
+        for revision in 3...4 {
+            let result = try await service.process(
+                TemporalSpatialRecognitionBatch(
+                    sequence: UInt64(revision),
+                    observations: [], expectedVisibleObjectIDs: []),
+                pose: temporalTestPose(
+                    mapID: mapID, coordinateFrameID: frameID,
+                    capturedAt: Double(99 + revision), sessionTimestamp: Double(revision),
+                    sequence: UInt64(revision)))
+            guard case .applied(let delta) = result else {
+                XCTFail("Next storage must continue without reset"); return
+            }
+            XCTAssertEqual(delta.newRevision, UInt64(revision))
+            let durable = try await journal.recover(mapID: mapID, coordinateFrameID: frameID)
+            let cached = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+            XCTAssertEqual(cached, durable?.snapshot)
+            XCTAssertEqual(cached.metadata(for: objectID)?.object.semanticLabel, "table")
+            XCTAssertNotNil(cached.metadata(for: newObjectID))
+        }
+    }
+
+    func testCancelledQueuedCorrectionReleasesPromptlyAndRecognitionContinues() async throws {
+        executionTimeAllowance = 60
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(103), frameID = temporalTestFrameID(103),
+            objectID = temporalTestObjectID(103)
+        let seed = temporalTestMetadata(mapID: mapID, coordinateFrameID: frameID, objectID: objectID, at: 90)
+        let store = TemporalMetadataStore(
+            document: SpatialMetadataDocument(
+                maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)], objects: [seed]))
+        let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let gate = TemporalBatchRecoveryGate()
+        let service = TemporalSpatialMemoryService(
+            journalRepository: journal, policy: temporalTestPolicy(),
+            metadataProvider: { try await store.snapshot() }, metadataWriter: { try await store.upsert($0) },
+            metadataBatchWriter: { objects in
+                for object in objects { try await store.upsert(object) }
+                await gate.pauseOnce()
+                try Task.checkCancellation()
+            })
+        let recovery = gatedRecovery(service, mapID: mapID, frameID: frameID, gate: gate)
+        guard await gate.waitUntilPausedOrFinished() else {
+            _ = try await recovery.value
+            throw TemporalMetadataStoreError.batchProjectionWasNotReached
+        }
+        let correction = Task {
+            try await service.correctClassification(
+                objectID: objectID, semanticLabel: "table",
+                expectedTemporalRevision: nil,
+                pose: temporalTestPose(
+                    mapID: mapID, coordinateFrameID: frameID,
+                    capturedAt: 100, sessionTimestamp: 1, sequence: 1))
+        }
+        try await waitForPendingOperations(service, count: 1)
+        correction.cancel()
+        try await waitForPendingOperations(service, count: 0)
+        do {
+            _ = try await correction.value; XCTFail("A cancelled waiter cannot edit the classification")
+        } catch is CancellationError {}
+        let recognition = Task {
+            try await service.process(
+                TemporalSpatialRecognitionBatch(
+                    sequence: 1,
+                    observations: [], expectedVisibleObjectIDs: []),
+                pose: temporalTestPose(
+                    mapID: mapID, coordinateFrameID: frameID,
+                    capturedAt: 101, sessionTimestamp: 2, sequence: 2))
+        }
+        try await waitForPendingOperations(service, count: 1)
+        recovery.cancel()
+        await gate.resume()
+        do {
+            _ = try await recovery.value; XCTFail("Cancelled recovery cannot publish its seed")
+        } catch is CancellationError {}
+        _ = try await recognition.value
+        let snapshot = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(snapshot.revision, 1)
+        XCTAssertEqual(snapshot.metadata(for: objectID)?.object.semanticLabel, seed.object.semanticLabel)
+        let durable = try await journal.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(snapshot, durable?.snapshot)
+    }
+
+    func testResetCancelsQueuedWorkAndOldOwnerCannotReleaseNewGeneration() async throws {
+        executionTimeAllowance = 60
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(104), frameID = temporalTestFrameID(104),
+            objectID = temporalTestObjectID(104)
+        let store = TemporalMetadataStore(
+            document: SpatialMetadataDocument(
+                maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)],
+                objects: [
+                    temporalTestMetadata(mapID: mapID, coordinateFrameID: frameID, objectID: objectID, at: 90)
+                ]))
+        let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let gate = TemporalBatchRecoveryGate()
+        let service = TemporalSpatialMemoryService(
+            journalRepository: journal, policy: temporalTestPolicy(),
+            metadataProvider: { try await store.snapshot() }, metadataWriter: { try await store.upsert($0) },
+            metadataBatchWriter: { objects in
+                for object in objects { try await store.upsert(object) }
+                await gate.pauseOnce()
+            })
+        let oldRecovery = gatedRecovery(service, mapID: mapID, frameID: frameID, gate: gate)
+        guard await gate.waitUntilPausedOrFinished() else {
+            _ = try await oldRecovery.value
+            throw TemporalMetadataStoreError.batchProjectionWasNotReached
+        }
+        let queued = Task {
+            try await service.process(
+                TemporalSpatialRecognitionBatch(
+                    sequence: 1,
+                    observations: [], expectedVisibleObjectIDs: []),
+                pose: temporalTestPose(
+                    mapID: mapID, coordinateFrameID: frameID,
+                    capturedAt: 100, sessionTimestamp: 1, sequence: 1))
+        }
+        try await waitForPendingOperations(service, count: 1)
+        await service.reset()
+        await store.clearObjects()
+        do {
+            _ = try await queued.value; XCTFail("Deletion must cancel queued pre-reset work")
+        } catch is CancellationError {}
+        let fresh = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertTrue(fresh.objects.isEmpty)
+        await gate.resume()
+        do {
+            _ = try await oldRecovery.value; XCTFail("Old recovery must not repopulate deleted state")
+        } catch is CancellationError {}
+        _ = try await service.process(
+            TemporalSpatialRecognitionBatch(
+                sequence: 1,
+                observations: [
+                    temporalTestNewObservation(
+                        mapID: mapID, coordinateFrameID: frameID,
+                        objectID: temporalTestObjectID(105), at: 101)
+                ], expectedVisibleObjectIDs: []),
+            pose: temporalTestPose(
+                mapID: mapID, coordinateFrameID: frameID,
+                capturedAt: 101, sessionTimestamp: 2, sequence: 2))
+        let afterReset = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(afterReset.revision, 1)
+        XCTAssertNil(afterReset.metadata(for: objectID))
+        XCTAssertEqual(afterReset.objects.count, 1)
+    }
+
+    private func gatedRecovery(
+        _ service: TemporalSpatialMemoryService, mapID: MapID, frameID: CoordinateFrameID,
+        gate: TemporalBatchRecoveryGate
+    ) -> Task<TemporalSpatialMemorySnapshot, any Error> {
+        Task {
+            do {
+                let snapshot = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+                await gate.finished()
+                return snapshot
+            } catch {
+                await gate.finished()
+                throw error
+            }
+        }
+    }
+
+    private func waitForPendingOperations(_ service: TemporalSpatialMemoryService, count: Int) async throws {
+        // The gate owns the execution order. This deadline only turns a broken
+        // queue into an assertion instead of hanging the simulator indefinitely.
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await service.pendingOperationCountForTesting != count {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("Expected \(count) queued temporal operations")
+                throw TemporalMetadataStoreError.batchProjectionWasNotReached
+            }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+    }
+
     func testUserCorrectionJournalsCurrentNameAndSurvivesServiceRestart() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
