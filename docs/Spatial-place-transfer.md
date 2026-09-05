@@ -19,6 +19,8 @@ Storage maintenance pauses capture and drains dependent work. Import reads the e
 
 A fresh typed blob is written and verified first. One atomic metadata replacement then publishes its map and objects together. A failed publication removes only the newly created blob; the existing primary catalog remains unchanged. If a process stops before rollback, the unpublished blob cannot be restored independently and normal reconciliation preserves it in bounded quarantine. Backup maintenance may advance to a valid copy of the prior catalog; it never requires replacing existing places with imported content.
 
+For a first import or checkpoint, the recovery copy records the empty prior state until the primary catalog is published. A failed first publication therefore cannot resurrect the rejected map through backup recovery. After successful publication, refreshing that first recovery copy is best effort: a maintenance failure does not report the completed import as failed or remove its referenced blob. If this refresh fails and the primary is subsequently lost before another successful save, only the empty prior state is recoverable.
+
 The importer only reads a user-selected, security-scoped file under coordinated access. Paths in the file are not interpreted as destinations. All writes remain behind the existing repository's protected, backup-excluded spatial-directory policy, symlink checks, byte quota, and free-space admission.
 
 ## Validation

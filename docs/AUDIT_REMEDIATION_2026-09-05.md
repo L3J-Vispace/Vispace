@@ -43,7 +43,11 @@
 
 `ebdd399`의 GitHub CI에서 코어, Debug·Release 빌드, 최적화 리소스 검사, 서명 없는 기기 archive가 통과했다. 시뮬레이터 검사는 6개 테스트에서 실패했다. 이전 timestamp 재사용 fixture, 동일성 검증이 빠진 합성 fixture, 조기 symlink 거부 오류 기대값, 치수 입력 단계·설정 스크롤을 반영하지 않은 UI 검사를 수정했다. 해당 실행을 전체 통과로 집계하지 않는다.
 
-시계 자동 복구, 암호화 이전, 물체 선택·이름 지정과 위 실패 수정의 최종 통합 CI 결과는 확인 후 이 절에 기록한다.
+`c5a8a6b`에서는 코어 XCTest 318개와 Swift Testing 9개, Debug·Release 빌드, 최적화 리소스 검사와 서명 없는 기기 archive가 통과했다. 시뮬레이터 테스트 target의 `SceneGraph` 비교문 컴파일 오류는 `5baeae0`에서 정렬된 관계 값 비교로 수정했다. 이 실행 역시 전체 통과로 집계하지 않는다.
+
+최초 장소 가져오기·지도 저장의 기본 파일 게시가 실패하면 복구 사본이 실패한 새 blob을 참조하지 않도록 이전의 빈 상태를 기록한다. 기본 파일 게시 이후의 첫 복구 사본 갱신 실패는 이미 저장된 blob을 되돌리지 않는다. 기본 파일 실패와 게시 이후 유지관리 실패를 각각 재현하는 회귀 검사를 추가했다.
+
+시계 자동 복구, 암호화 이전, 물체 선택·이름 지정과 후속 수정의 통합 판정은 [PR #1의 테스트 결과](https://github.com/L3J-Vispace/Vispace/pull/1)와 해당 head에 연결된 [iOS CI 실행 기록](https://github.com/L3J-Vispace/Vispace/actions/workflows/ios-ci.yml)을 따른다. Core, Debug·Release, 리소스, archive, 시뮬레이터 및 Analyze 전체 결과를 함께 확인하며 개별 단계 통과를 전체 통과로 표현하지 않는다. 실기기 합격 근거는 이 CI와 별개다.
 
 ## 영향과 롤백
 
