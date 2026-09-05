@@ -74,8 +74,20 @@ final class SceneGraphRepositoryTests: XCTestCase {
         for _ in 0..<200 where controller.isProcessingForTesting {
             try await Task.sleep(for: .milliseconds(5))
         }
-        XCTAssertEqual(controller.latestPresentation?.result.status, .answered)
-        XCTAssertEqual(controller.latestPresentation?.result.matches.map(\.subject.objectID), [cup.object.id])
+        let presentation = try XCTUnwrap(controller.latestPresentation)
+        XCTAssertEqual(presentation.result.status, .answered)
+        XCTAssertEqual(presentation.result.mode, .listRelatedObjects)
+        XCTAssertEqual(presentation.result.referenceObject?.objectID, table.object.id)
+        // Near is symmetric: the graph retains both edge orientations. The
+        // related object is the endpoint opposite the grounded reference.
+        XCTAssertTrue(presentation.result.matches.allSatisfy {
+            $0.subject.objectID == table.object.id || $0.object.objectID == table.object.id
+        })
+        let relatedIDs = Set(presentation.result.matches.map {
+            $0.subject.objectID == table.object.id ? $0.object.objectID : $0.subject.objectID
+        })
+        XCTAssertEqual(relatedIDs, Set([cup.object.id]))
+        XCTAssertEqual(presentation.message, "‘table’ 근처에 확인된 물체는 ‘cup’예요.")
     }
 
     func testSustainedUpdatesRollDeduplicationWindowAndRejectEvictedReplay() async throws {
