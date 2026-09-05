@@ -184,6 +184,93 @@ final class SpatialPlaceArchiveServiceTests: XCTestCase {
         XCTAssertEqual(blobFiles, ["\(saved.worldMapBlobID.uuidString.lowercased()).vispacemap"])
     }
 
+    func testFirstImportPrimaryWriteFailureRecoversEmptyCatalogAndAllowsRetry() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let primary = root.appendingPathComponent("spatial-metadata-v1.json")
+        let failingFiles = ArchiveCatalogCollisionFileManager(target: primary, writeOrdinal: 2)
+        let repository = makeRepository(root, fileManager: failingFiles)
+        let candidate = try fixture()
+
+        do {
+            _ = try await repository.importPortableCheckpoint(candidate)
+            XCTFail("Expected the primary catalog write to fail")
+        } catch {
+            XCTAssertTrue(failingFiles.didInjectCollision)
+        }
+        let backup = root.appendingPathComponent("spatial-metadata-v1.previous.json")
+        let previous = try SpatialMetadataMigrator.decodeAndMigrate(Data(contentsOf: backup))
+        XCTAssertTrue(previous.maps.isEmpty)
+        XCTAssertTrue(previous.objects.isEmpty)
+        XCTAssertEqual(try activeBlobNames(in: root), [])
+
+        // Remove only the directory created by the fault injector. Recovery
+        // must see the state from before the attempted import.
+        try FileManager.default.removeItem(at: primary)
+        let reopened = makeRepository(root)
+        let recovered = try await reopened.metadataSnapshot()
+        XCTAssertTrue(recovered.maps.isEmpty)
+        XCTAssertTrue(recovered.objects.isEmpty)
+        let importedID = try await reopened.importPortableCheckpoint(candidate)
+        XCTAssertEqual(importedID, candidate.metadata.mapID)
+    }
+
+    func testFirstCheckpointPrimaryWriteFailureCannotRecoverAttemptedMap() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let primary = root.appendingPathComponent("spatial-metadata-v1.json")
+        let failingFiles = ArchiveCatalogCollisionFileManager(target: primary, writeOrdinal: 2)
+        let repository = makeRepository(root, fileManager: failingFiles)
+
+        do {
+            _ = try await repository.saveCheckpoint(archive: Data("first".utf8),
+                captureIdentity: ARCaptureIdentity(status: .confirmed))
+            XCTFail("Expected the primary catalog write to fail")
+        } catch {
+            XCTAssertTrue(failingFiles.didInjectCollision)
+        }
+        try FileManager.default.removeItem(at: primary)
+        let recovered = try await makeRepository(root).metadataSnapshot()
+        XCTAssertTrue(recovered.maps.isEmpty)
+        XCTAssertTrue(recovered.objects.isEmpty)
+        XCTAssertEqual(try activeBlobNames(in: root), [])
+    }
+
+    func testFirstImportBackupMaintenanceFailureKeepsPublishedMapAndBlob() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backup = root.appendingPathComponent("spatial-metadata-v1.previous.json")
+        let failingFiles = ArchiveCatalogCollisionFileManager(target: backup, writeOrdinal: 3)
+        let repository = makeRepository(root, fileManager: failingFiles)
+        let candidate = try fixture()
+
+        let importedID = try await repository.importPortableCheckpoint(candidate)
+        XCTAssertTrue(failingFiles.didInjectCollision)
+        XCTAssertEqual(importedID, candidate.metadata.mapID)
+        try FileManager.default.removeItem(at: backup)
+        let restored = try await makeRepository(root).loadLatestValidCheckpoint(mapID: importedID)
+        XCTAssertEqual(restored?.archive, candidate.archive)
+        XCTAssertEqual(restored?.objects, candidate.objects)
+        XCTAssertEqual(try activeBlobNames(in: root).count, 1)
+    }
+
+    func testFirstCheckpointBackupMaintenanceFailureKeepsPublishedMapAndBlob() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backup = root.appendingPathComponent("spatial-metadata-v1.previous.json")
+        let failingFiles = ArchiveCatalogCollisionFileManager(target: backup, writeOrdinal: 3)
+        let repository = makeRepository(root, fileManager: failingFiles)
+        let archive = Data("first".utf8)
+
+        let saved = try await repository.saveCheckpoint(archive: archive,
+            captureIdentity: ARCaptureIdentity(status: .confirmed))
+        XCTAssertTrue(failingFiles.didInjectCollision)
+        try FileManager.default.removeItem(at: backup)
+        let restored = try await makeRepository(root).loadLatestValidCheckpoint(mapID: saved.mapID)
+        XCTAssertEqual(restored?.archive, archive)
+        XCTAssertEqual(try activeBlobNames(in: root), ["\(saved.worldMapBlobID.uuidString.lowercased()).vispacemap"])
+    }
+
     func testImportRejectsGlobalObjectIDCollisionAcrossDifferentMaps() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -233,11 +320,19 @@ final class SpatialPlaceArchiveServiceTests: XCTestCase {
         return (header + (try XCTUnwrap(sealed.combined)), key.withUnsafeBytes { Data($0).base64EncodedString() })
     }
 
-    private func makeRepository(_ directory: URL, failCatalogWrites: Bool = false) -> WorldMapCheckpointRepository {
+    private func makeRepository(
+        _ directory: URL, failCatalogWrites: Bool = false, fileManager: FileManager? = nil
+    ) -> WorldMapCheckpointRepository {
         let blobs = ARWorldMapBlobStore(directoryURL: directory.appendingPathComponent("WorldMaps"),
             maximumArchiveBytes: ARWorldMapArchiveCodec.maximumArchiveBytes, archiveValidator: { _ in })
         return WorldMapCheckpointRepository(directoryURL: directory, blobStore: blobs,
-            fileManager: failCatalogWrites ? ArchiveFullDiskFileManager() : FileManager())
+            fileManager: fileManager ?? (failCatalogWrites ? ArchiveFullDiskFileManager() : FileManager()))
+    }
+
+    private func activeBlobNames(in directory: URL) throws -> [String] {
+        try FileManager.default.contentsOfDirectory(atPath: directory.appendingPathComponent("WorldMaps").path)
+            .filter { $0.hasSuffix(".vispacemap") }
+            .sorted()
     }
 
     private func temporaryDirectory() -> URL {
@@ -248,5 +343,42 @@ final class SpatialPlaceArchiveServiceTests: XCTestCase {
 private final class ArchiveFullDiskFileManager: FileManager, @unchecked Sendable {
     override func attributesOfFileSystem(forPath path: String) throws -> [FileAttributeKey: Any] {
         [.systemFreeSize: NSNumber(value: 0)]
+    }
+}
+
+/// Forces an actual atomic Data.write failure by placing a directory at the
+/// selected catalog destination immediately before its filesystem write.
+/// Blob writes use a separate FileManager and cannot consume this ordinal.
+private final class ArchiveCatalogCollisionFileManager: FileManager, @unchecked Sendable {
+    private let target: URL
+    private let writeOrdinal: Int
+    private let lock = NSLock()
+    private var admissionCount = 0
+    private var injected = false
+
+    var didInjectCollision: Bool { lock.withLock { injected } }
+
+    init(target: URL, writeOrdinal: Int) {
+        self.target = target
+        self.writeOrdinal = writeOrdinal
+        super.init()
+    }
+
+    override func attributesOfFileSystem(forPath path: String) throws -> [FileAttributeKey: Any] {
+        var attributes = try super.attributesOfFileSystem(forPath: path)
+        // Admission must reach Data.write, rather than fail a space-policy
+        // precondition before exercising the real destination collision.
+        attributes[.systemFreeSize] = NSNumber(value: Int64.max)
+        let shouldInject = lock.withLock {
+            admissionCount += 1
+            return admissionCount == writeOrdinal
+        }
+        if shouldInject {
+            if fileExists(atPath: target.path) { try removeItem(at: target) }
+            try createDirectory(at: target, withIntermediateDirectories: false)
+            try Data("write-collision".utf8).write(to: target.appendingPathComponent("sentinel"))
+            lock.withLock { injected = true }
+        }
+        return attributes
     }
 }

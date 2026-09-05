@@ -749,11 +749,18 @@ public actor WorldMapCheckpointRepository {
                 maximum: Self.maximumMetadataBytes
             )
         }
-        if !preservePrevious || !fileManager.fileExists(atPath: metadataURL.path) {
+        let isInitialPublication = preservePrevious && !fileManager.fileExists(atPath: metadataURL.path)
+        if !preservePrevious {
             // Update the recovery copy before publishing deletion, so even a
             // crash between these writes cannot recover a deleted place.
             try SpatialStorageDirectory.atomicWrite(data, to: backupURL, directory: directoryURL, fileManager: fileManager, reclaiming: !preservePrevious)
-        } else if fileManager.fileExists(atPath: metadataURL.path) {
+        } else if isInitialPublication {
+            // Until the primary catalog is published, the last durable state
+            // is empty. A failed first checkpoint/import must not leave a
+            // recovery copy referring to its rolled-back or quarantined blob.
+            let previous = try encoder.encode(SpatialMetadataDocument())
+            try SpatialStorageDirectory.atomicWrite(previous, to: backupURL, directory: directoryURL, fileManager: fileManager)
+        } else {
             let previous = try readBoundedMetadata()
             try SpatialStorageDirectory.validateJSONSchemas(previous, allowsLegacyRoot: true, maximumSchemaVersion: 2)
             _ = try SpatialMetadataMigrator.decodeAndMigrate(previous)
@@ -762,6 +769,12 @@ public actor WorldMapCheckpointRepository {
         try SpatialStorageDirectory.atomicWrite(
             data, to: metadataURL, directory: directoryURL, fileManager: fileManager, reclaiming: !preservePrevious
         )
+        if isInitialPublication {
+            // Publication already succeeded. Creating the first useful recovery
+            // copy is maintenance: failure must never make callers roll back
+            // the blob now referenced by the durable primary catalog.
+            try? SpatialStorageDirectory.atomicWrite(data, to: backupURL, directory: directoryURL, fileManager: fileManager)
+        }
     }
 
     private func quarantineMetadata(reason: String) throws {
