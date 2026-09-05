@@ -514,7 +514,7 @@ final class TemporalSpatialMemoryTests: XCTestCase {
         XCTAssertEqual(coordinator.snapshot.recentDeltas.count, 1)
     }
 
-    func testCapacityAndHistoryAreBoundedWithoutPartialMutation() throws {
+    func testCapacityDefersNewIdentityWhileExistingIdentityAndHistoryAdvance() throws {
         let policy = try TemporalSpatialMemoryPolicy(
             minimumMissesForNotVisible: 2,
             minimumMissesForLastSeen: 3,
@@ -546,23 +546,73 @@ final class TemporalSpatialMemoryTests: XCTestCase {
         XCTAssertEqual(coordinator.snapshot.recentDeltas.count, 2)
         XCTAssertEqual(coordinator.snapshot.rememberedUpdateCount, 2)
 
-        let before = coordinator.snapshot
-        XCTAssertThrowsError(
-            try coordinator.apply(
+        let deferredID = objectID(81_112)
+        let delta = try applied(
+            coordinator.apply(
                 update(
                     revision: 3,
                     sequence: 4,
                     at: 4,
-                    observations: [newObservation(id: objectID(81_112), at: 4)]
+                    observations: [
+                        newObservation(id: deferredID, at: 4),
+                        existingObservation(id: firstID, at: 4),
+                    ],
+                    expected: [firstID, deferredID]
                 )
             )
-        ) { error in
-            XCTAssertEqual(
-                error as? TemporalSpatialMemoryError,
-                .objectCapacityExceeded(maximum: 1)
+        )
+        XCTAssertEqual(delta.deferredObjectIDs, [deferredID])
+        XCTAssertEqual(coordinator.snapshot.objects.count, 1)
+        XCTAssertEqual(coordinator.snapshot.metadata(for: firstID)?.object.lastSeenAt, 4)
+        XCTAssertNil(coordinator.snapshot.metadata(for: deferredID))
+        XCTAssertEqual(coordinator.snapshot.revision, 4)
+        XCTAssertEqual(coordinator.snapshot.recentDeltas.count, 2)
+        XCTAssertEqual(coordinator.snapshot.rememberedUpdateCount, 2)
+
+        let restored = try JSONDecoder().decode(
+            TemporalSpatialMemorySnapshot.self,
+            from: JSONEncoder().encode(coordinator.snapshot)
+        )
+        XCTAssertEqual(restored, coordinator.snapshot)
+        XCTAssertNoThrow(try TemporalSpatialMemoryCoordinator(restoring: restored, policy: policy))
+    }
+
+    func testCapacityAdmissionIsDeterministicAndDoesNotBlockMissEvidence() throws {
+        let policy = try TemporalSpatialMemoryPolicy(maximumObjectCount: 1)
+        let admittedID = objectID(81_120)
+        let deferredID = objectID(81_121)
+        let initial = update(
+            revision: 0,
+            sequence: 1,
+            at: 1,
+            observations: [
+                newObservation(id: deferredID, at: 1),
+                newObservation(id: admittedID, at: 1),
+            ],
+            expected: [deferredID, admittedID]
+        )
+        var coordinator = TemporalSpatialMemoryCoordinator(
+            mapID: map, coordinateFrameID: frame, policy: policy
+        )
+        let delta = try applied(coordinator.apply(initial))
+        XCTAssertNotNil(coordinator.snapshot.metadata(for: admittedID))
+        XCTAssertEqual(delta.deferredObjectIDs, [deferredID])
+        XCTAssertEqual(try coordinator.apply(initial), .alreadyApplied(currentRevision: 1))
+
+        _ = try coordinator.apply(
+            update(
+                revision: 1,
+                sequence: 2,
+                at: 2,
+                observations: [newObservation(id: deferredID, at: 2)],
+                expected: [admittedID, deferredID]
             )
-        }
-        XCTAssertEqual(coordinator.snapshot, before)
+        )
+        XCTAssertEqual(
+            coordinator.snapshot.lifecycleEvidence(for: admittedID)?.consecutiveMissCount,
+            1
+        )
+        XCTAssertNil(coordinator.snapshot.lifecycleEvidence(for: deferredID))
     }
 
     func testSnapshotCodableRoundTripPreservesPendingAndMissEvidence() throws {

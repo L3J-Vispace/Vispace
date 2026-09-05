@@ -450,6 +450,9 @@ public struct TemporalSpatialUpdate: Codable, Hashable, Sendable {
 }
 
 public enum TemporalSpatialChange: Codable, Hashable, Sendable {
+    /// The durable object limit prevents only this new identity's admission;
+    /// existing identities and visibility evidence in the batch still advance.
+    case deferredDueToCapacity(objectID: ObjectID, at: TimeInterval)
     case added(object: SpatialObjectMetadata, at: TimeInterval)
     case moved(
         objectID: ObjectID,
@@ -491,6 +494,15 @@ public struct TemporalSpatialDelta: Codable, Hashable, Sendable {
     public let coordinateFrameID: CoordinateFrameID
     public let spatialDelta: SpatialDelta
     public let changes: [TemporalSpatialChange]
+
+    public var deferredObjectIDs: Set<ObjectID> {
+        Set(changes.compactMap { change in
+            if case .deferredDueToCapacity(let objectID, _) = change {
+                return objectID
+            }
+            return nil
+        })
+    }
 
     fileprivate init(
         update: TemporalSpatialUpdate,
@@ -810,19 +822,19 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
         where !knownAfterUpdate.contains(objectID) {
             throw TemporalSpatialMemoryError.unknownExpectedObject(objectID)
         }
-        let actuallyNewCount = incomingNewIDs.subtracting(snapshot.objectStates.keys).count
-        guard snapshot.objectStates.count + actuallyNewCount <= policy.maximumObjectCount else {
-            throw TemporalSpatialMemoryError.objectCapacityExceeded(
-                maximum: policy.maximumObjectCount
-            )
-        }
+        let availableSlots = policy.maximumObjectCount - snapshot.objectStates.count
+        let orderedNewIDs = incomingNewIDs.subtracting(snapshot.objectStates.keys).sorted()
+        let deferredIDs = Set(orderedNewIDs.dropFirst(availableSlots))
 
         var working = snapshot
         var spatialEvents: [ObjectEvent] = []
-        var changes: [TemporalSpatialChange] = []
+        var changes: [TemporalSpatialChange] = deferredIDs.sorted().map {
+            .deferredDueToCapacity(objectID: $0, at: update.timestamp)
+        }
         let observedIDs = Set(update.observations.map { $0.metadata.object.id })
 
-        for observation in update.observations {
+        for observation in update.observations
+        where !deferredIDs.contains(observation.metadata.object.id) {
             try applyObservation(
                 observation,
                 to: &working,
