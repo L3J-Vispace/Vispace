@@ -3,6 +3,27 @@ import SwiftUI
 import VispaceCore
 import simd
 
+/// Placement yaw is measured from +X toward +Z. RealityKit's right-handed
+/// rotation around +Y turns +X toward -Z, so rendering uses the opposite sign.
+@MainActor
+enum FurniturePlacementRendering {
+    static func makePreview(dimensions: FurnitureDimensions, yawRadians: Double) -> ModelEntity {
+        let preview = ModelEntity(
+            mesh: .generateBox(
+                width: Float(dimensions.width), height: Float(dimensions.height),
+                depth: Float(dimensions.depth)
+            ),
+            materials: [SimpleMaterial(
+                color: UIColor.systemGreen.withAlphaComponent(0.30), isMetallic: false
+            )]
+        )
+        preview.name = "vispace-furniture-placement"
+        preview.position.y = Float(dimensions.height / 2)
+        preview.orientation = simd_quatf(angle: -Float(yawRadians), axis: SIMD3<Float>(0, 1, 0))
+        return preview
+    }
+}
+
 @MainActor
 struct CameraSurfaceView: UIViewRepresentable {
     let sessionController: any CameraSessionControlling
@@ -131,25 +152,8 @@ struct CameraSurfaceView: UIViewRepresentable {
                     Float(position.z)
                 )
             )
-            let dimensions = placement.dimensions
-            let preview = ModelEntity(
-                mesh: .generateBox(
-                    width: Float(dimensions.width),
-                    height: Float(dimensions.height),
-                    depth: Float(dimensions.depth)
-                ),
-                materials: [
-                    SimpleMaterial(
-                        color: UIColor.systemGreen.withAlphaComponent(0.30),
-                        isMetallic: false
-                    )
-                ]
-            )
-            preview.name = "vispace-furniture-placement"
-            preview.position.y = Float(dimensions.height / 2)
-            preview.orientation = simd_quatf(
-                angle: Float(placement.yawRadians),
-                axis: SIMD3<Float>(0, 1, 0)
+            let preview = FurniturePlacementRendering.makePreview(
+                dimensions: placement.dimensions, yawRadians: placement.yawRadians
             )
             anchor.addChild(preview)
             view.scene.addAnchor(anchor)

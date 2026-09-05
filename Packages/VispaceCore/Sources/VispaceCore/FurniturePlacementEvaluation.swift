@@ -57,6 +57,16 @@ public struct FurniturePlacementCandidate: Codable, Hashable, Sendable {
         self.furniture = furniture
     }
 
+    /// The exact world-space footprint used by the evaluator. Renderers can
+    /// verify their coordinate convention against these four floor corners.
+    public func footprintCorners() throws -> [Vec3] {
+        let polygon = Polygon2.rectangle(
+            centerX: position.x, centerZ: position.z,
+            width: furniture.width, depth: furniture.depth, yaw: yawRadians
+        )
+        return try polygon.vertices.map { try Vec3(x: $0.x, y: position.y, z: $0.z) }
+    }
+
     private static func normalizedAngle(_ value: Double) -> Double {
         atan2(sin(value), cos(value))
     }
