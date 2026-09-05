@@ -69,7 +69,10 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
     /// and poses. Wall-clock Date values are not comparable to those samples.
     public var navigationEvaluationTimestamp: TimeInterval? {
         guard state == .running, sessionIsRunning else { return nil }
-        return arView?.session.currentFrame?.timestamp
+        guard let frameTimestamp = arView?.session.currentFrame?.timestamp else { return nil }
+        return ARNavigationEvaluationClock.timestamp(
+            frameTimestamp: frameTimestamp, systemUptime: ProcessInfo.processInfo.systemUptime
+        )
     }
 
     /// Revalidates an asynchronous perception result against the exact live
@@ -1249,6 +1252,18 @@ public final class ARSessionController: ObservableObject, CameraSessionControlli
             task.cancel()
         }
         delegateProxy.endControllerEvents()
+    }
+}
+
+/// ARKit frame timestamps share the uptime clock used by session-run guards.
+/// An unchanged last frame must not freeze the clock used to expire evidence.
+enum ARNavigationEvaluationClock {
+    static func timestamp(frameTimestamp: TimeInterval, systemUptime: TimeInterval) -> TimeInterval? {
+        guard frameTimestamp.isFinite, systemUptime.isFinite,
+            frameTimestamp >= 0, systemUptime >= frameTimestamp,
+            systemUptime - frameTimestamp <= 1
+        else { return nil }
+        return systemUptime
     }
 }
 
