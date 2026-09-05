@@ -9,8 +9,8 @@
 - 실제 설치한 빌드의 버전·빌드 번호·소스 커밋 또는 변경본 식별자, iPhone 모델, iOS 버전, LiDAR 지원 여부, 시험 날짜와 담당자를 기록한다. 디버그용 모의 카메라·권한·AR 비활성화 인수를 사용하지 않는다.
 - 밝고 사람이 이동할 공간이 있는 방에서 시작한다. 바닥·벽·테이블과 노트북을 준비하고, 서로 같은 종류의 물체가 여러 개 있는 시험은 따로 수행한다. 별칭 표에 이름이 있다는 사실만으로 모델이 그 종류를 인식한다고 판정하지 않는다. 실제 인식된 라벨을 기록한다.
 - 물체 위치 A/B와 가구 후보 영역, 출발 지점을 표시하고 줄자로 기준 거리를 잰다. 기능 확인 전에는 경로 표시만 믿고 이동하거나 실제 가구를 옮기지 않는다.
-- 데이터 삭제 시험에는 시험용 기록을 사용한다. 삭제 확인을 누르면 이 iPhone의 저장된 지도·물체 위치·관계·기록이 실제로 삭제된다.
-- 화면 관찰 외에 저장 여부나 물체 ID를 확인할 때는 개발자가 Xcode의 앱 컨테이너 또는 디버거에서 읽기 전용으로 조사한다. 앱에는 수동 저장 버튼, 저장 완료 표시, 물체 ID 목록, 기록 내보내기 화면이 없다.
+- 데이터 삭제 시험에는 시험용 기록을 사용한다. 전체 삭제 확인을 누르면 이 iPhone의 저장된 지도·물체 위치·관계·기록이 실제로 삭제된다.
+- 화면 관찰 외에 저장 여부나 물체 ID를 확인할 때는 개발자가 Xcode의 앱 컨테이너 또는 디버거에서 읽기 전용으로 조사한다. 앱에는 수동 체크포인트 저장 버튼, 개별 관측의 저장 완료 표시, 물체 ID 목록이 없다. 설정에서는 장소별 최신 지도와 현재 물체 기록을 암호화해 내보내고 가져올 수 있지만 전체 시간 이력은 포함하지 않는다.
 
 현재 입력은 하단 텍스트 입력창과 키보드의 검색 또는 입력창의 보내기 버튼을 사용한다. 마이크나 자유 대화 기능은 이 절차의 대상이 아니다. 결과 카드의 X는 현재 결과·배치 미리보기·안내를 닫는다. 톱니바퀴는 **공간 데이터**, 격자 모양 가구 메뉴는 **가구 배치 확인**이다.
 
@@ -50,7 +50,7 @@
 ### 예상 결과와 통과 조건
 
 - 충분한 인식·깊이·좌표 근거가 쌓인 물체만 영속 기록에 반영된다. 재관찰과 재실행 후 기록을 조회할 수 있고, 위치가 실제 대상과 대응한다.
-- 같은 종류가 여럿이라 구분할 수 없으면 **후보가 여러 개라 하나의 위치로 확정할 수 없어요**와 같은 안내를 한다. 잘못된 하나를 확정하지 않는다.
+- 같은 종류가 여럿이라 구분할 수 없으면 후보 목록과 **찾으려는 물체를 선택해 주세요** 안내를 한다. 선택 전에는 하나를 임의로 확정하지 않고, 선택 후에는 최신 기록과 좌표·신뢰도를 다시 확인한다.
 - 인식된 종류, 성공/실패 횟수, 중복 ID, 잘못 합쳐진 ID, 기준 위치와의 오차를 기록한다. 노트북 예시의 인식 성공을 다른 모든 물체 종류의 성공으로 확대하지 않는다.
 
 ### 실패·제한 시험
@@ -92,13 +92,13 @@
 ### 소파 배치 절차
 
 1. LiDAR 기기에서 바닥·벽·문·주변 물체·통로를 넓게 비춘 뒤, 소파를 둘 후보 바닥을 화면 중앙에 둔다.
-2. 격자 모양 **가구 배치 확인** 메뉴에서 **소파**를 선택한다. 같은 위치에서 `여기에 소파 놓으면 어때?`를 입력해 동일 기능으로 연결되는지도 확인한다.
+2. 격자 모양 **가구 배치 확인** 메뉴에서 **소파**를 선택하고, 치수 입력 화면에서 실측한 폭·깊이·높이를 입력한 뒤 배치 평가를 실행한다. 같은 위치에서 `여기에 소파 놓으면 어때?`를 입력해 동일한 치수 입력과 평가로 연결되는지도 확인한다.
 3. 넓게 비어 있는 후보, 기존 물체와 겹치는 후보, 벽에 너무 붙은 후보, 문이나 좁은 통로를 가리는 후보를 각각 확인한다. 후보를 바꾸려면 화면 중앙을 새 바닥 위치에 맞춰 다시 요청한다.
 4. 배치가 가능하다고 판정된 경우 반투명 가구 미리보기의 바닥 접촉·위치·규모를 실제 공간과 비교한다. 결과를 닫거나 추적이 끊기면 미리보기가 정리되는지 확인한다.
 
 ### 예상 결과와 통과 조건
 
-- 이 화면은 한 후보 위치에 기본 크기의 가구가 들어갈지 평가한다. 기본 소파는 **폭 2.0m × 깊이 0.9m × 높이 0.9m**다. 침대는 1.6 × 2.0 × 0.6m, 책상은 1.4 × 0.7 × 0.75m다. 현재 UI에는 크기 입력·회전 손잡이·상품 선택 기능이 없다.
+- 이 화면은 한 후보 위치에 사용자가 확인한 치수의 가구가 들어갈지 평가한다. 치수 입력의 초기값은 소파 **폭 2.0m × 깊이 0.9m × 높이 0.9m**, 침대 1.6 × 2.0 × 0.6m, 책상 1.4 × 0.7 × 0.75m이며 수정할 수 있다. 현재 UI에는 회전 손잡이·상품 선택 기능이 없다.
 - 바닥 지지·벽·문·물체·통로 근거를 충족할 때만 적합 메시지와 반투명 미리보기를 표시한다. 실제 소파의 미관·스타일·가격 추천이나 방 전체의 최적 배치 결과로 해석하지 않는다.
 - 충돌, 벽 여유 부족, 통로 좁아짐, 출입 공간 방해를 각각 거절하는지 기록한다. 실제로 놓을 수 없는 후보에 적합 판정이 나오면 실패다.
 
@@ -131,7 +131,7 @@
 - 새 스캔이 시작되면 전용 폴더에 새 파일이 생길 수 있다. 따라서 폴더가 영구히 비어 있는지가 아니라 **삭제 전 기록이 돌아오지 않는지**를 판정한다.
 - 삭제 실패 시 **공간 데이터를 삭제하지 못했습니다. 다시 시도해 주세요.**가 표시되어야 한다. 완료 표시가 뜨지 않아야 하며, 개발자는 남아 있는 파일을 조사한다.
 - 첫 실행 설명 완료 설정과 iOS 카메라 권한 초기화는 공간 데이터 삭제 기능에 포함되지 않는다. 삭제 후 설명이 다시 뜨지 않는 것을 실패로 보지 않는다.
-- 원본 카메라 프레임 미저장과 외부 전송 없음은 화면만으로 입증하지 않는다. 실제 앱 컨테이너와 실행 중 네트워크 관찰을 별도로 남긴다. 검수자가 만든 화면 캡처는 앱 자체 저장과 구분한다.
+- 원본 카메라 프레임 미저장과 자동 외부 전송 없음은 화면만으로 입증하지 않는다. 실제 앱 컨테이너와 실행 중 네트워크 관찰을 별도로 남긴다. 사용자가 Files로 내보낸 암호화 장소 파일과 검수자가 만든 화면 캡처는 앱의 자동 저장·전송과 구분한다.
 
 ## 6단계 — 검증된 실내 길 안내
 
@@ -198,7 +198,7 @@
 - 한국어 물체 이름과 저장 라벨 연결: [SpatialObjectQueryRepository.swift](../Vispace/PlaceRecognition/SpatialObjectQueryRepository.swift)
 - 검색·현재/마지막 위치와 안내 연결: [SpatialObjectQueryController.swift](../Vispace/PlaceRecognition/SpatialObjectQueryController.swift), [CameraScreen.swift](../Vispace/Camera/CameraScreen.swift), [ARGuidanceOverlay.swift](../Vispace/Guidance/ARGuidanceOverlay.swift)
 - 관계 최신성·응답: [SpatialRelationQueryController.swift](../Vispace/SceneGraph/SpatialRelationQueryController.swift)
-- 기본 가구 치수·배치 조건·응답: [ARFurniturePlacementEvidenceBuilder.swift](../Vispace/FurniturePlacement/ARFurniturePlacementEvidenceBuilder.swift), [FurniturePlacementController.swift](../Vispace/FurniturePlacement/FurniturePlacementController.swift)
+- 가구 치수 입력·초기값·배치 조건·응답: [SpatialQueryPanel.swift](../Vispace/Search/SpatialQueryPanel.swift), [ARFurniturePlacementEvidenceBuilder.swift](../Vispace/FurniturePlacement/ARFurniturePlacementEvidenceBuilder.swift), [FurniturePlacementController.swift](../Vispace/FurniturePlacement/FurniturePlacementController.swift)
 - 지도 자동 저장·재실행: [ARSessionController.swift](../Vispace/SpatialCapture/ARSessionController.swift), [WorldMapCheckpointRepository.swift](../Vispace/Persistence/WorldMapCheckpointRepository.swift)
 - 삭제 화면·실제 삭제 범위·수명주기: [SpatialDataSettingsScreen.swift](../Vispace/Persistence/SpatialDataSettingsScreen.swift), [SpatialDataManagementController.swift](../Vispace/Persistence/SpatialDataManagementController.swift), [VispaceApp.swift](../Vispace/VispaceApp.swift)
 - 경로·추적 제한·문 근거 처리: [ARIndoorNavigationIntegration.swift](../Vispace/Navigation/ARIndoorNavigationIntegration.swift), [ARVerifiedNavigationEvidenceBuilder.swift](../Vispace/Navigation/ARVerifiedNavigationEvidenceBuilder.swift)
