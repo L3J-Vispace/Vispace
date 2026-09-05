@@ -7,6 +7,112 @@ import simd
 
 @MainActor
 final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
+    func testNewlyStoredObjectKeepsOneIdentityAcrossRollingObservationsAndMovement() async throws {
+        executionTimeAllowance = 60
+        try await withNewObjectTemporalHarness(includesLandmark: true) { harness in
+            let baseTime = Date().timeIntervalSince1970
+            let baseUptime = ProcessInfo.processInfo.systemUptime
+            var firstStored: SpatialObjectMetadata?
+            let movementStart = 45
+            let movement: Float = 0.205
+
+            for index in 0..<48 {
+                try await sendNewObjectFrame(
+                    harness, index: index, baseTime: baseTime, baseUptime: baseUptime,
+                    cameraOffsetX: index >= movementStart ? movement : 0
+                )
+                let storedObjects = await harness.store.objects()
+                let chairs = storedObjects.filter { $0.object.semanticLabel == "chair" }
+                if index < 2 {
+                    XCTAssertTrue(chairs.isEmpty, "Fewer than three frames must not create an identity")
+                    continue
+                }
+                XCTAssertEqual(chairs.count, 1, "Transient comparison IDs must never become extra durable objects")
+                let current = try XCTUnwrap(chairs.first)
+                if firstStored == nil { firstStored = current }
+                let original = try XCTUnwrap(firstStored)
+                XCTAssertEqual(current.object.id, original.object.id)
+                XCTAssertEqual(current.object.firstSeenAt, original.object.firstSeenAt)
+                if index < movementStart || index == 47 {
+                    XCTAssertEqual(current.object.lastSeenAt, baseTime + Double(index) * 0.2)
+                } else {
+                    XCTAssertEqual(current.position.value, original.position.value,
+                        "A single moved observation cannot bypass the temporal movement gate")
+                }
+            }
+
+            let original = try XCTUnwrap(firstStored)
+            let objects = await harness.store.objects()
+            XCTAssertEqual(objects.count, 2)
+            let latest = try XCTUnwrap(objects.first { $0.object.id == original.object.id })
+            XCTAssertEqual(latest.position.value.x, original.position.value.x + Double(movement), accuracy: 0.000_001)
+            let journalRecovery = try await harness.journal.recover(
+                mapID: harness.identity.mapID!, coordinateFrameID: harness.identity.coordinateFrameID
+            )
+            let recovery = try XCTUnwrap(journalRecovery)
+            XCTAssertEqual(recovery.snapshot.revision, 46)
+            XCTAssertEqual(recovery.snapshot.metadata(for: latest.object.id), latest)
+            let movedIDs = recovery.snapshot.recentDeltas.flatMap(\.changes).compactMap { change -> ObjectID? in
+                if case .moved(let objectID, _, _, _, _) = change { return objectID }
+                return nil
+            }
+            XCTAssertEqual(movedIDs, [original.object.id])
+
+            let batches = await harness.recorder.batches()
+            XCTAssertEqual(batches.count, 46)
+            let firstObservation = try XCTUnwrap(batches.first?.observations.first)
+            XCTAssertEqual(firstObservation.identityDecision, .genuinelyNew)
+            for batch in batches.dropFirst() {
+                let observation = try XCTUnwrap(batch.observations.first)
+                guard case .confirmedExisting(let candidate) = observation.identityDecision else {
+                    throw TemporalMemoryProcessorRecorderError.identityWasNotReconfirmed
+                }
+                XCTAssertEqual(candidate.objectID, original.object.id)
+                XCTAssertGreaterThanOrEqual(candidate.geometryScore, ConfidencePolicy.default.highThreshold)
+                XCTAssertGreaterThanOrEqual(try XCTUnwrap(candidate.spatialContextScore), ConfidencePolicy.default.highThreshold)
+                XCTAssertEqual(batch.observations.count, 1)
+                XCTAssertEqual(observation.metadata.object.id, original.object.id)
+            }
+            let finalEvidence = try XCTUnwrap(batches.last?.observations.first?.promotionEvidence)
+            XCTAssertEqual(finalEvidence.observations.count, ObjectReidentificationPromotionEvidence.maximumObservationCount)
+            XCTAssertEqual(Set(finalEvidence.frameIDs).count, finalEvidence.frameIDs.count)
+            XCTAssertGreaterThan(finalEvidence.firstObservedAt, baseTime)
+            XCTAssertEqual(finalEvidence.lastObservedAt, latest.object.lastSeenAt)
+            XCTAssertEqual(harness.controller.metrics.promotedObjects, 1)
+            XCTAssertEqual(harness.controller.metrics.genuinelyNewObjects, 1)
+            XCTAssertNil(harness.controller.persistenceFailureMessage)
+        }
+    }
+
+    func testNewlyStoredObjectDoesNotReuseTrackIdentityWithoutIndependentContext() async throws {
+        executionTimeAllowance = 60
+        try await withNewObjectTemporalHarness(includesLandmark: false) { harness in
+            let baseTime = Date().timeIntervalSince1970
+            let baseUptime = ProcessInfo.processInfo.systemUptime
+            var firstStored: SpatialObjectMetadata?
+            for index in 0..<12 {
+                try await sendNewObjectFrame(harness, index: index, baseTime: baseTime, baseUptime: baseUptime)
+                let objects = await harness.store.objects()
+                if index == 2 { firstStored = try XCTUnwrap(objects.first) }
+                if index >= 3 {
+                    XCTAssertEqual(objects, [try XCTUnwrap(firstStored)],
+                        "Repeated boxes and depth alone must not fabricate confirmedExisting evidence")
+                }
+            }
+            let batches = await harness.recorder.batches()
+            XCTAssertEqual(batches.count, 1)
+            XCTAssertEqual(batches.first?.observations.first?.identityDecision, .genuinelyNew)
+            XCTAssertGreaterThanOrEqual(harness.controller.metrics.ambiguousReidentifications, 9)
+            XCTAssertEqual(harness.controller.metrics.promotedObjects, 1)
+            XCTAssertNil(harness.controller.persistenceFailureMessage)
+            let recovery = try await harness.journal.recover(
+                mapID: harness.identity.mapID!, coordinateFrameID: harness.identity.coordinateFrameID
+            )
+            XCTAssertEqual(recovery?.snapshot.revision, 1)
+            XCTAssertEqual(recovery?.snapshot.objects.count, 1)
+        }
+    }
+
     func testClockRollbackWarningSurvivesAFrameWithoutAStorageAttempt() async throws {
         let channel = LatestValueChannel<ARFrameSnapshot>()
         let detector = TemporalSequenceObjectDetector(
@@ -689,6 +795,80 @@ final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
         XCTAssertTrue(calls.first?.batch.observations.isEmpty == true)
     }
 
+    private func withNewObjectTemporalHarness(
+        includesLandmark: Bool,
+        body: @MainActor (NewObjectTemporalHarness) async throws -> Void
+    ) async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "vispace-new-object-reobservation-\(UUID().uuidString)", isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let identity = ARCaptureIdentity(mapID: MapID(), status: .confirmed)
+        let landmarks = includesLandmark ? [try temporalExistingMetadata(
+            id: ObjectID(), label: "table", position: Vec3(x: 1, y: 0, z: -2), identity: identity
+        )] : []
+        let store = TemporalControllerMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: identity.mapID!, coordinateFrameID: identity.coordinateFrameID)],
+            objects: landmarks
+        ))
+        let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let service = TemporalSpatialMemoryService(
+            journalRepository: journal,
+            metadataProvider: { await store.snapshot() }, metadataWriter: { await store.upsert($0) }
+        )
+        let recorder = TemporalCommittedBatchRecorder()
+        let channel = LatestValueChannel<ARFrameSnapshot>()
+        let detector = TemporalSequenceObjectDetector(outputs: Array(repeating: [temporalDetection()], count: 48))
+        let controller = SpatialPerceptionController(
+            frames: channel.stream,
+            detectorResolution: ObjectDetectorResolution(detector: detector, availability: .available),
+            detectorInterval: 0.1, confirmedIdentityProvider: { _ in identity },
+            metadataProvider: { await store.objects() }, metadataWriter: { _ in },
+            temporalMemoryProcessor: { batch, pose in
+                let result = try await service.process(batch, pose: pose)
+                await recorder.record(batch)
+                return result
+            }, processingBudgetProvider: { .normal }
+        )
+        let harness = NewObjectTemporalHarness(
+            identity: identity, channel: channel, detector: detector, controller: controller,
+            store: store, journal: journal, recorder: recorder
+        )
+        controller.activate()
+        do {
+            try await body(harness)
+        } catch {
+            await controller.deactivateAndWaitForPendingWork()
+            throw error
+        }
+        await controller.deactivateAndWaitForPendingWork()
+    }
+
+    private func sendNewObjectFrame(
+        _ harness: NewObjectTemporalHarness, index: Int, baseTime: TimeInterval,
+        baseUptime: TimeInterval, cameraOffsetX: Float = 0
+    ) async throws {
+        var transform = matrix_identity_float4x4
+        transform.columns.3.x = cameraOffsetX
+        harness.channel.send(try temporalSnapshot(
+            identity: harness.identity, capturedAt: baseTime + Double(index) * 0.2,
+            timestamp: baseUptime + Double(index) * 0.2, includesDepth: true,
+            cameraTransform: transform
+        ))
+        while await harness.detector.callCount() < index + 1 {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await harness.controller.waitForProcessingCompletionForTesting()
+        try Task.checkCancellation()
+        if case .failed(let message) = harness.controller.state {
+            throw TemporalMemoryProcessorRecorderError.processingFailed(frame: index + 1, message: message)
+        }
+        let count = await harness.detector.callCount()
+        XCTAssertEqual(count, index + 1)
+        XCTAssertEqual(harness.controller.pendingProcessingTaskCountForTesting, 0)
+    }
+
     private func waitForTemporalDetector(
         _ detector: TemporalSequenceObjectDetector,
         expectedCount: Int
@@ -745,6 +925,24 @@ private struct TemporalMemoryProcessorCall: Sendable {
 
 private enum TemporalMemoryProcessorRecorderError: Error {
     case missingMap
+    case identityWasNotReconfirmed
+    case processingFailed(frame: Int, message: String)
+}
+
+private struct NewObjectTemporalHarness: Sendable {
+    let identity: ARCaptureIdentity
+    let channel: LatestValueChannel<ARFrameSnapshot>
+    let detector: TemporalSequenceObjectDetector
+    let controller: SpatialPerceptionController
+    let store: TemporalControllerMetadataStore
+    let journal: TemporalSpatialMemoryJournalRepository
+    let recorder: TemporalCommittedBatchRecorder
+}
+
+private actor TemporalCommittedBatchRecorder {
+    private var recorded: [TemporalSpatialRecognitionBatch] = []
+    func record(_ batch: TemporalSpatialRecognitionBatch) { recorded.append(batch) }
+    func batches() -> [TemporalSpatialRecognitionBatch] { recorded }
 }
 
 private actor TemporalMemoryProcessorRecorder {
@@ -924,7 +1122,8 @@ private func temporalSnapshot(
     timestamp: TimeInterval,
     includesDepth: Bool,
     rawDepth: ARDepthSnapshot? = nil,
-    smoothedDepth: ARDepthSnapshot? = nil
+    smoothedDepth: ARDepthSnapshot? = nil,
+    cameraTransform: simd_float4x4 = matrix_identity_float4x4
 ) throws -> ARFrameSnapshot {
     let dimensions = ImageDimensions(width: 10, height: 10)
     var pixelBuffer: CVPixelBuffer?
@@ -951,7 +1150,7 @@ private func temporalSnapshot(
         coordinateFrameStatus: .confirmed,
         capturedAt: capturedAt,
         timestamp: timestamp,
-        cameraTransform: Matrix4x4Snapshot(matrix_identity_float4x4),
+        cameraTransform: Matrix4x4Snapshot(cameraTransform),
         trackingState: .normal,
         worldMappingStatus: .mapped
     )

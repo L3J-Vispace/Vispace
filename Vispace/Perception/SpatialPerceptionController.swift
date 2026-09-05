@@ -93,6 +93,16 @@ public final class SpatialPerceptionController: ObservableObject {
         processingTask != nil
     }
 
+    #if DEBUG
+    /// Joins work after the test has observed admission of its intended frame.
+    /// The enclosing XCTest time allowance bounds failures to make progress.
+    func waitForProcessingCompletionForTesting() async {
+        while let current = processingTask {
+            await current.value
+        }
+    }
+    #endif
+
     var pendingProcessingTaskCountForTesting: Int {
         processingTasks.count
     }
@@ -875,11 +885,17 @@ public final class SpatialPerceptionController: ObservableObject {
             evidence: promotionEvidence
         )
         let established = temporalIdentityByPromotedObjectID[promotedMetadata.object.id]
-        if let established, case .genuinelyNew = established.decision {
-            // A genuinely-new durable identity is never converted into a
-            // repeated observation from transient track continuity alone.
-            return nil
-        }
+        // The promoter's ID becomes durable when a genuinely-new object is
+        // committed. Re-ID requests need a separate, nonpersistent ID so that
+        // object remains an eligible candidate on subsequent observations.
+        // This ID supplies no identity evidence: the resolver must still verify
+        // the rolling observations, geometry, independent context and ambiguity.
+        let reidentificationMetadata = try refreshedPromotedMetadata(
+            promotedMetadata,
+            objectID: ObjectID(),
+            from: promotionObservation,
+            evidence: promotionEvidence
+        )
 
         let existingObjects = try await metadataProvider()
         try Task.checkCancellation()
@@ -890,7 +906,7 @@ public final class SpatialPerceptionController: ObservableObject {
             return nil
         }
         let context = try reidentificationContextBuilder.makeContexts(
-            for: currentPromotedMetadata,
+            for: reidentificationMetadata,
             existingObjects: existingObjects
         )
         let decision: PersistentObjectReidentificationDecision
@@ -905,7 +921,7 @@ public final class SpatialPerceptionController: ObservableObject {
             referenceMetadata = currentPromotedMetadata
         } else {
             let request = try PersistentObjectReidentificationRequest(
-                promotedObject: currentPromotedMetadata,
+                promotedObject: reidentificationMetadata,
                 promotionEvidence: promotionEvidence,
                 incomingContext: context.incoming,
                 candidateContexts: context.candidates
@@ -965,11 +981,12 @@ public final class SpatialPerceptionController: ObservableObject {
 
     private func refreshedPromotedMetadata(
         _ promoted: SpatialObjectMetadata,
+        objectID: ObjectID? = nil,
         from observation: ObjectPromotionObservation,
         evidence: ObjectReidentificationPromotionEvidence
     ) throws -> SpatialObjectMetadata {
         let object = try SpatialObject(
-            id: promoted.object.id,
+            id: objectID ?? promoted.object.id,
             semanticLabel: promoted.object.semanticLabel,
             nodeID: promoted.object.nodeID,
             position: observation.position.value,
