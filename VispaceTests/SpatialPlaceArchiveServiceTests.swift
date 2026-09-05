@@ -188,15 +188,15 @@ final class SpatialPlaceArchiveServiceTests: XCTestCase {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let primary = root.appendingPathComponent("spatial-metadata-v1.json")
-        let failingFiles = ArchiveCatalogCollisionFileManager(target: primary, writeOrdinal: 2)
-        let repository = makeRepository(root, fileManager: failingFiles)
+        let collisionState = ArchiveCatalogCollisionState(target: primary, writeOrdinal: 2)
+        let repository = makeRepository(root, collisionState: collisionState)
         let candidate = try fixture()
 
         do {
             _ = try await repository.importPortableCheckpoint(candidate)
             XCTFail("Expected the primary catalog write to fail")
         } catch {
-            XCTAssertTrue(failingFiles.didInjectCollision)
+            XCTAssertTrue(collisionState.didInjectCollision)
         }
         let backup = root.appendingPathComponent("spatial-metadata-v1.previous.json")
         let previous = try SpatialMetadataMigrator.decodeAndMigrate(Data(contentsOf: backup))
@@ -219,15 +219,15 @@ final class SpatialPlaceArchiveServiceTests: XCTestCase {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let primary = root.appendingPathComponent("spatial-metadata-v1.json")
-        let failingFiles = ArchiveCatalogCollisionFileManager(target: primary, writeOrdinal: 2)
-        let repository = makeRepository(root, fileManager: failingFiles)
+        let collisionState = ArchiveCatalogCollisionState(target: primary, writeOrdinal: 2)
+        let repository = makeRepository(root, collisionState: collisionState)
 
         do {
             _ = try await repository.saveCheckpoint(archive: Data("first".utf8),
                 captureIdentity: ARCaptureIdentity(status: .confirmed))
             XCTFail("Expected the primary catalog write to fail")
         } catch {
-            XCTAssertTrue(failingFiles.didInjectCollision)
+            XCTAssertTrue(collisionState.didInjectCollision)
         }
         try FileManager.default.removeItem(at: primary)
         let recovered = try await makeRepository(root).metadataSnapshot()
@@ -240,12 +240,12 @@ final class SpatialPlaceArchiveServiceTests: XCTestCase {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let backup = root.appendingPathComponent("spatial-metadata-v1.previous.json")
-        let failingFiles = ArchiveCatalogCollisionFileManager(target: backup, writeOrdinal: 3)
-        let repository = makeRepository(root, fileManager: failingFiles)
+        let collisionState = ArchiveCatalogCollisionState(target: backup, writeOrdinal: 3)
+        let repository = makeRepository(root, collisionState: collisionState)
         let candidate = try fixture()
 
         let importedID = try await repository.importPortableCheckpoint(candidate)
-        XCTAssertTrue(failingFiles.didInjectCollision)
+        XCTAssertTrue(collisionState.didInjectCollision)
         XCTAssertEqual(importedID, candidate.metadata.mapID)
         try FileManager.default.removeItem(at: backup)
         let restored = try await makeRepository(root).loadLatestValidCheckpoint(mapID: importedID)
@@ -258,13 +258,13 @@ final class SpatialPlaceArchiveServiceTests: XCTestCase {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let backup = root.appendingPathComponent("spatial-metadata-v1.previous.json")
-        let failingFiles = ArchiveCatalogCollisionFileManager(target: backup, writeOrdinal: 3)
-        let repository = makeRepository(root, fileManager: failingFiles)
+        let collisionState = ArchiveCatalogCollisionState(target: backup, writeOrdinal: 3)
+        let repository = makeRepository(root, collisionState: collisionState)
         let archive = Data("first".utf8)
 
         let saved = try await repository.saveCheckpoint(archive: archive,
             captureIdentity: ARCaptureIdentity(status: .confirmed))
-        XCTAssertTrue(failingFiles.didInjectCollision)
+        XCTAssertTrue(collisionState.didInjectCollision)
         try FileManager.default.removeItem(at: backup)
         let restored = try await makeRepository(root).loadLatestValidCheckpoint(mapID: saved.mapID)
         XCTAssertEqual(restored?.archive, archive)
@@ -322,13 +322,13 @@ final class SpatialPlaceArchiveServiceTests: XCTestCase {
 
     private func makeRepository(
         _ directory: URL, failCatalogWrites: Bool = false,
-        fileManager: ArchiveCatalogCollisionFileManager? = nil
+        collisionState: ArchiveCatalogCollisionState? = nil
     ) -> WorldMapCheckpointRepository {
         let blobs = ARWorldMapBlobStore(directoryURL: directory.appendingPathComponent("WorldMaps"),
             maximumArchiveBytes: ARWorldMapArchiveCodec.maximumArchiveBytes, archiveValidator: { _ in })
-        if let fileManager {
+        if let collisionState {
             return WorldMapCheckpointRepository(directoryURL: directory, blobStore: blobs,
-                fileManager: fileManager)
+                fileManager: ArchiveCatalogCollisionFileManager(state: collisionState))
         }
         if failCatalogWrites {
             return WorldMapCheckpointRepository(directoryURL: directory, blobStore: blobs,
@@ -355,10 +355,9 @@ private final class ArchiveFullDiskFileManager: FileManager, @unchecked Sendable
     }
 }
 
-/// Forces an actual atomic Data.write failure by placing a directory at the
-/// selected catalog destination immediately before its filesystem write.
-/// Blob writes use a separate FileManager and cannot consume this ordinal.
-private final class ArchiveCatalogCollisionFileManager: FileManager, @unchecked Sendable {
+/// Only this lock-protected state is shared with the test. The FileManager
+/// instance itself is freshly created for, and owned by, the repository actor.
+private final class ArchiveCatalogCollisionState: @unchecked Sendable {
     private let target: URL
     private let writeOrdinal: Int
     private let lock = NSLock()
@@ -370,6 +369,28 @@ private final class ArchiveCatalogCollisionFileManager: FileManager, @unchecked 
     init(target: URL, writeOrdinal: Int) {
         self.target = target
         self.writeOrdinal = writeOrdinal
+    }
+
+    func nextCollisionTarget() -> URL? {
+        lock.withLock {
+            admissionCount += 1
+            return admissionCount == writeOrdinal ? target : nil
+        }
+    }
+
+    func recordCollision() {
+        lock.withLock { injected = true }
+    }
+}
+
+/// Forces an actual atomic Data.write failure by placing a directory at the
+/// selected catalog destination immediately before its filesystem write.
+/// Blob writes use a separate FileManager and cannot consume this ordinal.
+private final class ArchiveCatalogCollisionFileManager: FileManager, @unchecked Sendable {
+    private let state: ArchiveCatalogCollisionState
+
+    init(state: ArchiveCatalogCollisionState) {
+        self.state = state
         super.init()
     }
 
@@ -378,15 +399,11 @@ private final class ArchiveCatalogCollisionFileManager: FileManager, @unchecked 
         // Admission must reach Data.write, rather than fail a space-policy
         // precondition before exercising the real destination collision.
         attributes[.systemFreeSize] = NSNumber(value: Int64.max)
-        let shouldInject = lock.withLock {
-            admissionCount += 1
-            return admissionCount == writeOrdinal
-        }
-        if shouldInject {
+        if let target = state.nextCollisionTarget() {
             if fileExists(atPath: target.path) { try removeItem(at: target) }
             try createDirectory(at: target, withIntermediateDirectories: false)
             try Data("write-collision".utf8).write(to: target.appendingPathComponent("sentinel"))
-            lock.withLock { injected = true }
+            state.recordCollision()
         }
         return attributes
     }
