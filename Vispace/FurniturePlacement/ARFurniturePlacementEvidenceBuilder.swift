@@ -973,12 +973,7 @@ public struct ARFurniturePlacementEvidenceBuilder: Sendable {
     }
 
     private func cameraAlignedYaw(_ transform: Matrix4x4Snapshot) -> Double? {
-        let right = transform.column0
-        let horizontalLength = hypot(Double(right.x), Double(right.z))
-        guard horizontalLength.isFinite, horizontalLength > 1e-5 else {
-            return nil
-        }
-        return atan2(Double(right.z), Double(right.x))
+        ARHorizontalCameraBasis(cameraTransform: transform)?.yawRadians
     }
 
     private func worldPoint(

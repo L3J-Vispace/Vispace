@@ -97,6 +97,56 @@ final class ARGuidanceProjectorTests: XCTestCase {
         XCTAssertEqual(projection.bearingRadians, 0)
     }
 
+    func testPortraitHeadingSurvivesForwardBackwardTiltAndWorldYaw() throws {
+        for yaw in [-Double.pi / 2, 0, .pi / 3, .pi] {
+            for pitch in [-20.0, 0, 20] {
+                let transform = portraitCamera(yaw: yaw, pitch: pitch * .pi / 180)
+                let snapshot = Matrix4x4Snapshot(transform)
+                let forward = (x: sin(yaw), z: -cos(yaw))
+                let right = (x: cos(yaw), z: sin(yaw))
+                for (offset, direction, bearing) in [
+                    (forward, ARGuidanceDirection.ahead, 0.0),
+                    (right, .right, .pi / 2),
+                    ((x: -right.x, z: -right.z), .left, -.pi / 2),
+                ] {
+                    let result = try XCTUnwrap(
+                        projector.project(
+                            target: Vec3(x: 10 + 2 * offset.x, y: 1, z: 5 + 2 * offset.z),
+                            cameraTransform: snapshot
+                        ))
+                    XCTAssertEqual(result.direction, direction, "yaw=\(yaw), pitch=\(pitch)")
+                    XCTAssertEqual(result.bearingRadians, bearing, accuracy: 1e-6)
+                    XCTAssertEqual(result.distanceMeters, 2, accuracy: 1e-6)
+                }
+                // The same raw pose remains available for image/depth transforms.
+                XCTAssertEqual(snapshot.simdValue, transform)
+            }
+        }
+    }
+
+    func testCameraPointingVerticallyHasNoStableHorizontalHeading() throws {
+        for pitch in [-Double.pi / 2, .pi / 2] {
+            XCTAssertNil(
+                projector.project(
+                    target: try Vec3(x: 10, y: 1, z: 3),
+                    cameraTransform: Matrix4x4Snapshot(portraitCamera(yaw: 0, pitch: pitch))
+                ))
+        }
+    }
+
+    private func portraitCamera(yaw: Double, pitch: Double) -> simd_float4x4 {
+        let portrait = simd_float4x4(
+            columns: (
+                SIMD4<Float>(0, -1, 0, 0), SIMD4<Float>(1, 0, 0, 0),
+                SIMD4<Float>(0, 0, 1, 0), SIMD4<Float>(0, 0, 0, 1)
+            ))
+        let heading = simd_float4x4(simd_quatf(angle: Float(-yaw), axis: SIMD3<Float>(0, 1, 0)))
+        let tilt = simd_float4x4(simd_quatf(angle: Float(pitch), axis: SIMD3<Float>(1, 0, 0)))
+        var transform = heading * tilt * portrait
+        transform.columns.3 = SIMD4<Float>(10, 1, 5, 1)
+        return transform
+    }
+
     func testDegenerateOrNonFiniteCameraPoseFailsClosed() throws {
         let degenerate = simd_float4x4(
             SIMD4<Float>(0, 0, 0, 0),
@@ -119,5 +169,13 @@ final class ARGuidanceProjectorTests: XCTestCase {
                 cameraTransform: Matrix4x4Snapshot(nonFinite)
             )
         )
+
+        nonFinite = matrix_identity_float4x4
+        nonFinite.columns.0.y = .nan
+        XCTAssertNil(
+            projector.project(
+                target: try Vec3(x: 0, y: 0, z: -1),
+                cameraTransform: Matrix4x4Snapshot(nonFinite)
+            ))
     }
 }

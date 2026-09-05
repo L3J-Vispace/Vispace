@@ -29,7 +29,7 @@ final class FurniturePlacementControllerTests: XCTestCase {
         XCTAssertEqual(prepared.candidate.furniture, dimensions)
     }
 
-    func testBuilderPreservesProviderCoordinateAndUsesCameraRightAxisForYaw() throws {
+    func testBuilderPreservesProviderCoordinateAndUsesHorizontalHeadingForYaw() throws {
         let context = spatialContext(cameraTransform: cameraYawNinetyDegrees())
         let candidate = try framedPosition(
             frameID: context.frameID,
@@ -51,6 +51,40 @@ final class FurniturePlacementControllerTests: XCTestCase {
         XCTAssertEqual(prepared.candidate.position, candidate.value)
         XCTAssertEqual(prepared.candidate.furniture, ARFurnitureDefaults.dimensions(for: .desk))
         XCTAssertEqual(prepared.candidate.yawRadians, .pi / 2, accuracy: 1e-6)
+    }
+
+    func testPortraitFurnitureRotationRemainsLevelAcrossTiltAndYaw() throws {
+        for yaw in [-Double.pi / 2, 0.0, Double.pi / 3] {
+            for pitch in [-20.0, 0, 20] {
+                let camera = portraitCamera(yaw: yaw, pitch: pitch * .pi / 180)
+                let context = spatialContext(cameraTransform: camera)
+                let prepared = try unwrapReady(
+                    builder().build(
+                        kind: .desk,
+                        candidatePosition: framedPosition(frameID: context.frameID, value: .zero),
+                        surface: context.surface, pose: context.pose,
+                        capabilities: fullCapabilities(), objects: []
+                    ))
+                XCTAssertEqual(prepared.candidate.yawRadians, yaw, accuracy: 1e-6)
+                XCTAssertEqual(context.pose.cameraTransform.simdValue, camera)
+                XCTAssertEqual(
+                    FurniturePlacementEvaluator().evaluate(
+                        candidate: prepared.candidate, evidence: prepared.evidence
+                    ).disposition, .feasible)
+            }
+        }
+    }
+
+    func testVerticallyPointingCameraCannotInventFurnitureYaw() throws {
+        let context = spatialContext(cameraTransform: portraitCamera(yaw: 0, pitch: .pi / 2))
+        XCTAssertEqual(
+            try unwrapIssue(
+                builder().build(
+                    kind: .desk,
+                    candidatePosition: framedPosition(frameID: context.frameID, value: .zero),
+                    surface: context.surface, pose: context.pose,
+                    capabilities: fullCapabilities(), objects: []
+                )), .trackingUnstable)
     }
 
     func testFloorPlaneBecomesConservativelyInsetFloorAndObservationRegions() throws {
@@ -1594,6 +1628,17 @@ final class FurniturePlacementControllerTests: XCTestCase {
                 SIMD4<Float>(-1, 0, 0, 0),
                 SIMD4<Float>(0, 0, 0, 1)
             ))
+    }
+
+    private func portraitCamera(yaw: Double, pitch: Double = 0) -> simd_float4x4 {
+        let portrait = simd_float4x4(
+            columns: (
+                SIMD4<Float>(0, -1, 0, 0), SIMD4<Float>(1, 0, 0, 0),
+                SIMD4<Float>(0, 0, 1, 0), SIMD4<Float>(0, 0, 0, 1)
+            ))
+        let heading = simd_float4x4(simd_quatf(angle: Float(-yaw), axis: SIMD3<Float>(0, 1, 0)))
+        let tilt = simd_float4x4(simd_quatf(angle: Float(pitch), axis: SIMD3<Float>(1, 0, 0)))
+        return heading * tilt * portrait
     }
 
     private func mapID(_ value: Int) -> MapID {

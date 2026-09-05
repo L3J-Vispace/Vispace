@@ -55,7 +55,7 @@ public struct ARGuidanceProjectionPolicy: Equatable, Sendable {
 }
 
 /// Converts an already-grounded target into a distance and horizontal bearing
-/// using ARKit's camera convention (local -Z is forward, +X is right).
+/// using optical forward and gravity to keep portrait guidance level.
 public struct ARGuidanceProjector: Sendable {
     public let policy: ARGuidanceProjectionPolicy
 
@@ -68,14 +68,15 @@ public struct ARGuidanceProjector: Sendable {
         cameraTransform: Matrix4x4Snapshot
     ) -> ARGuidanceProjection? {
         let camera = cameraTransform.column3
-        let rightAxis = cameraTransform.column0
-        let forwardAxis = -cameraTransform.column2
         let finiteValues = [
             camera.x, camera.y, camera.z,
-            rightAxis.x, rightAxis.z,
-            forwardAxis.x, forwardAxis.z,
         ]
-        guard finiteValues.allSatisfy(\.isFinite) else {
+        guard finiteValues.allSatisfy(\.isFinite),
+            let basis = ARHorizontalCameraBasis(
+                cameraTransform: cameraTransform,
+                minimumHorizontalLength: policy.minimumHorizontalVectorMeters
+            )
+        else {
             return nil
         }
 
@@ -88,20 +89,10 @@ public struct ARGuidanceProjector: Sendable {
             return nil
         }
 
-        let rightLength = hypot(Double(rightAxis.x), Double(rightAxis.z))
-        let forwardLength = hypot(Double(forwardAxis.x), Double(forwardAxis.z))
-        guard rightLength >= policy.minimumHorizontalVectorMeters,
-            forwardLength >= policy.minimumHorizontalVectorMeters
-        else {
-            return nil
-        }
-
         let rightComponent =
-            deltaX * Double(rightAxis.x) / rightLength
-            + deltaZ * Double(rightAxis.z) / rightLength
+            deltaX * basis.rightX + deltaZ * basis.rightZ
         let forwardComponent =
-            deltaX * Double(forwardAxis.x) / forwardLength
-            + deltaZ * Double(forwardAxis.z) / forwardLength
+            deltaX * basis.forwardX + deltaZ * basis.forwardZ
         let bearing: Double
         if horizontalDistance < policy.minimumHorizontalVectorMeters {
             bearing = 0
