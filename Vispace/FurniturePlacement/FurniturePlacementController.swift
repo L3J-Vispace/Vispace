@@ -185,7 +185,7 @@ public final class FurniturePlacementController: ObservableObject {
         invalidateEvaluationContext()
     }
 
-    public func evaluate(_ kind: FurnitureKind) {
+    public func evaluate(_ kind: FurnitureKind, dimensions: FurnitureDimensions? = nil) {
         guard let pose = latestPose else {
             publishInsufficient(kind: kind, issue: .poseUnavailable)
             return
@@ -259,7 +259,8 @@ public final class FurniturePlacementController: ObservableObject {
                         surface: surface,
                         pose: pose,
                         capabilities: capabilities,
-                        objects: objects
+                        objects: objects,
+                        furnitureDimensions: dimensions
                     )
                 }
                 let buildOutcome = await withTaskCancellationHandler {

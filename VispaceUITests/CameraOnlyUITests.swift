@@ -23,6 +23,10 @@ final class CameraOnlyUITests: XCTestCase {
         let sofa = app.buttons["vispace.placement.sofa"]
         XCTAssertTrue(sofa.waitForExistence(timeout: 3))
         sofa.tap()
+        let evaluate = app.buttons["vispace.placement.evaluate"]
+        XCTAssertTrue(evaluate.waitForExistence(timeout: 5))
+        XCTAssertTrue(evaluate.isEnabled)
+        evaluate.tap()
         XCTAssertTrue(result.waitForExistence(timeout: 5))
         XCTAssertTrue(result.staticTexts.firstMatch.label.contains("공간 정보"))
     }

@@ -195,7 +195,8 @@ public struct ARFurniturePlacementEvidenceBuilder: Sendable {
         surface: ARSurfaceStateSnapshot,
         pose: ARPoseSnapshot,
         capabilities: ARCaptureCapabilities,
-        objects: [SpatialObjectMetadata]
+        objects: [SpatialObjectMetadata],
+        furnitureDimensions: FurnitureDimensions? = nil
     ) -> ARFurniturePlacementEvidenceBuildOutcome {
         guard !Task.isCancelled else { return .insufficient(.surfaceUnavailable) }
         guard capabilities.supportsWorldTracking else {
@@ -257,7 +258,8 @@ public struct ARFurniturePlacementEvidenceBuilder: Sendable {
             return .insufficient(.trackingUnstable)
         }
 
-        let dimensions = ARFurnitureDefaults.dimensions(for: kind)
+        let dimensions = furnitureDimensions ?? ARFurnitureDefaults.dimensions(for: kind)
+        guard dimensions.kind == kind else { return .insufficient(.candidatePositionUncertain) }
         guard
             let candidate = try? FurniturePlacementCandidate(
                 position: candidatePosition.value,

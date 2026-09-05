@@ -17,6 +17,18 @@ final class FurniturePlacementControllerTests: XCTestCase {
         XCTAssertEqual([desk.width, desk.depth, desk.height], [1.4, 0.7, 0.75])
     }
 
+    func testBuilderUsesActualProductDimensions() throws {
+        let context = spatialContext()
+        let dimensions = try FurnitureDimensions(kind: .desk, width: 1.8, depth: 0.8, height: 1.1)
+        let prepared = try unwrapReady(builder().build(
+            kind: .desk,
+            candidatePosition: framedPosition(frameID: context.frameID, value: vec(0, 0, 0)),
+            surface: context.surface, pose: context.pose,
+            capabilities: fullCapabilities(), objects: [], furnitureDimensions: dimensions
+        ))
+        XCTAssertEqual(prepared.candidate.furniture, dimensions)
+    }
+
     func testBuilderPreservesProviderCoordinateAndUsesCameraRightAxisForYaw() throws {
         let context = spatialContext(cameraTransform: cameraYawNinetyDegrees())
         let candidate = try framedPosition(
