@@ -169,6 +169,34 @@ jobs:
               --path "${RUNNER_TEMP}/VispaceTests.xcresult" --compact
           fi
 
+      - name: Repeat place history rotation
+        id: place_history_stress
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Vispace.xcodeproj \
+            -scheme Vispace \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${SIMULATOR_UDID}" \
+            -derivedDataPath "${RUNNER_TEMP}/VispaceDerivedData" \
+            -resultBundlePath "${RUNNER_TEMP}/VispacePlaceHistoryTests.xcresult" \
+            -only-testing:VispaceTests/PlaceRecognitionControllerTests/testDeferredAttemptRotationWithRealRepositorySurvivesHistoryLimitAndBackwardClock \
+            -test-iterations 5 \
+            -run-tests-until-failure \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            test-without-building
+
+      - name: Report place history results
+        if: ${{ !cancelled() && steps.place_history_stress.outcome != 'skipped' }}
+        run: |
+          set -euo pipefail
+          if [[ -d "${RUNNER_TEMP}/VispacePlaceHistoryTests.xcresult" ]]; then
+            xcrun xcresulttool get test-results summary \
+              --path "${RUNNER_TEMP}/VispacePlaceHistoryTests.xcresult" --compact
+          fi
+
       - name: Build optimized configuration without signing
         run: |
           set -euo pipefail
