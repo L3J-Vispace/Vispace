@@ -5,6 +5,135 @@ import XCTest
 @testable import Vispace
 
 final class WorldMapCheckpointRepositoryTests: XCTestCase {
+    func testBatchUpsertPublishesOnceAndPreservesNamesAcrossClockRollback() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let writes = BatchMetadataWriteState()
+        let repository = makeRepository(root: root, batchWrites: writes)
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let map = try await repository.saveCheckpoint(archive: Data("batch-map".utf8), captureIdentity: identity)
+        let original = try (0..<64).map { _ in
+            try batchMetadata(mapID: map.mapID, frameID: identity.coordinateFrameID,
+                objectID: ObjectID(), time: 100, revision: 1)
+        }
+        _ = try await repository.upsertObjectMetadataBatch(original)
+        _ = try await repository.renameObject(expected: original[0], displayName: "창가 의자")
+        let before = try await repository.metadataSnapshot()
+        let next = try original.map {
+            try batchMetadata(mapID: map.mapID, frameID: identity.coordinateFrameID,
+                objectID: $0.object.id, time: 10, revision: 2)
+        }
+        writes.reset()
+        let committed = try await repository.upsertObjectMetadataBatch(next)
+        XCTAssertEqual(writes.count, 2, "One previous-catalog write and one primary publication for the whole batch")
+        XCTAssertEqual(committed.objects.count, 64)
+        XCTAssertEqual(committed.objects.first?.object.displayName, "창가 의자")
+        XCTAssertTrue(committed.objects.allSatisfy { $0.object.temporalRevision == 2 && $0.object.lastSeenAt == 10 })
+        XCTAssertEqual(committed.objects.map(\.position), next.map(\.position))
+        let backup = try SpatialMetadataMigrator.decodeAndMigrate(
+            Data(contentsOf: root.appendingPathComponent("spatial-metadata-v1.previous.json")))
+        XCTAssertEqual(backup, before, "Recovery contains the complete prior transaction, never a partial batch")
+        let cold = try await makeRepository(root: root).metadataSnapshot()
+        XCTAssertEqual(cold, committed)
+        writes.reset()
+        let replayed = try await repository.upsertObjectMetadataBatch(next)
+        XCTAssertEqual(replayed, committed)
+        XCTAssertEqual(writes.count, 0, "An equal replay must still return authoritative names without rewriting storage")
+    }
+
+    func testBatchRejectsInvalidLastObjectWithoutPublishingEarlierObjects() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let writes = BatchMetadataWriteState()
+        let repository = makeRepository(root: root, batchWrites: writes)
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let map = try await repository.saveCheckpoint(archive: Data("batch-map".utf8), captureIdentity: identity)
+        let existing = try batchMetadata(mapID: map.mapID, frameID: identity.coordinateFrameID,
+            objectID: ObjectID(), time: 10, revision: 2)
+        try await repository.upsertObjectMetadata(existing)
+        let primaryURL = root.appendingPathComponent("spatial-metadata-v1.json")
+        let backupURL = root.appendingPathComponent("spatial-metadata-v1.previous.json")
+        let primary = try Data(contentsOf: primaryURL)
+        let backup = try Data(contentsOf: backupURL)
+        let valid = try batchMetadata(mapID: map.mapID, frameID: identity.coordinateFrameID,
+            objectID: ObjectID(), time: 20, revision: 3)
+        let invalid: [(SpatialObjectMetadata, WorldMapCheckpointRepositoryError)] = [
+            (try batchMetadata(mapID: map.mapID, frameID: identity.coordinateFrameID,
+                objectID: existing.object.id, time: 200, revision: 1), .staleObjectUpdate(existing.object.id)),
+            (try batchMetadata(mapID: map.mapID, frameID: CoordinateFrameID(),
+                objectID: ObjectID(), time: 20, revision: 3), .coordinateFrameMismatch),
+            (try batchMetadata(mapID: MapID(), frameID: identity.coordinateFrameID,
+                objectID: ObjectID(), time: 20, revision: 3), .unknownOrQuarantinedMap),
+        ]
+        for (metadata, expected) in invalid {
+            writes.reset()
+            await assertThrowsErrorAsync {
+                try await repository.upsertObjectMetadataBatch([valid, metadata])
+            } verify: { XCTAssertEqual($0 as? WorldMapCheckpointRepositoryError, expected) }
+            XCTAssertEqual(writes.count, 0)
+            XCTAssertEqual(try Data(contentsOf: primaryURL), primary)
+            XCTAssertEqual(try Data(contentsOf: backupURL), backup)
+        }
+    }
+
+    func testBatchPrimaryPublicationFailurePreservesPreviousTransactionAndAllowsRetry() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let writes = BatchMetadataWriteState()
+        let repository = makeRepository(root: root, batchWrites: writes)
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let map = try await repository.saveCheckpoint(archive: Data("batch-map".utf8), captureIdentity: identity)
+        let before = try await repository.metadataSnapshot()
+        let primaryURL = root.appendingPathComponent("spatial-metadata-v1.json")
+        let originalBytes = try Data(contentsOf: primaryURL)
+        let incoming = try (0..<2).map { _ in
+            try batchMetadata(mapID: map.mapID, frameID: identity.coordinateFrameID,
+                objectID: ObjectID(), time: 10, revision: 1)
+        }
+        writes.reset(failAt: 2)
+        await assertThrowsErrorAsync {
+            try await repository.upsertObjectMetadataBatch(incoming)
+        } verify: { error in
+            guard let storageError = error as? SpatialStorageError,
+                case .insufficientFreeSpace = storageError else {
+                return XCTFail("Expected publication admission failure after the backup write: \(error)")
+            }
+        }
+        XCTAssertEqual(writes.count, 2)
+        XCTAssertEqual(try Data(contentsOf: primaryURL), originalBytes)
+        let backup = try SpatialMetadataMigrator.decodeAndMigrate(
+            Data(contentsOf: root.appendingPathComponent("spatial-metadata-v1.previous.json")))
+        XCTAssertEqual(backup, before)
+        writes.reset()
+        let retried = try await repository.upsertObjectMetadataBatch(incoming)
+        XCTAssertEqual(retried.objects, incoming)
+        let restored = try await repository.loadLatestValidCheckpoint()
+        XCTAssertEqual(restored?.archive, Data("batch-map".utf8))
+        XCTAssertEqual(restored?.objects, incoming)
+    }
+
+    func testCancelledBatchDoesNotPublishOrAcquireAWriteBudget() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let writes = BatchMetadataWriteState()
+        let repository = makeRepository(root: root, batchWrites: writes)
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let map = try await repository.saveCheckpoint(archive: Data("batch-map".utf8), captureIdentity: identity)
+        let incoming = try batchMetadata(mapID: map.mapID, frameID: identity.coordinateFrameID,
+            objectID: ObjectID(), time: 10, revision: 1)
+        let before = try await repository.metadataSnapshot()
+        writes.reset()
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await repository.upsertObjectMetadataBatch([incoming])
+        }
+        do { _ = try await task.value; XCTFail("A cancelled batch must not publish") }
+        catch is CancellationError { }
+        XCTAssertEqual(writes.count, 0)
+        let after = try await repository.metadataSnapshot()
+        XCTAssertEqual(after, before)
+    }
+
     func testUserNameSurvivesColdJournalRecoveryAndFollowingObservation() async throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -749,13 +878,22 @@ final class WorldMapCheckpointRepositoryTests: XCTestCase {
         root: URL,
         maximumCheckpointsPerMap: Int = WorldMapCheckpointRepository
             .defaultMaximumCheckpointsPerMap,
-        maximumLogicalMaps: Int = WorldMapCheckpointRepository.defaultMaximumLogicalMaps
+        maximumLogicalMaps: Int = WorldMapCheckpointRepository.defaultMaximumLogicalMaps,
+        batchWrites: BatchMetadataWriteState? = nil
     ) -> WorldMapCheckpointRepository {
         let blobStore = ARWorldMapBlobStore(
             directoryURL: root.appendingPathComponent("WorldMaps", isDirectory: true),
             maximumArchiveBytes: ARWorldMapArchiveCodec.maximumArchiveBytes,
             archiveValidator: { _ in }
         )
+        if let batchWrites {
+            return WorldMapCheckpointRepository(
+                directoryURL: root, blobStore: blobStore,
+                maximumCheckpointsPerMap: maximumCheckpointsPerMap,
+                maximumLogicalMaps: maximumLogicalMaps,
+                fileManager: BatchMetadataFileManager(state: batchWrites)
+            )
+        }
         return WorldMapCheckpointRepository(
             directoryURL: root,
             blobStore: blobStore,
@@ -764,9 +902,49 @@ final class WorldMapCheckpointRepositoryTests: XCTestCase {
         )
     }
 
+    private func batchMetadata(mapID: MapID, frameID: CoordinateFrameID,
+        objectID: ObjectID, time: TimeInterval, revision: UInt64) throws -> SpatialObjectMetadata {
+        let object = try SpatialObject(id: objectID, semanticLabel: "chair",
+            position: Vec3(x: time / 10, y: 0, z: -2), certainty: .confirmed,
+            confidence: ConfidenceVector(semantic: .one, geometry: .one, tracking: .one,
+                identity: .one, objectState: .one),
+            firstSeenAt: 100, lastSeenAt: time, temporalRevision: revision)
+        return try SpatialObjectMetadata(mapID: mapID, object: object,
+            position: FramedPosition(coordinateFrameID: frameID, value: object.position,
+                observedAt: time, trackingQuality: .normal, uncertainty: .highConfidenceDepth))
+    }
+
     private func temporaryDirectory() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("vispace-checkpoint-tests-\(UUID().uuidString)")
+    }
+}
+
+private final class BatchMetadataWriteState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var admissions = 0
+    private var failureOrdinal: Int?
+    var count: Int { lock.withLock { admissions } }
+
+    func reset(failAt ordinal: Int? = nil) {
+        lock.withLock { admissions = 0; failureOrdinal = ordinal }
+    }
+
+    func nextAvailableBytes() -> Int64 {
+        lock.withLock {
+            admissions += 1
+            return admissions == failureOrdinal ? 0 : Int64.max
+        }
+    }
+}
+
+private final class BatchMetadataFileManager: FileManager, @unchecked Sendable {
+    private let state: BatchMetadataWriteState
+    init(state: BatchMetadataWriteState) { self.state = state; super.init() }
+    override func attributesOfFileSystem(forPath path: String) throws -> [FileAttributeKey: Any] {
+        var attributes = try super.attributesOfFileSystem(forPath: path)
+        attributes[.systemFreeSize] = NSNumber(value: state.nextAvailableBytes())
+        return attributes
     }
 }
 

@@ -392,25 +392,44 @@ public actor WorldMapCheckpointRepository {
     }
 
     public func upsertObjectMetadata(_ metadata: SpatialObjectMetadata) async throws {
+        _ = try await upsertObjectMetadataBatch([metadata])
+    }
+
+    /// Applies one complete projection against a freshly loaded catalog. No
+    /// object is published until every incoming update passes the same identity,
+    /// revision and annotation checks as an individual observation. The returned
+    /// document is the authoritative state at this transaction's commit point.
+    @discardableResult
+    public func upsertObjectMetadataBatch(
+        _ metadata: [SpatialObjectMetadata]
+    ) async throws -> SpatialMetadataDocument {
         try Task.checkCancellation()
         await operationGate.acquire()
         do {
             try Task.checkCancellation()
-            try await upsertObjectMetadataLocked(metadata)
+            var document = try loadDocumentRecoveringInvalidCatalog()
+            await reconcileDetachedBlobs(referencedBy: document)
+            try Task.checkCancellation()
+            var changed = false
+            for object in metadata {
+                try Task.checkCancellation()
+                if try mergeObjectMetadata(object, into: &document) {
+                    changed = true
+                }
+            }
+            try Task.checkCancellation()
+            if changed { try commit(document) }
             await operationGate.release()
+            return document
         } catch {
             await operationGate.release()
             throw error
         }
     }
 
-    private func upsertObjectMetadataLocked(_ metadata: SpatialObjectMetadata) async throws {
-        var document = try loadDocumentRecoveringInvalidCatalog()
-        await reconcileDetachedBlobs(referencedBy: document)
-        // An ARSession lifecycle reset cancels the originating perception task.
-        // Recheck after every suspension and immediately before the atomic
-        // catalog write so an old run cannot publish late coordinates.
-        try Task.checkCancellation()
+    private func mergeObjectMetadata(
+        _ metadata: SpatialObjectMetadata, into document: inout SpatialMetadataDocument
+    ) throws -> Bool {
         let matchingMaps = document.maps.filter {
             $0.mapID == metadata.mapID && $0.availability == .active
         }
@@ -437,7 +456,7 @@ public actor WorldMapCheckpointRepository {
                 mapID: metadata.mapID, object: observedObject, position: metadata.position
             )
             if existing == metadata {
-                return
+                return false
             }
             let newer: Bool
             switch (metadata.object.temporalRevision, existing.object.temporalRevision) {
@@ -453,8 +472,7 @@ public actor WorldMapCheckpointRepository {
         } else {
             document.objects.append(metadata)
         }
-        try Task.checkCancellation()
-        try commit(document)
+        return true
     }
 
     /// Preserves typed blobs that are no longer reachable from the durable

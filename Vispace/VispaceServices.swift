@@ -47,15 +47,26 @@ final class VispaceServices: ObservableObject {
         )
         let durableMetadataWriter: @Sendable (SpatialObjectMetadata) async throws -> Void = {
             metadata in
-            try await repository.upsertObjectMetadata(metadata)
+            let document = try await repository.upsertObjectMetadataBatch([metadata])
+            try Task.checkCancellation()
             let now = Date().timeIntervalSince1970
             // Preserve observation dates after clock correction. The graph
             // service uses actual current time to retire future-dated evidence.
-            let objects = try await repository.metadataSnapshot().objects
             _ = try await sceneGraphService.ingest(
                 changed: metadata,
-                allObjects: objects,
+                allObjects: document.objects,
                 at: now
+            )
+        }
+        let durableMetadataBatchWriter: TemporalSpatialMemoryService.MetadataBatchWriter = { metadata in
+            let document = try await repository.upsertObjectMetadataBatch(metadata)
+            try Task.checkCancellation()
+            guard let first = metadata.first else { return }
+            // Recovery provides one complete map/frame snapshot. Reconcile from
+            // the committed document, including any name updated before the batch.
+            try await sceneGraphService.rebuild(
+                mapID: first.mapID, coordinateFrameID: first.position.coordinateFrameID,
+                allObjects: document.objects, at: Date().timeIntervalSince1970
             )
         }
         let temporalJournalRepository = TemporalSpatialMemoryJournalRepository(
@@ -67,6 +78,7 @@ final class VispaceServices: ObservableObject {
                 try await repository.metadataSnapshot()
             },
             metadataWriter: durableMetadataWriter,
+            metadataBatchWriter: durableMetadataBatchWriter,
             poseValidator: sessionController.makeTemporalPoseValidator()
         )
         let detectorResolution: ObjectDetectorResolution

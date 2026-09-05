@@ -7,17 +7,23 @@ public struct SpatialRelationQuerySnapshot: Sendable {
     public let coordinateFrameID: CoordinateFrameID
     public let records: [StoredSpatialObjectRecord]
     public let graph: SceneGraph
+    public let geometryProjection: SceneGraphGeometryProjection
+    public let hasDeferredProjection: Bool
 
     public init(
         mapID: MapID,
         coordinateFrameID: CoordinateFrameID,
         records: [StoredSpatialObjectRecord],
-        graph: SceneGraph
+        graph: SceneGraph,
+        geometryProjection: SceneGraphGeometryProjection = .materialized,
+        hasDeferredProjection: Bool = false
     ) {
         self.mapID = mapID
         self.coordinateFrameID = coordinateFrameID
         self.records = records
         self.graph = graph
+        self.geometryProjection = geometryProjection
+        self.hasDeferredProjection = hasDeferredProjection
     }
 }
 
@@ -89,15 +95,22 @@ public final class SpatialRelationQueryController: ObservableObject {
         snapshotProvider = { mapID in
             async let objectSnapshot = objectRepository.loadSnapshot(currentMapID: mapID)
             async let graphRecord = sceneGraphRepository.load(mapID: mapID)
-            let (objects, record) = try await (objectSnapshot, graphRecord)
-            guard let record else {
+            async let deferred = sceneGraphRepository.isProjectionDeferred(mapID: mapID)
+            let (objects, record, hasDeferredProjection) = try await (objectSnapshot, graphRecord, deferred)
+            guard let frameID = record?.coordinateFrameID ?? objects.records.first(where: {
+                $0.metadata.mapID == mapID
+            })?.metadata.position.coordinateFrameID else {
                 return nil
             }
             return SpatialRelationQuerySnapshot(
-                mapID: record.mapID,
-                coordinateFrameID: record.coordinateFrameID,
+                mapID: mapID,
+                coordinateFrameID: frameID,
                 records: objects.records,
-                graph: record.graph
+                graph: record?.graph ?? SceneGraph(),
+                // Geometry is reproducible from the source snapshot even when
+                // the cache missed an update or could not create its first row.
+                geometryProjection: .onDemand,
+                hasDeferredProjection: hasDeferredProjection
             )
         }
         self.currentIdentityProvider = currentIdentityProvider
@@ -195,16 +208,33 @@ public final class SpatialRelationQueryController: ObservableObject {
                     records: eligibleRecords
                 )
                 let result = try await Task.detached(priority: .userInitiated) {
-                    try engine.query(
+                    var queryGraph = graph
+                    if snapshot.geometryProjection == .onDemand,
+                        let scope = engine.geometryScope(for: query, records: eligibleRecords) {
+                        for relation in queryGraph.relations(includeProvisional: true)
+                        where relation.key.predicate == scope.predicate { queryGraph.remove(relation.key) }
+                        let geometry = try SpatialSceneGraphService.geometryGraphForQuery(
+                            scope: scope, objects: eligibleRecords.map(\.metadata), at: now,
+                            confidencePolicy: graph.confidencePolicy
+                        )
+                        for relation in geometry.relations(includeProvisional: true) { try queryGraph.upsert(relation) }
+                    }
+                    return try engine.query(
                         query,
                         records: eligibleRecords,
-                        graph: graph,
+                        graph: queryGraph,
                         at: now
                     )
                 }.value
                 try Task.checkCancellation()
                 guard self.isCurrent(requestID: requestID, identity: identity) else {
                     self.rejectStaleResult(requestID: requestID)
+                    self.finish(requestID: requestID)
+                    return
+                }
+
+                if snapshot.hasDeferredProjection, result.predicate?.isGeometryDerived == false {
+                    self.publishUnavailable("관계 저장 공간이 부족해 이 관계의 기록을 확인할 수 없어요. 저장된 공간을 정리한 뒤 다시 확인해 주세요.")
                     self.finish(requestID: requestID)
                     return
                 }

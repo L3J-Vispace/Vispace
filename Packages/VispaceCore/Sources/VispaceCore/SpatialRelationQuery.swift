@@ -101,6 +101,18 @@ public struct SpatialRelationQueryPolicy: Hashable, Sendable {
     public static let `default` = try! Self()
 }
 
+/// A bounded geometry lookup selected with exactly the query engine's semantic
+/// grounding rules. Unresolved or ambiguous language never starts pair expansion.
+public struct SpatialRelationQueryGeometryScope: Sendable {
+    public let predicate: SpatialRelationPredicate
+    public let objectIDs: Set<ObjectID>
+
+    fileprivate init(predicate: SpatialRelationPredicate, objectIDs: Set<ObjectID>) {
+        self.predicate = predicate
+        self.objectIDs = objectIDs
+    }
+}
+
 /// Answers basic relation questions only from confirmed, currently valid scene
 /// graph edges. It never derives a relation from language or object positions.
 public struct DeterministicSpatialRelationQueryEngine: Sendable {
@@ -108,6 +120,23 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
 
     public init(policy: SpatialRelationQueryPolicy = .default) {
         self.policy = policy
+    }
+
+    public func geometryScope(
+        for utterance: String,
+        records: [StoredSpatialObjectRecord]
+    ) -> SpatialRelationQueryGeometryScope? {
+        guard let predicate = detectedPredicate(in: utterance), predicate.isGeometryDerived else { return nil }
+        let eligible = eligibleRecords(records)
+        let labels = orderedDistinctLabels(semanticMentions(in: utterance, records: eligible))
+        guard (1...2).contains(labels.count) else { return nil }
+        let byLabel = Dictionary(grouping: eligible) { normalize($0.metadata.object.semanticLabel) }
+        var objectIDs: Set<ObjectID> = []
+        for label in labels {
+            guard let matches = byLabel[label], matches.count == 1 else { return nil }
+            objectIDs.insert(matches[0].metadata.object.id)
+        }
+        return SpatialRelationQueryGeometryScope(predicate: predicate, objectIDs: objectIDs)
     }
 
     public func query(

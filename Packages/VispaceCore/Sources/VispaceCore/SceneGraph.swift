@@ -29,6 +29,15 @@ public enum SpatialRelationPredicate: String, Codable, CaseIterable, Hashable, S
     case intersects
     case connectedTo
     case accessibleFrom
+
+    /// These predicates can be rebuilt from validated object bounds. Other
+    /// relations need independent evidence and must never be discarded as cache.
+    public var isGeometryDerived: Bool {
+        switch self {
+        case .leftOf, .rightOf, .on, .under, .inside, .near, .intersects: true
+        case .blocking, .connectedTo, .accessibleFrom: false
+        }
+    }
 }
 
 public enum RelationCertainty: String, Codable, Hashable, Sendable {

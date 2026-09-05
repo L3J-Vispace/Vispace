@@ -12,12 +12,15 @@ public enum SpatialSceneGraphServiceError: Error, Equatable, Sendable {
 public enum SpatialSceneGraphServiceResult: Sendable {
     case unchanged(SceneGraphMapRecord)
     case updated(SceneGraphMapRecord)
+    case deferredForCapacity(mapID: MapID)
 }
 
 /// Recomputes only relations touching the changed object. Previous relation
 /// versions are retained as bounded expired evidence instead of being silently
 /// overwritten.
 public actor SpatialSceneGraphService {
+    public private(set) var capacityDeferralCount: UInt64 = 0
+    public private(set) var rebuildObjectProjectionCount: UInt64 = 0
     private let repository: SceneGraphRepository
     private let deriver: SpatialRelationDeriver
     private let confidencePolicy: ConfidencePolicy
@@ -30,6 +33,34 @@ public actor SpatialSceneGraphService {
         self.repository = repository
         self.deriver = deriver
         self.confidencePolicy = confidencePolicy
+    }
+
+    /// The caller commits the complete metadata batch before rebuilding this
+    /// optional cache. Once the map uses on-demand geometry (or records a
+    /// capacity deferral), all queryable source objects are already durable;
+    /// visiting the remaining objects would only repeat the same catalog I/O.
+    public func rebuild(
+        mapID: MapID,
+        coordinateFrameID: CoordinateFrameID,
+        allObjects: [SpatialObjectMetadata],
+        at timestamp: TimeInterval
+    ) async throws {
+        guard timestamp.isFinite, timestamp >= 0 else { throw SpatialSceneGraphServiceError.invalidTimestamp }
+        let sameMap = allObjects.filter { $0.mapID == mapID }
+        guard sameMap.allSatisfy({ $0.position.coordinateFrameID == coordinateFrameID }) else {
+            throw SpatialSceneGraphServiceError.mapCoordinateFrameMismatch
+        }
+        for metadata in sameMap.sorted(by: { $0.object.id < $1.object.id }) {
+            try Task.checkCancellation()
+            rebuildObjectProjectionCount &+= 1
+            let result = try await ingest(changed: metadata, allObjects: sameMap, at: timestamp)
+            switch result {
+            case .deferredForCapacity:
+                return
+            case .unchanged(let record), .updated(let record):
+                if record.geometryProjection == .onDemand { return }
+            }
+        }
     }
 
     @discardableResult
@@ -86,10 +117,17 @@ public actor SpatialSceneGraphService {
 
         var graph = existing?.graph ?? SceneGraph(confidencePolicy: confidencePolicy)
         var history = existing?.expiredRelationHistory ?? []
-        let desired = try desiredRelations(
+        if let existing, existing.geometryProjection == .onDemand {
+            // The durable objects are the projection source. Dense maps stay in
+            // this mode; observation processing does not rewrite an all-pairs cache.
+            try await repository.acknowledgeCurrentProjection(mapID: changed.mapID)
+            return .unchanged(existing)
+        }
+        let desired = try Self.desiredRelations(
             changed: changed,
             sameMapObjects: sameMap,
-            timestamp: effectiveTimestamp
+            timestamp: effectiveTimestamp,
+            deriver: deriver, confidencePolicy: confidencePolicy
         )
         let currentRelations = graph.relations(includeProvisional: true)
         var currentByKey = Dictionary(uniqueKeysWithValues: currentRelations.map { ($0.key, $0) })
@@ -99,7 +137,7 @@ public actor SpatialSceneGraphService {
         where relationTouches(
             relation,
             objectID: changed.object.id
-        ) {
+        ) && relation.key.predicate.isGeometryDerived {
             guard let replacement = desired[relation.key] else {
                 try archive(relation, at: effectiveTimestamp, into: &history)
                 graph.remove(relation.key)
@@ -145,17 +183,59 @@ public actor SpatialSceneGraphService {
             expiredRelationHistory: history,
             timestamp: effectiveTimestamp
         )
-        let applied = try await repository.apply(update)
+        let applied: SceneGraphUpdateResult
+        do {
+            applied = try await repository.apply(update)
+        } catch let error as SceneGraphRepositoryError {
+            guard case .catalogTooLarge = error else { throw error }
+            // Source metadata has already committed. Keep opaque graph evidence
+            // intact and durably mark incomplete coverage instead of blocking
+            // every later object observation on this optional projection.
+            try await repository.recordCapacityDeferral(mapID: changed.mapID, baseRevision: update.baseRevision)
+            capacityDeferralCount &+= 1
+            return .deferredForCapacity(mapID: changed.mapID)
+        }
         switch applied {
         case .applied(let record), .alreadyApplied(let record):
             return .updated(record)
         }
     }
 
-    private func desiredRelations(
+    /// Rebuilds only the requested predicate touching its one or two grounded
+    /// objects. It uses the same geometry/confidence rules as ingestion and
+    /// preserves source observation times rather than dating old evidence now.
+    public nonisolated static func geometryGraphForQuery(
+        scope: SpatialRelationQueryGeometryScope,
+        objects: [SpatialObjectMetadata],
+        at timestamp: TimeInterval,
+        confidencePolicy: ConfidencePolicy = .default
+    ) throws -> SceneGraph {
+        guard timestamp.isFinite, timestamp >= 0 else { throw SpatialSceneGraphServiceError.invalidTimestamp }
+        var graph = SceneGraph(confidencePolicy: confidencePolicy)
+        for objectID in scope.objectIDs.sorted() {
+            try Task.checkCancellation()
+            guard let target = objects.first(where: { $0.object.id == objectID }) else { continue }
+            let sameMap = objects.filter {
+                $0.mapID == target.mapID && $0.position.coordinateFrameID == target.position.coordinateFrameID
+            }
+            let relations = try desiredRelations(
+                changed: target, sameMapObjects: sameMap, timestamp: timestamp,
+                deriver: SpatialRelationDeriver(), confidencePolicy: confidencePolicy,
+                predicate: scope.predicate, useObservationTime: true
+            )
+            for relation in relations.values { try graph.upsert(relation) }
+        }
+        return graph
+    }
+
+    private nonisolated static func desiredRelations(
         changed: SpatialObjectMetadata,
         sameMapObjects: [SpatialObjectMetadata],
-        timestamp: TimeInterval
+        timestamp: TimeInterval,
+        deriver: SpatialRelationDeriver,
+        confidencePolicy: ConfidencePolicy,
+        predicate requestedPredicate: SpatialRelationPredicate? = nil,
+        useObservationTime: Bool = false
     ) throws -> [RelationKey: SpatialRelation] {
         guard isEligible(changed), changed.object.lastSeenAt <= timestamp,
             changed.object.stateUpdatedAt <= timestamp,
@@ -164,6 +244,7 @@ public actor SpatialSceneGraphService {
         }
         var desired: [RelationKey: SpatialRelation] = [:]
         for other in sameMapObjects.sorted(by: { $0.object.id < $1.object.id }) {
+            try Task.checkCancellation()
             guard other.object.id != changed.object.id,
                 isEligible(other),
                 other.object.lastSeenAt <= timestamp,
@@ -178,7 +259,12 @@ public actor SpatialSceneGraphService {
                 continue
             }
             let certainty: RelationCertainty = grade == .high ? .confirmed : .provisional
-            for predicate in deriver.predicates(subject: changedBounds, object: otherBounds) {
+            let validFrom = useObservationTime ? max(
+                max(changed.object.stateUpdatedAt, other.object.stateUpdatedAt),
+                max(changed.object.lastSeenAt, other.object.lastSeenAt)
+            ) : timestamp
+            for predicate in deriver.predicates(subject: changedBounds, object: otherBounds)
+            where requestedPredicate == nil || requestedPredicate == predicate {
                 let key = RelationKey(
                     subject: .object(changed.object.id),
                     predicate: predicate,
@@ -188,12 +274,13 @@ public actor SpatialSceneGraphService {
                     key: key,
                     confidence: confidence,
                     certainty: certainty,
-                    validFrom: timestamp,
+                    validFrom: validFrom,
                     subjectTemporalRevision: changed.object.temporalRevision,
                     objectTemporalRevision: other.object.temporalRevision
                 )
             }
-            for predicate in deriver.predicates(subject: otherBounds, object: changedBounds) {
+            for predicate in deriver.predicates(subject: otherBounds, object: changedBounds)
+            where requestedPredicate == nil || requestedPredicate == predicate {
                 let key = RelationKey(
                     subject: .object(other.object.id),
                     predicate: predicate,
@@ -203,7 +290,7 @@ public actor SpatialSceneGraphService {
                     key: key,
                     confidence: confidence,
                     certainty: certainty,
-                    validFrom: timestamp,
+                    validFrom: validFrom,
                     subjectTemporalRevision: other.object.temporalRevision,
                     objectTemporalRevision: changed.object.temporalRevision
                 )
@@ -212,13 +299,13 @@ public actor SpatialSceneGraphService {
         return desired
     }
 
-    private func isEligible(_ metadata: SpatialObjectMetadata) -> Bool {
+    private nonisolated static func isEligible(_ metadata: SpatialObjectMetadata) -> Bool {
         metadata.object.certainty == .confirmed
             && metadata.object.presence != .removed
             && metadata.object.bounds != nil
     }
 
-    private func relationConfidence(
+    private nonisolated static func relationConfidence(
         _ first: SpatialObject,
         _ second: SpatialObject
     ) -> ConfidenceScore {

@@ -15,10 +15,18 @@ public enum SceneGraphRepositoryError: Error, Equatable, Sendable {
     case historyCapacityExceeded(maximum: Int)
     case updateIDCapacityExceeded(maximum: Int)
     case invalidUpdateHistory
+    case invalidProjectionMode
+}
+
+public enum SceneGraphGeometryProjection: String, Codable, Sendable {
+    case materialized
+    /// Geometry edges are derived for the grounded query from durable object
+    /// metadata. An absent cached edge in this mode is never negative evidence.
+    case onDemand
 }
 
 public struct SceneGraphMapRecord: Codable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 1
+    public static let currentSchemaVersion: UInt16 = 2
     public static let absoluteMaximumHistoryCount = 2_048
     public static let absoluteMaximumAppliedUpdateIDs = 512
 
@@ -27,6 +35,7 @@ public struct SceneGraphMapRecord: Codable, Sendable {
     public let coordinateFrameID: CoordinateFrameID
     public let revision: UInt64
     public let graph: SceneGraph
+    public let geometryProjection: SceneGraphGeometryProjection
     public let expiredRelationHistory: [SpatialRelation]
     public let appliedUpdateIDs: Set<UUID>
     /// Oldest to newest. Revision checks reject replays outside this window.
@@ -40,13 +49,14 @@ public struct SceneGraphMapRecord: Codable, Sendable {
         coordinateFrameID: CoordinateFrameID,
         revision: UInt64,
         graph: SceneGraph,
+        geometryProjection: SceneGraphGeometryProjection = .materialized,
         expiredRelationHistory: [SpatialRelation] = [],
         appliedUpdateIDs: Set<UUID> = [],
         appliedUpdateOrder: [UUID]? = nil,
         createdAt: TimeInterval,
         updatedAt: TimeInterval
     ) throws {
-        guard schemaVersion == Self.currentSchemaVersion else {
+        guard (1...Self.currentSchemaVersion).contains(schemaVersion) else {
             throw SceneGraphRepositoryError.unsupportedRecordSchema(schemaVersion)
         }
         guard createdAt.isFinite, createdAt >= 0,
@@ -65,6 +75,10 @@ public struct SceneGraphMapRecord: Codable, Sendable {
         guard expiredRelationHistory.allSatisfy({ $0.validUntil != nil }) else {
             throw SceneGraphRepositoryError.historyContainsActiveRelation
         }
+        guard geometryProjection != .onDemand || (
+            graph.relations(includeProvisional: true).allSatisfy { !$0.key.predicate.isGeometryDerived }
+                && expiredRelationHistory.allSatisfy { !$0.key.predicate.isGeometryDerived }
+        ) else { throw SceneGraphRepositoryError.invalidProjectionMode }
         guard appliedUpdateIDs.count <= Self.absoluteMaximumAppliedUpdateIDs else {
             throw SceneGraphRepositoryError.updateIDCapacityExceeded(
                 maximum: Self.absoluteMaximumAppliedUpdateIDs
@@ -78,11 +92,12 @@ public struct SceneGraphMapRecord: Codable, Sendable {
         else {
             throw SceneGraphRepositoryError.invalidUpdateHistory
         }
-        self.schemaVersion = schemaVersion
+        self.schemaVersion = Self.currentSchemaVersion
         self.mapID = mapID
         self.coordinateFrameID = coordinateFrameID
         self.revision = revision
         self.graph = graph
+        self.geometryProjection = geometryProjection
         self.expiredRelationHistory = expiredRelationHistory
         self.appliedUpdateIDs = appliedUpdateIDs
         self.appliedUpdateOrder = updateOrder
@@ -96,6 +111,7 @@ public struct SceneGraphMapRecord: Codable, Sendable {
         case coordinateFrameID
         case revision
         case graph
+        case geometryProjection
         case expiredRelationHistory
         case appliedUpdateIDs
         case appliedUpdateOrder
@@ -105,9 +121,10 @@ public struct SceneGraphMapRecord: Codable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let version = try container.decode(UInt16.self, forKey: .schemaVersion)
         do {
             try self.init(
-                schemaVersion: container.decode(UInt16.self, forKey: .schemaVersion),
+                schemaVersion: version,
                 mapID: container.decode(MapID.self, forKey: .mapID),
                 coordinateFrameID: container.decode(
                     CoordinateFrameID.self,
@@ -115,6 +132,9 @@ public struct SceneGraphMapRecord: Codable, Sendable {
                 ),
                 revision: container.decode(UInt64.self, forKey: .revision),
                 graph: container.decode(SceneGraph.self, forKey: .graph),
+                geometryProjection: version == 1 ? .materialized : container.decode(
+                    SceneGraphGeometryProjection.self, forKey: .geometryProjection
+                ),
                 expiredRelationHistory: container.decode(
                     [SpatialRelation].self,
                     forKey: .expiredRelationHistory
@@ -139,10 +159,29 @@ public struct SceneGraphMapRecord: Codable, Sendable {
             )
         }
     }
+
+    fileprivate var cachedGeometryCount: Int {
+        graph.relations(includeProvisional: true).filter { $0.key.predicate.isGeometryDerived }.count
+            + expiredRelationHistory.filter { $0.key.predicate.isGeometryDerived }.count
+    }
+
+    fileprivate func withoutGeometryCache() throws -> SceneGraphMapRecord {
+        var retained = SceneGraph(confidencePolicy: graph.confidencePolicy)
+        for relation in graph.relations(includeProvisional: true) where !relation.key.predicate.isGeometryDerived {
+            try retained.upsert(relation)
+        }
+        return try SceneGraphMapRecord(
+            mapID: mapID, coordinateFrameID: coordinateFrameID, revision: revision,
+            graph: retained, geometryProjection: .onDemand,
+            expiredRelationHistory: expiredRelationHistory.filter { !$0.key.predicate.isGeometryDerived },
+            appliedUpdateIDs: appliedUpdateIDs, appliedUpdateOrder: appliedUpdateOrder,
+            createdAt: createdAt, updatedAt: updatedAt
+        )
+    }
 }
 
 public struct SceneGraphCatalogSnapshot: Codable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 1
+    public static let currentSchemaVersion: UInt16 = 2
     public static let absoluteMaximumMapCount = 64
 
     public let schemaVersion: UInt16
@@ -152,7 +191,7 @@ public struct SceneGraphCatalogSnapshot: Codable, Sendable {
         schemaVersion: UInt16 = Self.currentSchemaVersion,
         records: [SceneGraphMapRecord] = []
     ) throws {
-        guard schemaVersion == Self.currentSchemaVersion else {
+        guard (1...Self.currentSchemaVersion).contains(schemaVersion) else {
             throw SceneGraphRepositoryError.unsupportedCatalogSchema(schemaVersion)
         }
         guard records.count <= Self.absoluteMaximumMapCount else {
@@ -164,7 +203,7 @@ public struct SceneGraphCatalogSnapshot: Codable, Sendable {
         for record in records where !mapIDs.insert(record.mapID).inserted {
             throw SceneGraphRepositoryError.duplicateMap(record.mapID)
         }
-        self.schemaVersion = schemaVersion
+        self.schemaVersion = Self.currentSchemaVersion
         self.records = records.sorted { $0.mapID < $1.mapID }
     }
 
@@ -198,6 +237,7 @@ public struct SceneGraphMapUpdate: Sendable {
     public let coordinateFrameID: CoordinateFrameID
     public let baseRevision: UInt64
     public let graph: SceneGraph
+    public let geometryProjection: SceneGraphGeometryProjection
     public let expiredRelationHistory: [SpatialRelation]
     public let timestamp: TimeInterval
 
@@ -207,6 +247,7 @@ public struct SceneGraphMapUpdate: Sendable {
         coordinateFrameID: CoordinateFrameID,
         baseRevision: UInt64,
         graph: SceneGraph,
+        geometryProjection: SceneGraphGeometryProjection = .materialized,
         expiredRelationHistory: [SpatialRelation],
         timestamp: TimeInterval
     ) {
@@ -215,6 +256,7 @@ public struct SceneGraphMapUpdate: Sendable {
         self.coordinateFrameID = coordinateFrameID
         self.baseRevision = baseRevision
         self.graph = graph
+        self.geometryProjection = geometryProjection
         self.expiredRelationHistory = expiredRelationHistory
         self.timestamp = timestamp
     }
@@ -230,15 +272,18 @@ public enum SceneGraphUpdateResult: Sendable {
 public actor SceneGraphRepository {
     public static let catalogFileName = "scene-graphs-v1.json"
     public static let maximumCatalogBytes = 4 * 1_024 * 1_024
+    public static let maximumCachedGeometryRelationsPerMap = 1_024
 
     private let directoryURL: URL
     private let catalogURL: URL
     private let maximumMapCount: Int
+    private let catalogByteLimit: Int
     private let fileManager: FileManager
 
     public init(
         directoryURL: URL,
         maximumMapCount: Int = 32,
+        catalogByteLimit: Int = SceneGraphRepository.maximumCatalogBytes,
         fileManager: FileManager = .default
     ) {
         let directory = directoryURL.standardizedFileURL
@@ -249,6 +294,7 @@ public actor SceneGraphRepository {
             SceneGraphCatalogSnapshot.absoluteMaximumMapCount
         )
         self.fileManager = fileManager
+        self.catalogByteLimit = min(Self.maximumCatalogBytes, max(1_024, catalogByteLimit))
     }
 
     public func catalogSnapshot() async throws -> SceneGraphCatalogSnapshot {
@@ -260,6 +306,25 @@ public actor SceneGraphRepository {
 
     public func load(mapID: MapID) async throws -> SceneGraphMapRecord? {
         try await catalogSnapshot().records.first { $0.mapID == mapID }
+    }
+
+    /// Tiny independent receipt: non-reproducible evidence can fill the graph
+    /// catalog, but that must not prevent object commits or masquerade as a
+    /// complete relation snapshot after process restart.
+    public func isProjectionDeferred(mapID: MapID) throws -> Bool {
+        try projectionDeferrals()[mapID] != nil
+    }
+
+    public func recordCapacityDeferral(mapID: MapID, baseRevision: UInt64) throws {
+        try Task.checkCancellation()
+        var deferred = try projectionDeferrals()
+        deferred[mapID] = max(deferred[mapID] ?? 0, baseRevision)
+        try writeProjectionDeferrals(deferred)
+    }
+
+    public func acknowledgeCurrentProjection(mapID: MapID) async throws {
+        guard let record = try await load(mapID: mapID) else { return }
+        try clearProjectionDeferral(mapID: mapID, committedRevision: record.revision)
     }
 
     @discardableResult
@@ -277,6 +342,7 @@ public actor SceneGraphRepository {
                 throw SceneGraphRepositoryError.mapCoordinateFrameConflict(update.mapID)
             }
             if existing.appliedUpdateIDs.contains(update.id) {
+                try clearProjectionDeferral(mapID: update.mapID, committedRevision: existing.revision)
                 return .alreadyApplied(existing)
             }
             guard existing.revision == update.baseRevision else {
@@ -297,6 +363,7 @@ public actor SceneGraphRepository {
                 coordinateFrameID: update.coordinateFrameID,
                 revision: existing.revision + 1,
                 graph: update.graph,
+                geometryProjection: update.geometryProjection,
                 expiredRelationHistory: update.expiredRelationHistory,
                 appliedUpdateIDs: Set(updateOrder),
                 appliedUpdateOrder: updateOrder,
@@ -305,8 +372,9 @@ public actor SceneGraphRepository {
             )
             catalog.records[index] = record
             try Task.checkCancellation()
-            try commit(catalog)
-            return .applied(record)
+            let committed = try commit(catalog)
+            try clearProjectionDeferral(mapID: update.mapID, committedRevision: committed.records[index].revision)
+            return .applied(committed.records[index])
         }
 
         guard update.baseRevision == 0 else {
@@ -323,6 +391,7 @@ public actor SceneGraphRepository {
             coordinateFrameID: update.coordinateFrameID,
             revision: 1,
             graph: update.graph,
+            geometryProjection: update.geometryProjection,
             expiredRelationHistory: update.expiredRelationHistory,
             appliedUpdateIDs: [update.id],
             createdAt: update.timestamp,
@@ -331,8 +400,9 @@ public actor SceneGraphRepository {
         catalog.records.append(record)
         catalog.records.sort { $0.mapID < $1.mapID }
         try Task.checkCancellation()
-        try commit(catalog)
-        return .applied(record)
+        let committed = try commit(catalog)
+        try clearProjectionDeferral(mapID: update.mapID, committedRevision: record.revision)
+        return .applied(committed.records.first { $0.mapID == update.mapID } ?? record)
     }
 
     public func deleteMap(mapID: MapID) async throws {
@@ -341,6 +411,7 @@ public actor SceneGraphRepository {
         catalog.records.removeAll { $0.mapID == mapID }
         try Task.checkCancellation()
         try commit(catalog, reclaiming: true)
+        try clearProjectionDeferral(mapID: mapID)
     }
 
     private func loadRecoveringInvalidData() throws -> SceneGraphCatalogSnapshot {
@@ -355,7 +426,7 @@ public actor SceneGraphRepository {
         }
         do {
             let data = try readBounded()
-            try SpatialStorageDirectory.validateJSONSchemas(data)
+            try SpatialStorageDirectory.validateJSONSchemas(data, maximumSchemaVersion: 2)
             return try JSONDecoder().decode(SceneGraphCatalogSnapshot.self, from: data)
         } catch let error as SceneGraphRepositoryError {
             guard case .catalogTooLarge = error else {
@@ -395,21 +466,100 @@ public actor SceneGraphRepository {
         }
     }
 
-    private func commit(_ catalog: SceneGraphCatalogSnapshot, reclaiming: Bool = false) throws {
+    @discardableResult
+    private func commit(_ input: SceneGraphCatalogSnapshot, reclaiming: Bool = false) throws -> SceneGraphCatalogSnapshot {
+        var catalog = input
         try validateConfiguredCapacity(catalog)
         try prepareDirectory()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(catalog)
-        guard data.count <= Self.maximumCatalogBytes else {
+        for index in catalog.records.indices
+        where catalog.records[index].cachedGeometryCount > Self.maximumCachedGeometryRelationsPerMap {
+            catalog.records[index] = try catalog.records[index].withoutGeometryCache()
+        }
+        var data = try encoder.encode(catalog)
+        // Only reproducible geometry is evictable. Explicit graph evidence and
+        // its history are preserved even when that means reporting real storage
+        // exhaustion. Largest caches go first; MapID order breaks equal ties.
+        let evictionOrder = catalog.records.indices.sorted {
+            let left = catalog.records[$0].cachedGeometryCount
+            let right = catalog.records[$1].cachedGeometryCount
+            return left == right ? catalog.records[$0].mapID < catalog.records[$1].mapID : left > right
+        }
+        for index in evictionOrder where data.count > catalogByteLimit {
+            guard catalog.records[index].cachedGeometryCount > 0 else { continue }
+            catalog.records[index] = try catalog.records[index].withoutGeometryCache()
+            data = try encoder.encode(catalog)
+        }
+        guard data.count <= catalogByteLimit else {
             throw SceneGraphRepositoryError.catalogTooLarge(
                 actual: data.count,
-                maximum: Self.maximumCatalogBytes
+                maximum: catalogByteLimit
             )
         }
         try SpatialStorageDirectory.atomicWrite(
             data, to: catalogURL, directory: directoryURL, fileManager: fileManager, reclaiming: reclaiming
         )
+        return catalog
+    }
+
+    private struct ProjectionDeferrals: Codable {
+        let schemaVersion: UInt16
+        let entries: [Entry]
+
+        struct Entry: Codable {
+            let mapID: MapID
+            let baseRevision: UInt64
+        }
+    }
+
+    private var projectionDeferralsURL: URL {
+        directoryURL.appendingPathComponent("scene-graph-projection-deferrals-v1.json")
+    }
+
+    private func projectionDeferrals() throws -> [MapID: UInt64] {
+        let url = projectionDeferralsURL
+        try SpatialStorageDirectory.validatePath(at: url, fileManager: fileManager)
+        guard fileManager.fileExists(atPath: url.path) else { return [:] }
+        try SpatialStorageDirectory.validateRegularFile(at: url, fileManager: fileManager)
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: 16_385) ?? Data()
+        guard data.count <= 16_384 else {
+            throw SceneGraphRepositoryError.invalidProjectionMode
+        }
+        try SpatialStorageDirectory.validateJSONSchemas(data)
+        let receipt = try JSONDecoder().decode(ProjectionDeferrals.self, from: data)
+        guard receipt.schemaVersion == 1 else {
+            throw SceneGraphRepositoryError.unsupportedCatalogSchema(receipt.schemaVersion)
+        }
+        let ids = Set(receipt.entries.map(\.mapID))
+        guard ids.count == receipt.entries.count, ids.count <= SceneGraphCatalogSnapshot.absoluteMaximumMapCount else {
+            throw SceneGraphRepositoryError.invalidProjectionMode
+        }
+        return Dictionary(uniqueKeysWithValues: receipt.entries.map { ($0.mapID, $0.baseRevision) })
+    }
+
+    private func writeProjectionDeferrals(_ ids: [MapID: UInt64], reclaiming: Bool = false) throws {
+        guard ids.count <= SceneGraphCatalogSnapshot.absoluteMaximumMapCount else {
+            throw SceneGraphRepositoryError.mapCapacityReached(maximum: SceneGraphCatalogSnapshot.absoluteMaximumMapCount)
+        }
+        try prepareDirectory()
+        let entries = ids.sorted { $0.key < $1.key }.map {
+            ProjectionDeferrals.Entry(mapID: $0.key, baseRevision: $0.value)
+        }
+        let data = try JSONEncoder().encode(ProjectionDeferrals(schemaVersion: 1, entries: entries))
+        try SpatialStorageDirectory.atomicWrite(
+            data, to: projectionDeferralsURL, directory: directoryURL, fileManager: fileManager,
+            reclaiming: reclaiming
+        )
+    }
+
+    private func clearProjectionDeferral(mapID: MapID, committedRevision: UInt64? = nil) throws {
+        var deferred = try projectionDeferrals()
+        guard let failedBase = deferred[mapID], committedRevision.map({ $0 > failedBase }) ?? true else { return }
+        deferred.removeValue(forKey: mapID)
+        try writeProjectionDeferrals(deferred, reclaiming: true)
     }
 
     private func quarantine(reason: String) throws {

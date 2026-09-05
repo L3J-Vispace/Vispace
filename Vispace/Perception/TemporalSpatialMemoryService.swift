@@ -54,6 +54,9 @@ public actor TemporalSpatialMemoryService {
     public typealias MetadataWriter =
         @Sendable (SpatialObjectMetadata) async throws
         -> Void
+    public typealias MetadataBatchWriter =
+        @Sendable ([SpatialObjectMetadata]) async throws
+        -> Void
     public typealias PoseValidator = @Sendable (ARPoseSnapshot) -> Bool
 
     private struct MapFrameKey: Hashable, Sendable {
@@ -64,6 +67,7 @@ public actor TemporalSpatialMemoryService {
     private let journalRepository: TemporalSpatialMemoryJournalRepository
     private let metadataProvider: MetadataProvider
     private let metadataWriter: MetadataWriter
+    private let metadataBatchWriter: MetadataBatchWriter?
     private let policy: TemporalSpatialMemoryPolicy
     private let poseValidator: PoseValidator?
     private var coordinators: [MapFrameKey: TemporalSpatialMemoryCoordinator] = [:]
@@ -83,6 +87,9 @@ public actor TemporalSpatialMemoryService {
         metadataWriter = { metadata in
             try await checkpointRepository.upsertObjectMetadata(metadata)
         }
+        metadataBatchWriter = { metadata in
+            _ = try await checkpointRepository.upsertObjectMetadataBatch(metadata)
+        }
         self.policy = policy
         self.poseValidator = poseValidator
     }
@@ -92,6 +99,7 @@ public actor TemporalSpatialMemoryService {
         policy: TemporalSpatialMemoryPolicy = .default,
         metadataProvider: @escaping MetadataProvider,
         metadataWriter: @escaping MetadataWriter,
+        metadataBatchWriter: MetadataBatchWriter? = nil,
         poseValidator: PoseValidator? = nil
     ) {
         self.journalRepository = journalRepository
@@ -99,6 +107,7 @@ public actor TemporalSpatialMemoryService {
         self.poseValidator = poseValidator
         self.metadataProvider = metadataProvider
         self.metadataWriter = metadataWriter
+        self.metadataBatchWriter = metadataBatchWriter
     }
 
     /// Restores a map from a compact checkpoint plus the bounded journal
@@ -399,9 +408,9 @@ public actor TemporalSpatialMemoryService {
         let durableByID = Dictionary(
             uniqueKeysWithValues: durableObjects.map { ($0.object.id, $0) }
         )
-        for (objectID, journalMetadata) in snapshot.objects.sorted(by: {
-            $0.key < $1.key
-        }) {
+        let orderedObjects = snapshot.objects.sorted { $0.key < $1.key }
+        for (objectID, journalMetadata) in orderedObjects {
+            try validateGeneration(generation)
             if let durable = durableByID[objectID] {
                 var comparableObject = durable.object
                 try comparableObject.setDisplayName(journalMetadata.object.displayName)
@@ -423,12 +432,6 @@ public actor TemporalSpatialMemoryService {
                     }
                 }
             }
-            // Equal object metadata does not prove that downstream projections
-            // (such as scene relations) committed before a process interruption.
-            // Reapply the complete idempotent writer on every cold recovery.
-            try validateGeneration(generation)
-            try await metadataWriter(journalMetadata)
-            try validateGeneration(generation)
         }
         let journalIDs = Set(snapshot.objects.keys)
         if let untracked = durableObjects.lazy
@@ -438,6 +441,20 @@ public actor TemporalSpatialMemoryService {
             .first
         {
             throw TemporalSpatialMemoryServiceError.untrackedDurableObject(untracked)
+        }
+        // Equal metadata does not prove that downstream projections committed.
+        // Replay the whole validated snapshot, using a single catalog transaction
+        // when the caller supplies a writer that also reconciles its projections.
+        try validateGeneration(generation)
+        if let metadataBatchWriter, !orderedObjects.isEmpty {
+            try await metadataBatchWriter(orderedObjects.map(\.value))
+            try validateGeneration(generation)
+        } else {
+            for (_, metadata) in orderedObjects {
+                try validateGeneration(generation)
+                try await metadataWriter(metadata)
+                try validateGeneration(generation)
+            }
         }
     }
 

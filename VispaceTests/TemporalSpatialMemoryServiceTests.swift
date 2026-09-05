@@ -4,6 +4,138 @@ import XCTest
 @testable import Vispace
 
 final class TemporalSpatialMemoryServiceTests: XCTestCase {
+    func testColdRecoveryUsesOneCompleteBatchAndKeepsDeltaWriterContract() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(70)
+        let frameID = temporalTestFrameID(70)
+        let objects = (0..<32).map { index in
+            temporalTestMetadata(mapID: mapID, coordinateFrameID: frameID,
+                objectID: temporalTestObjectID(700 + index), at: 100)
+        }
+        let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)], objects: objects))
+        let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let batches = TemporalBatchProjectionRecorder()
+        let batchWriter: TemporalSpatialMemoryService.MetadataBatchWriter = { metadata in
+            await batches.record(metadata)
+            for object in metadata { try await store.upsert(object) }
+        }
+        let service = TemporalSpatialMemoryService(journalRepository: journal,
+            policy: temporalTestPolicy(), metadataProvider: { try await store.snapshot() },
+            metadataWriter: { try await store.upsert($0) }, metadataBatchWriter: batchWriter)
+        let recovered = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(recovered.objects.count, 32)
+        let initialBatches = await batches.objectIDs
+        XCTAssertEqual(initialBatches, [objects.map(\.object.id).sorted()])
+        _ = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+        let cachedBatches = await batches.objectIDs
+        XCTAssertEqual(cachedBatches, initialBatches)
+        _ = try await service.process(TemporalSpatialRecognitionBatch(sequence: 1,
+            observations: [temporalTestNewObservation(mapID: mapID, coordinateFrameID: frameID,
+                objectID: temporalTestObjectID(799), at: 101)], expectedVisibleObjectIDs: []),
+            pose: temporalTestPose(mapID: mapID, coordinateFrameID: frameID,
+                capturedAt: 101, sessionTimestamp: 1, sequence: 1))
+        let afterDelta = await batches.objectIDs
+        XCTAssertEqual(afterDelta, initialBatches, "Normal observations retain their existing single-object writer")
+        let cold = TemporalSpatialMemoryService(journalRepository: journal,
+            policy: temporalTestPolicy(), metadataProvider: { try await store.snapshot() },
+            metadataWriter: { try await store.upsert($0) }, metadataBatchWriter: batchWriter)
+        let restarted = try await cold.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(restarted.objects.count, 33)
+        let restartedBatches = await batches.objectIDs
+        XCTAssertEqual(restartedBatches.count, 2)
+        XCTAssertEqual(restartedBatches.last, restarted.objects.keys.sorted(),
+            "Matching durable metadata still requires one complete downstream projection replay after restart")
+    }
+
+    func testCancelledBatchRecoveryRetainsPendingProjectionAndContinues() async throws {
+        try await exerciseCancelledBatchRecovery(resetWhilePaused: false)
+    }
+
+    func testResetDuringBatchRecoveryDoesNotRepopulateDeletedState() async throws {
+        try await exerciseCancelledBatchRecovery(resetWhilePaused: true)
+    }
+
+    private func exerciseCancelledBatchRecovery(resetWhilePaused: Bool) async throws {
+        executionTimeAllowance = 60
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(71)
+        let frameID = temporalTestFrameID(71)
+        let objectID = temporalTestObjectID(71)
+        let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)]))
+        let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let gate = TemporalBatchRecoveryGate()
+        let batches = TemporalBatchProjectionRecorder()
+        let service = TemporalSpatialMemoryService(journalRepository: journal,
+            policy: temporalTestPolicy(), metadataProvider: { try await store.snapshot() },
+            metadataWriter: { try await store.upsert($0) }, metadataBatchWriter: { metadata in
+                for object in metadata { try await store.upsert(object) }
+                await batches.record(metadata)
+                // Metadata is durable; dependent projection has not returned.
+                await gate.pauseOnce()
+                try Task.checkCancellation()
+            })
+        await store.failAfterNextWrites(1)
+        await assertThrowsServiceError({
+            try await service.process(TemporalSpatialRecognitionBatch(sequence: 1,
+                observations: [temporalTestNewObservation(mapID: mapID, coordinateFrameID: frameID,
+                    objectID: objectID, at: 100)], expectedVisibleObjectIDs: [objectID]),
+                pose: temporalTestPose(mapID: mapID, coordinateFrameID: frameID,
+                    capturedAt: 100, sessionTimestamp: 1, sequence: 1))
+        }, equals: .committedJournalProjectionPending)
+        let recovery = Task {
+            do {
+                let snapshot = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+                await gate.finished()
+                return snapshot
+            } catch {
+                await gate.finished()
+                throw error
+            }
+        }
+        do {
+            guard await gate.waitUntilPausedOrFinished() else {
+                _ = try await recovery.value
+                throw TemporalMetadataStoreError.batchProjectionWasNotReached
+            }
+            recovery.cancel()
+            if resetWhilePaused {
+                await service.reset()
+                try await journal.deleteMap(mapID: mapID)
+                await store.clearObjects()
+            }
+            await gate.resume()
+            do { _ = try await recovery.value; XCTFail("Cancelled batch recovery must not clear pending state") }
+            catch is CancellationError { }
+            let recovered = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+            XCTAssertEqual(recovered.revision, resetWhilePaused ? 0 : 1)
+            let calls = await batches.objectIDs
+            XCTAssertEqual(calls.count, resetWhilePaused ? 1 : 2)
+            let durableObjects = await store.allObjects()
+            XCTAssertEqual(Dictionary(uniqueKeysWithValues: durableObjects.map { ($0.object.id, $0) }), recovered.objects)
+            _ = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+            let repeatedCalls = await batches.objectIDs
+            XCTAssertEqual(repeatedCalls, calls, "Pending clears only after the entire batch writer returns successfully")
+            let next = try await service.process(TemporalSpatialRecognitionBatch(sequence: 2,
+                observations: [], expectedVisibleObjectIDs: []),
+                pose: temporalTestPose(mapID: mapID, coordinateFrameID: frameID,
+                    capturedAt: 101, sessionTimestamp: 2, sequence: 2))
+            guard case .applied(let delta) = next else { throw TemporalMetadataStoreError.batchProjectionWasNotReached }
+            XCTAssertEqual(delta.newRevision, resetWhilePaused ? 1 : 2)
+            let committed = try await journal.recover(mapID: mapID, coordinateFrameID: frameID)
+            let cached = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+            XCTAssertEqual(committed?.snapshot, cached)
+        } catch {
+            recovery.cancel()
+            await gate.resume()
+            _ = try? await recovery.value
+            throw error
+        }
+    }
+
     func testCancellationAfterDurableAppendRecoversAndContinuesOnSameService() async throws {
         try await exerciseCommittedCancellation(pauseAfterAppend: true, resetBeforeReturn: false)
     }
@@ -984,6 +1116,50 @@ private enum TemporalMetadataStoreError: Error, Equatable {
     case injectedFailure
     case injectedPostWriteFailure
     case staleWrite
+    case batchProjectionWasNotReached
+}
+
+private actor TemporalBatchProjectionRecorder {
+    private(set) var objectIDs: [[ObjectID]] = []
+    func record(_ metadata: [SpatialObjectMetadata]) { objectIDs.append(metadata.map(\.object.id).sorted()) }
+}
+
+/// Wait for an actual boundary or an early operation failure, rather than
+/// imposing a per-write scheduler deadline inside the functional regression.
+private actor TemporalBatchRecoveryGate {
+    private var paused: CheckedContinuation<Void, Never>?
+    private var arrival: CheckedContinuation<Bool, Never>?
+    private var used = false
+    private var completed = false
+
+    func pauseOnce() async {
+        guard !used else { return }
+        used = true
+        await withCheckedContinuation { continuation in
+            paused = continuation
+            arrival?.resume(returning: true)
+            arrival = nil
+        }
+    }
+
+    func waitUntilPausedOrFinished() async -> Bool {
+        if paused != nil { return true }
+        if completed { return false }
+        return await withCheckedContinuation { arrival = $0 }
+    }
+
+    func finished() {
+        completed = true
+        arrival?.resume(returning: false)
+        arrival = nil
+    }
+
+    func resume() {
+        used = true
+        paused?.resume()
+        paused = nil
+        finished()
+    }
 }
 
 private func assertThrowsServiceError<T>(
