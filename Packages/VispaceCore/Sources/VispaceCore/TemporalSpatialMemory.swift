@@ -268,6 +268,19 @@ public struct TemporalSpatialObservation: Codable, Hashable, Sendable {
     public let identityDecision: PersistentObjectReidentificationDecision
     public let identitySupport: PersistentObjectIdentitySupport?
 
+    /// The admission boundary can defer one weak observation before batching.
+    /// Reduction repeats this same check; rolling promotion evidence never
+    /// substitutes for the confidence of the current measurement.
+    public var hasSufficientConfidenceForPersistence: Bool {
+        let policy = ConfidencePolicy.default
+        let confidence = metadata.object.confidence
+        return metadata.position.trackingQuality == .normal
+            && policy.grade(for: confidence.semantic) == .high
+            && policy.grade(for: confidence.geometry) == .high
+            && policy.grade(for: confidence.identity) == .high
+            && policy.grade(for: confidence.objectState) == .high
+    }
+
     public init(
         metadata: SpatialObjectMetadata,
         promotionEvidence: ObjectReidentificationPromotionEvidence,
@@ -1120,7 +1133,6 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
     private func validateObservations(
         _ observations: [TemporalSpatialObservation]
     ) throws {
-        let confidencePolicy = ConfidencePolicy.default
         for observation in observations {
             let metadata = observation.metadata
             let object = metadata.object
@@ -1136,11 +1148,7 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
                     actual: metadata.position.coordinateFrameID
                 )
             }
-            guard metadata.position.trackingQuality == .normal,
-                confidencePolicy.grade(for: object.confidence.semantic) == .high,
-                confidencePolicy.grade(for: object.confidence.geometry) == .high,
-                confidencePolicy.grade(for: object.confidence.identity) == .high,
-                confidencePolicy.grade(for: object.confidence.objectState) == .high
+            guard observation.hasSufficientConfidenceForPersistence
             else {
                 throw TemporalSpatialMemoryError.insufficientObservationConfidence(object.id)
             }

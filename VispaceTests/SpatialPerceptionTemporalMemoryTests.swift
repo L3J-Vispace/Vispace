@@ -7,6 +7,130 @@ import simd
 
 @MainActor
 final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
+    func testWeakCurrentObservationDoesNotDiscardHealthyTrackingOrDetectorAbsence() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let identity = ARCaptureIdentity(mapID: MapID(), status: .confirmed)
+        let mapID = try XCTUnwrap(identity.mapID)
+        let store = TemporalControllerMetadataStore(
+            document: SpatialMetadataDocument(
+                maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: identity.coordinateFrameID)]))
+        let journal = TemporalSpatialMemoryJournalRepository(directoryURL: directory)
+        let service = TemporalSpatialMemoryService(
+            journalRepository: journal,
+            metadataProvider: { await store.snapshot() }, metadataWriter: { await store.upsert($0) })
+        let chair = DetectedObject(
+            label: "chair", confidence: 0.95,
+            boundingBox: NormalizedBoundingBox(x: 0.15, y: 0.15, width: 0.25, height: 0.25))
+        let table = DetectedObject(
+            label: "table", confidence: 0.95,
+            boundingBox: NormalizedBoundingBox(x: 0.60, y: 0.15, width: 0.25, height: 0.25))
+        let cup = DetectedObject(
+            label: "cup", confidence: 0.95,
+            boundingBox: NormalizedBoundingBox(x: 0.40, y: 0.60, width: 0.20, height: 0.20))
+        let weakChair = DetectedObject(label: chair.label, confidence: 0.79, boundingBox: chair.boundingBox)
+        let detector = TemporalSequenceObjectDetector(
+            outputs:
+                Array(repeating: [chair, table, cup], count: 3) + [[weakChair, table], [chair, table]])
+        let tracker = TemporalSelectiveConfidenceTracker()
+        let recorder = TemporalCommittedBatchRecorder()
+        let channel = LatestValueChannel<ARFrameSnapshot>()
+        let controller = SpatialPerceptionController(
+            frames: channel.stream,
+            detectorResolution: ObjectDetectorResolution(detector: detector, availability: .available),
+            tracker: tracker, detectorInterval: 0.2, confirmedIdentityProvider: { _ in identity },
+            metadataProvider: { await store.objects() }, metadataWriter: { _ in },
+            temporalMemoryProcessor: { batch, pose in
+                let result = try await service.process(batch, pose: pose)
+                await recorder.record(batch)
+                return result
+            }, processingBudgetProvider: { .normal })
+        controller.activate()
+        defer { controller.deactivate() }
+        let wall = Date().timeIntervalSince1970, uptime = ProcessInfo.processInfo.systemUptime
+        for index in 0..<3 {
+            channel.send(
+                try temporalSnapshot(
+                    identity: identity,
+                    capturedAt: wall + Double(index) * 0.25, timestamp: uptime + Double(index) * 0.25,
+                    includesDepth: true, imageSize: 100, focalLength: 200))
+            try await waitForTemporalDetector(detector, expectedCount: index + 1)
+            await controller.waitForProcessingCompletionForTesting()
+        }
+        let initialObjects = await store.objects()
+        XCTAssertEqual(initialObjects.count, 3)
+        let originalChair = try XCTUnwrap(initialObjects.first { $0.object.semanticLabel == "chair" })
+        let originalTable = try XCTUnwrap(initialObjects.first { $0.object.semanticLabel == "table" })
+        let originalCup = try XCTUnwrap(initialObjects.first { $0.object.semanticLabel == "cup" })
+
+        // The current left tracker gives .95 * .83 = .7885 even though its
+        // rolling promotion and independent continuous tracking still qualify.
+        channel.send(
+            try temporalSnapshot(
+                identity: identity, capturedAt: wall + 0.55,
+                timestamp: uptime + 0.55, includesDepth: true, imageSize: 100, focalLength: 200))
+        await tracker.waitForCalls(3)
+        await controller.waitForProcessingCompletionForTesting()
+        let trackedBatches = await recorder.batches()
+        XCTAssertEqual(trackedBatches.count, 2)
+        let trackingBatch = try XCTUnwrap(trackedBatches.last)
+        XCTAssertEqual(trackingBatch.observations.map(\.metadata.object.id), [originalTable.object.id])
+        XCTAssertEqual(
+            trackingBatch.expectedVisibleObjectIDs, [originalTable.object.id],
+            "A missing tracker result must not count as detector absence")
+        let afterTracking = try await service.recover(
+            mapID: mapID, coordinateFrameID: identity.coordinateFrameID)
+        XCTAssertEqual(afterTracking.metadata(for: originalChair.object.id), originalChair)
+        XCTAssertEqual(afterTracking.metadata(for: originalTable.object.id)?.object.lastSeenAt, wall + 0.55)
+        XCTAssertNil(controller.persistenceFailureMessage)
+        XCTAssertEqual(controller.metrics.lowConfidenceObservationsDeferred, 1)
+
+        // A real detector pass independently proves empty space at the cup's
+        // measured footprint while one current detection remains too weak.
+        var depths = Array(repeating: Float(2), count: 10_000)
+        for y in 0..<45 { for x in 0..<100 { depths[y * 100 + x] = 3 } }
+        let missingCupDepth = ARDepthSnapshot(
+            dimensions: ImageDimensions(width: 100, height: 100),
+            depthMeters: depths, confidence: Array(repeating: ARDepthConfidence.high.rawValue, count: 10_000))
+        channel.send(
+            try temporalSnapshot(
+                identity: identity, capturedAt: wall + 0.8,
+                timestamp: uptime + 0.8, includesDepth: true, rawDepth: missingCupDepth,
+                imageSize: 100, focalLength: 200))
+        try await waitForTemporalDetector(detector, expectedCount: 4)
+        await controller.waitForProcessingCompletionForTesting()
+        let detectedBatches = await recorder.batches()
+        XCTAssertEqual(detectedBatches.count, 3)
+        let detectorBatch = try XCTUnwrap(detectedBatches.last)
+        XCTAssertEqual(detectorBatch.observations.map(\.metadata.object.id), [originalTable.object.id])
+        XCTAssertEqual(
+            Set(detectorBatch.expectedVisibleObjectIDs), [originalTable.object.id, originalCup.object.id])
+        let afterDetector = try await service.recover(
+            mapID: mapID, coordinateFrameID: identity.coordinateFrameID)
+        XCTAssertEqual(afterDetector.metadata(for: originalChair.object.id), originalChair)
+        XCTAssertEqual(afterDetector.metadata(for: originalTable.object.id)?.object.lastSeenAt, wall + 0.8)
+        XCTAssertEqual(afterDetector.lifecycleEvidence(for: originalCup.object.id)?.consecutiveMissCount, 1)
+        XCTAssertNil(controller.persistenceFailureMessage)
+        XCTAssertEqual(controller.metrics.lowConfidenceObservationsDeferred, 2)
+
+        // A later high-confidence measurement resumes the deferred identity.
+        channel.send(
+            try temporalSnapshot(
+                identity: identity, capturedAt: wall + 1.05,
+                timestamp: uptime + 1.05, includesDepth: true, rawDepth: missingCupDepth,
+                imageSize: 100, focalLength: 200))
+        try await waitForTemporalDetector(detector, expectedCount: 5)
+        await controller.waitForProcessingCompletionForTesting()
+        let restored = try await service.recover(mapID: mapID, coordinateFrameID: identity.coordinateFrameID)
+        XCTAssertEqual(restored.metadata(for: originalChair.object.id)?.object.lastSeenAt, wall + 1.05)
+        XCTAssertEqual(restored.objects.count, 3)
+        XCTAssertNil(controller.persistenceFailureMessage)
+        XCTAssertEqual(controller.state, .scanning)
+        let durable = try await journal.recover(mapID: mapID, coordinateFrameID: identity.coordinateFrameID)
+        XCTAssertEqual(restored, durable?.snapshot)
+        await controller.deactivateAndWaitForPendingWork()
+    }
+
     func testNewlyStoredObjectKeepsOneIdentityAcrossRollingObservationsAndMovement() async throws {
         executionTimeAllowance = 60
         try await withNewObjectTemporalHarness(includesLandmark: true) { harness in
@@ -1382,9 +1506,11 @@ private func temporalSnapshot(
     includesDepth: Bool,
     rawDepth: ARDepthSnapshot? = nil,
     smoothedDepth: ARDepthSnapshot? = nil,
-    cameraTransform: simd_float4x4 = matrix_identity_float4x4
+    cameraTransform: simd_float4x4 = matrix_identity_float4x4,
+    imageSize: Int = 10,
+    focalLength: Float = 100
 ) throws -> ARFrameSnapshot {
-    let dimensions = ImageDimensions(width: 10, height: 10)
+    let dimensions = ImageDimensions(width: imageSize, height: imageSize)
     var pixelBuffer: CVPixelBuffer?
     let status = CVPixelBufferCreate(
         kCFAllocatorDefault,
@@ -1419,9 +1545,9 @@ private func temporalSnapshot(
         capturedImage: ImmutablePixelBuffer(pixelBuffer: pixelBuffer),
         cameraIntrinsics: Matrix3x3Snapshot(
             simd_float3x3(
-                SIMD3<Float>(100, 0, 0),
-                SIMD3<Float>(0, 100, 0),
-                SIMD3<Float>(5, 5, 1)
+                SIMD3<Float>(focalLength, 0, 0),
+                SIMD3<Float>(0, focalLength, 0),
+                SIMD3<Float>(Float(imageSize) / 2, Float(imageSize) / 2, 1)
             )
         ),
         cameraImageDimensions: dimensions,
@@ -1430,10 +1556,10 @@ private func temporalSnapshot(
             ? rawDepth
                 ?? ARDepthSnapshot(
                     dimensions: dimensions,
-                    depthMeters: Array(repeating: 2, count: 100),
+                    depthMeters: Array(repeating: 2, count: imageSize * imageSize),
                     confidence: Array(
                         repeating: ARDepthConfidence.high.rawValue,
-                        count: 100
+                        count: imageSize * imageSize
                     )
                 )
             : nil,
@@ -1450,4 +1576,29 @@ private func temporalDepth(
         depthMeters: Array(repeating: meters, count: 100),
         confidence: Array(repeating: confidence.rawValue, count: 100)
     )
+}
+
+/// Predicts every detector association, then drops only the cup on tracker
+/// cadence and lowers only the chair's tracker score. No ID itself is proof.
+private actor TemporalSelectiveConfidenceTracker: ObjectTracking {
+    private var seeds: [TrackingSeed] = []
+    private var calls = 0
+    private var callWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    func seed(_ seeds: [TrackingSeed]) { self.seeds = seeds }
+    func track(in frame: ARFrameSnapshot) async throws -> [TrackedObject] {
+        calls += 1
+        let ready = callWaiters.filter { $0.0 <= calls }
+        callWaiters.removeAll { $0.0 <= calls }
+        for waiter in ready { waiter.1.resume() }
+        return seeds.filter { calls != 3 || $0.boundingBox.y < 0.5 }.map {
+            TrackedObject(
+                id: $0.id, confidence: $0.boundingBox.x < 0.3 ? 0.83 : 0.95,
+                boundingBox: $0.boundingBox)
+        }
+    }
+    func waitForCalls(_ count: Int) async {
+        guard calls < count else { return }
+        await withCheckedContinuation { callWaiters.append((count, $0)) }
+    }
+    func reset() { seeds = [] }
 }

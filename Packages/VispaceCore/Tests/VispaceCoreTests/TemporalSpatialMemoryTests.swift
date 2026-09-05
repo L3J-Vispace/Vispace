@@ -6,6 +6,61 @@ final class TemporalSpatialMemoryTests: XCTestCase {
     private let map = MapID(rawValue: testUUID(81_001))
     private let frame = CoordinateFrameID(rawValue: testUUID(81_002))
 
+    func testCurrentConfidenceAdmissionMatchesAtomicReducerGateAcrossEveryRequiredDimension() throws {
+        let weakID = objectID(81_100), healthyID = objectID(81_101)
+        let cases: [(ConfidenceVector, SpatialTrackingQuality, Bool)] = [
+            (vector(semantic: 0.95 * 0.83), .normal, false),
+            (vector(geometry: 0.7999), .normal, false),
+            (vector(identity: 0.7999), .normal, false),
+            (vector(objectState: 0.7999), .normal, false),
+            (vector(), .limited, false),
+            (vector(), .unavailable, false),
+            (vector(semantic: 0.8, geometry: 0.8, identity: 0.8, objectState: 0.8), .normal, true),
+            // The unchanged Core contract does not invent additional gates on
+            // unrelated place/relation scores or replace pose tracking quality.
+            (vector(tracking: 0, place: 0, relation: 0), .normal, true),
+        ]
+        for (confidence, tracking, admitted) in cases {
+            var coordinator = makeCoordinator()
+            _ = try coordinator.apply(
+                update(
+                    revision: 0, sequence: 1, at: 100,
+                    observations: [
+                        newObservation(id: weakID, at: 100), newObservation(id: healthyID, at: 100),
+                    ]))
+            let before = coordinator.snapshot
+            let base = existingObservation(id: weakID, at: 100.4)
+            var object = base.metadata.object
+            object.confidence = confidence
+            let candidate = try TemporalSpatialObservation(
+                metadata: SpatialObjectMetadata(
+                    mapID: map, object: object,
+                    position: FramedPosition(
+                        coordinateFrameID: frame, value: base.metadata.position.value,
+                        observedAt: 100.4, trackingQuality: tracking, uncertainty: .highConfidenceDepth)),
+                promotionEvidence: base.promotionEvidence, identityDecision: base.identityDecision)
+            let healthy = existingObservation(id: healthyID, at: 100.4)
+            XCTAssertEqual(candidate.hasSufficientConfidenceForPersistence, admitted)
+            let mixed = update(revision: 1, sequence: 2, at: 100.4, observations: [candidate, healthy])
+            if admitted {
+                _ = try coordinator.apply(mixed)
+                XCTAssertEqual(coordinator.snapshot.metadata(for: weakID)?.object.lastSeenAt, 100.4)
+            } else {
+                XCTAssertThrowsError(try coordinator.apply(mixed)) {
+                    XCTAssertEqual(
+                        $0 as? TemporalSpatialMemoryError, .insufficientObservationConfidence(weakID))
+                }
+                XCTAssertEqual(coordinator.snapshot, before, "Core must retain atomic fail-closed validation")
+                _ = try coordinator.apply(
+                    update(
+                        revision: 1, sequence: 2, at: 100.4,
+                        observations: [healthy]))
+                XCTAssertEqual(coordinator.snapshot.metadata(for: weakID), before.metadata(for: weakID))
+            }
+            XCTAssertEqual(coordinator.snapshot.metadata(for: healthyID)?.object.lastSeenAt, 100.4)
+        }
+    }
+
     func testCurrentCaptureAuthorityContinuesBeyond4096SessionsWithoutRetiredHistory() throws {
         var coordinator = makeCoordinator()
         for epoch in 1...4_100 {

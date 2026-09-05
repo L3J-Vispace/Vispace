@@ -43,6 +43,7 @@ public struct SpatialPerceptionMetrics: Equatable, Sendable {
     public var framesSuperseded: UInt64 = 0
     public var staleResultsRejected: UInt64 = 0
     public var depthFailures: UInt64 = 0
+    public var lowConfidenceObservationsDeferred: UInt64 = 0
     public var promotedObjects: UInt64 = 0
     public var reidentifiedObjects: UInt64 = 0
     public var genuinelyNewObjects: UInt64 = 0
@@ -759,8 +760,13 @@ public final class SpatialPerceptionController: ObservableObject {
         if !duplicateIDs.isEmpty {
             metrics.ambiguousReidentifications &+= UInt64(duplicateIDs.count)
         }
-        let uniqueResolved = resolved.filter {
-            !duplicateIDs.contains($0.observation.metadata.object.id)
+        let uniqueResolved = resolved.filter { value in
+            guard !duplicateIDs.contains(value.observation.metadata.object.id) else { return false }
+            guard value.observation.hasSufficientConfidenceForPersistence else {
+                metrics.lowConfidenceObservationsDeferred &+= 1
+                return false
+            }
+            return true
         }
         let observedObjectIDs = Set(
             uniqueResolved.map { $0.observation.metadata.object.id }
