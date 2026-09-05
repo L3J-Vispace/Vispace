@@ -12,7 +12,7 @@
 
 `capturedAt`, `firstSeenAt`, `lastSeenAt`, `stateUpdatedAt`은 실제 관측 당시의 달력 시간을 보존한다. 기기 시간이 정상으로 돌아오면 `lastSeenAt < firstSeenAt`이 될 수 있으며, 날짜를 미래로 올리거나 과거 기록을 다시 쓰지 않는다. v2 물체의 양의 `temporalRevision`이 저장 순서를 결정하므로, 실제 날짜가 이전 값보다 작아도 최신 관측을 저장할 수 있다. 같은 revision의 다른 관측이나 이전 revision은 저장소와 delta reducer에서 거절한다.
 
-각 capture segment는 영구 journal의 clock epoch에 연결된다. 같은 epoch 안에서는 AR 세션의 단조 증가 시간이 엄격히 증가해야 한다. 새 segment는 다음 epoch를 사용한다. 실제 앱에서는 현재 실행 중인 ARSession의 attachment/run token, confirmed segment/map/frame을 외부 capture authority가 검증해야 epoch를 만들 수 있다. 서비스 진입, 비동기 복구 이후, journal의 실제 commit 직전에 같은 권한을 다시 확인한다. 이전 segment의 지연 결과는 재시작 뒤에도 현재 권한과 일치하지 않아 거절한다. journal에 수락된 권한과 epoch ordinal을 남기므로 과거 segment ID를 무한히 모으지 않아도 된다.
+각 capture segment는 영구 journal의 clock epoch에 연결된다. 같은 epoch 안에서는 AR 세션의 단조 증가 시간이 엄격히 증가해야 한다. 새 segment는 다음 epoch를 사용한다. 실제 앱에서는 현재 실행 중인 ARSession의 attachment/run token, confirmed segment/map/frame을 외부 capture authority가 검증해야 epoch를 만들 수 있다. 서비스 진입, 비동기 복구 이후, journal이 commit 작업을 수락하는 시점에 같은 권한을 다시 확인한다. 이 최종 확인 이후 시작한 동기 인코딩·원자적 파일 교체는 세션 권한이 해제되어도 완료될 수 있다. journal actor가 이후 epoch의 쓰기를 순서대로 처리하며 revision 검사가 이전 값의 덮어쓰기를 막는다. 장소 삭제는 이미 수락한 저장 작업의 완료를 기다린다. 최종 확인 전에 권한을 잃은 이전 segment의 지연 결과는 재시작 뒤에도 거절한다. journal에 수락된 권한과 epoch ordinal을 남기므로 과거 segment ID를 무한히 모으지 않아도 된다.
 
 미관측 유예와 이동 증거 간격은 달력 시간이 아닌 세션 경과 시간으로 계산한다. epoch 전환이나 달력 역행 시 기존 미관측·이동 증거를 초기화하고 새 증거부터 보수적으로 누적한다. 인식 pipeline도 달력 역행 시 진행 중 promotion 창을 초기화한다. 세션 전환으로 무효화된 결과는 저장 장애 배너를 만들지 않고 취소한다.
 
