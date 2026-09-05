@@ -6,6 +6,154 @@ final class TemporalSpatialMemoryTests: XCTestCase {
     private let map = MapID(rawValue: testUUID(81_001))
     private let frame = CoordinateFrameID(rawValue: testUUID(81_002))
 
+    func testLegacyFutureDatesMigrateWithoutRewritingObservationDates() throws {
+        let id = objectID(81_140)
+        let value = metadata(id: id, at: 1_000)
+        let futureObject = try SpatialObject(
+            id: id, semanticLabel: value.object.semanticLabel,
+            position: value.object.position, bounds: value.object.bounds,
+            certainty: .confirmed, confidence: value.object.confidence,
+            firstSeenAt: 999, lastSeenAt: 1_000
+        )
+        let durable = try SpatialObjectMetadata(mapID: map, object: futureObject, position: value.position)
+        var coordinator = try TemporalSpatialMemoryCoordinator(
+            mapID: map, coordinateFrameID: frame, restoringDurableObjects: [durable], policy: testPolicy()
+        )
+        let segment = CaptureSegmentID()
+        let delta = try applied(coordinator.apply(update(
+            revision: 0, sequence: 1, at: 100,
+            observations: [existingObservation(id: id, at: 100)],
+            clock: TemporalSpatialClock(epoch: 1, captureSegmentID: segment, monotonicTimestamp: 10)
+        )))
+        let object = try XCTUnwrap(coordinator.snapshot.metadata(for: id)?.object)
+        XCTAssertEqual(object.firstSeenAt, 999)
+        XCTAssertEqual(object.lastSeenAt, 100)
+        XCTAssertEqual(object.stateUpdatedAt, 100)
+        XCTAssertEqual(object.temporalRevision, 1)
+        XCTAssertTrue(delta.changes.contains(.clockEpochStarted(epoch: 1, at: 100)))
+        let encoded = try JSONEncoder().encode(coordinator.snapshot)
+        let decoded = try JSONDecoder().decode(TemporalSpatialMemorySnapshot.self, from: encoded)
+        XCTAssertEqual(decoded, coordinator.snapshot)
+        XCTAssertNoThrow(try TemporalSpatialMemoryCoordinator(restoring: decoded, policy: testPolicy()))
+
+        for index in 1...4 {
+            _ = try coordinator.apply(update(
+                revision: UInt64(index), sequence: UInt64(index + 1), at: 100 + Double(index),
+                expected: [id],
+                clock: TemporalSpatialClock(epoch: 1, captureSegmentID: segment, monotonicTimestamp: 10 + Double(index))
+            ))
+        }
+        XCTAssertEqual(coordinator.snapshot.metadata(for: id)?.object.presence, .removed)
+        XCTAssertEqual(coordinator.snapshot.metadata(for: id)?.object.firstSeenAt, 999)
+        XCTAssertEqual(coordinator.snapshot.metadata(for: id)?.object.lastSeenAt, 100)
+        XCTAssertEqual(coordinator.snapshot.metadata(for: id)?.object.stateUpdatedAt, 104)
+        XCTAssertNoThrow(try JSONDecoder().decode(
+            TemporalSpatialMemorySnapshot.self, from: JSONEncoder().encode(coordinator.snapshot)
+        ))
+    }
+
+    func testCalendarJumpsCannotReplaceElapsedMissEvidence() throws {
+        let id = objectID(81_141)
+        let segment = CaptureSegmentID()
+        var coordinator = makeCoordinator()
+        _ = try coordinator.apply(update(
+            revision: 0, sequence: 1, at: 100, observations: [newObservation(id: id, at: 100)],
+            clock: TemporalSpatialClock(epoch: 1, captureSegmentID: segment, monotonicTimestamp: 10)
+        ))
+        for (index, wall, elapsed) in [(1, 5_000.0, 11.0), (2, 9_000.0, 11.1)] {
+            _ = try coordinator.apply(update(
+                revision: UInt64(index), sequence: UInt64(index + 1), at: wall, expected: [id],
+                clock: TemporalSpatialClock(epoch: 1, captureSegmentID: segment, monotonicTimestamp: elapsed)
+            ))
+        }
+        XCTAssertEqual(coordinator.snapshot.metadata(for: id)?.object.presence, .visible)
+        _ = try coordinator.apply(update(
+            revision: 3, sequence: 4, at: 102, expected: [id],
+            clock: TemporalSpatialClock(epoch: 1, captureSegmentID: segment, monotonicTimestamp: 12)
+        ))
+        XCTAssertEqual(coordinator.snapshot.lifecycleEvidence(for: id)?.consecutiveMissCount, 1)
+        _ = try coordinator.apply(update(
+            revision: 4, sequence: 5, at: 103, expected: [id],
+            clock: TemporalSpatialClock(epoch: 1, captureSegmentID: segment, monotonicTimestamp: 13)
+        ))
+        XCTAssertEqual(coordinator.snapshot.metadata(for: id)?.object.presence, .notVisible)
+    }
+
+    func testRetiredCaptureEpochCannotReturnAfterRestartAndEvidenceResets() throws {
+        let firstSegment = CaptureSegmentID()
+        let nextSegment = CaptureSegmentID()
+        let id = objectID(81_142)
+        var coordinator = makeCoordinator()
+        _ = try coordinator.apply(update(
+            revision: 0, sequence: 1, at: 1_000, observations: [newObservation(id: id, at: 1_000)],
+            clock: TemporalSpatialClock(epoch: 1, captureSegmentID: firstSegment, monotonicTimestamp: 500)
+        ))
+        _ = try coordinator.apply(update(
+            revision: 1, sequence: 2, at: 1_001, expected: [id],
+            clock: TemporalSpatialClock(epoch: 1, captureSegmentID: firstSegment, monotonicTimestamp: 501)
+        ))
+        _ = try coordinator.apply(update(
+            revision: 2, sequence: 3, at: 100, expected: [id],
+            clock: TemporalSpatialClock(epoch: 2, captureSegmentID: nextSegment, monotonicTimestamp: 1)
+        ))
+        XCTAssertEqual(coordinator.snapshot.lifecycleEvidence(for: id)?.consecutiveMissCount, 1)
+        let restored = try JSONDecoder().decode(
+            TemporalSpatialMemorySnapshot.self, from: JSONEncoder().encode(coordinator.snapshot)
+        )
+        var restarted = try TemporalSpatialMemoryCoordinator(restoring: restored, policy: testPolicy())
+        XCTAssertThrowsError(try restarted.apply(update(
+            revision: 3, sequence: 4, at: 1_002,
+            clock: TemporalSpatialClock(epoch: 3, captureSegmentID: firstSegment, monotonicTimestamp: 502)
+        ))) { error in
+            XCTAssertEqual(error as? TemporalSpatialMemoryError, .clockEpochConflict)
+        }
+        XCTAssertEqual(restarted.snapshot, restored)
+        XCTAssertThrowsError(try restarted.apply(update(revision: 3, sequence: 4, at: 101)))
+        XCTAssertEqual(restarted.snapshot, restored)
+    }
+
+    func testImportedRevisionSeedsAboveItsDurableHighWaterMark() throws {
+        let id = objectID(81_143)
+        let original = metadata(id: id, at: 1_000)
+        var object = original.object
+        object.temporalRevision = 500
+        let durable = try SpatialObjectMetadata(mapID: map, object: object, position: original.position)
+        var coordinator = try TemporalSpatialMemoryCoordinator(
+            mapID: map, coordinateFrameID: frame, restoringDurableObjects: [durable], policy: testPolicy()
+        )
+        XCTAssertEqual(coordinator.snapshot.revision, 500)
+        _ = try coordinator.apply(update(
+            revision: 500, sequence: 501, at: 100,
+            observations: [existingObservation(id: id, at: 100)],
+            clock: TemporalSpatialClock(epoch: 1, captureSegmentID: CaptureSegmentID(), monotonicTimestamp: 1)
+        ))
+        XCTAssertEqual(coordinator.snapshot.metadata(for: id)?.object.temporalRevision, 501)
+    }
+
+    func testVersionOneSnapshotMigratesAndVersionTwoDeltasRemainReducerCompatible() throws {
+        let id = objectID(81_144)
+        var coordinator = makeCoordinator()
+        let legacyDelta = try applied(coordinator.apply(update(
+            revision: 0, sequence: 1, at: 1_000, observations: [newObservation(id: id, at: 1_000)]
+        )))
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(coordinator.snapshot)) as? [String: Any])
+        json["schemaVersion"] = 1
+        json.removeValue(forKey: "latestClock")
+        json.removeValue(forKey: "retiredCaptureSegmentIDs")
+        let migrated = try JSONDecoder().decode(TemporalSpatialMemorySnapshot.self, from: JSONSerialization.data(withJSONObject: json))
+        var restarted = try TemporalSpatialMemoryCoordinator(restoring: migrated, policy: testPolicy())
+        let delta = try applied(restarted.apply(update(
+            revision: 1, sequence: 2, at: 100, observations: [existingObservation(id: id, at: 100)],
+            clock: TemporalSpatialClock(epoch: 1, captureSegmentID: CaptureSegmentID(), monotonicTimestamp: 1)
+        )))
+        var reducer = SpatialDeltaReducer()
+        _ = try reducer.apply(legacyDelta.spatialDelta)
+        _ = try reducer.apply(delta.spatialDelta)
+        XCTAssertEqual(reducer.snapshot.confirmedObjects[id], restarted.snapshot.metadata(for: id)?.object)
+        XCTAssertEqual(reducer.snapshot.confirmedObjects[id]?.lastSeenAt, 100)
+        XCTAssertEqual(reducer.snapshot.confirmedObjects[id]?.temporalRevision, 2)
+    }
+
     func testRepeatedMissesAdvanceLifecycleAndPreserveLastSeenLocationAndTime() throws {
         let id = objectID(81_101)
         var coordinator = makeCoordinator()
@@ -905,7 +1053,8 @@ final class TemporalSpatialMemoryTests: XCTestCase {
         at timestamp: TimeInterval,
         observations: [TemporalSpatialObservation] = [],
         expected: [ObjectID] = [],
-        idNumber: Int? = nil
+        idNumber: Int? = nil,
+        clock: TemporalSpatialClock? = nil
     ) -> TemporalSpatialUpdate {
         try! TemporalSpatialUpdate(
             id: deltaID(idNumber ?? (Int(sequence) + 81_500)),
@@ -915,7 +1064,8 @@ final class TemporalSpatialMemoryTests: XCTestCase {
             mapID: map,
             coordinateFrameID: frame,
             observations: observations,
-            expectedVisibleObjectIDs: expected
+            expectedVisibleObjectIDs: expected,
+            clock: clock
         )
     }
 

@@ -152,6 +152,14 @@ public actor TemporalSpatialMemoryService {
                 restoringDurableObjects: durableObjects,
                 policy: policy
             )
+            // A portable import contains checkpoint metadata but intentionally
+            // omits derived journals/relations. Rebuild those projections from
+            // the validated seed without inventing observation evidence.
+            try await reconcile(
+                snapshot: coordinator.snapshot,
+                durableObjects: durableObjects,
+                generation: generation
+            )
         }
         try validateGeneration(generation)
         coordinators[key] = coordinator
@@ -180,15 +188,32 @@ public actor TemporalSpatialMemoryService {
             throw TemporalSpatialMemoryServiceError.missingMappedIdentity
         }
 
+        let previousClock = current.snapshot.latestClock
+        let epoch: UInt64
+        if let previousClock, previousClock.captureSegmentID == pose.segmentID {
+            epoch = previousClock.epoch
+        } else {
+            let (nextEpoch, overflow) = (previousClock?.epoch ?? 0).addingReportingOverflow(1)
+            guard !overflow else { throw TemporalSpatialMemoryError.invalidClock }
+            epoch = nextEpoch
+        }
+        let (nextSequence, sequenceOverflow) = (current.snapshot.latestSequence ?? 0)
+            .addingReportingOverflow(1)
+        guard !sequenceOverflow else { throw TemporalSpatialMemoryError.revisionOverflow }
+        let clock = try TemporalSpatialClock(
+            epoch: epoch, captureSegmentID: pose.segmentID, monotonicTimestamp: pose.timestamp
+        )
+
         let update = try TemporalSpatialUpdate(
             id: batch.id,
             baseRevision: current.snapshot.revision,
-            sequence: batch.sequence,
+            sequence: max(nextSequence, batch.sequence),
             timestamp: pose.capturedAt,
             mapID: mapID,
             coordinateFrameID: pose.coordinateFrameID,
             observations: batch.observations,
-            expectedVisibleObjectIDs: batch.expectedVisibleObjectIDs
+            expectedVisibleObjectIDs: batch.expectedVisibleObjectIDs,
+            clock: clock
         )
         var next = current
         let application = try next.apply(update)
@@ -348,10 +373,14 @@ public actor TemporalSpatialMemoryService {
                     mapID: durable.mapID, object: comparableObject, position: durable.position
                 )
                 if comparableDurable != journalMetadata {
-                    guard
-                        journalMetadata.object.stateUpdatedAt
-                            > durable.object.stateUpdatedAt
-                    else {
+                    let newer: Bool
+                    switch (journalMetadata.object.temporalRevision, durable.object.temporalRevision) {
+                    case (.some(let incoming), .some(let existing)): newer = incoming > existing
+                    case (.some, .none): newer = true
+                    case (.none, .some): newer = false
+                    case (.none, .none): newer = journalMetadata.object.stateUpdatedAt > durable.object.stateUpdatedAt
+                    }
+                    guard newer else {
                         throw
                             TemporalSpatialMemoryServiceError
                             .durableMetadataAheadOfJournal(objectID)

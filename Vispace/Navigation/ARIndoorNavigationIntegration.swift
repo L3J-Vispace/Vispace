@@ -218,7 +218,8 @@ public struct ARIndoorNavigationTargetAdapter: Sendable {
 
     public func resolve(
         metadata: SpatialObjectMetadata,
-        currentIdentity: ARCaptureIdentity
+        currentIdentity: ARCaptureIdentity,
+        now: TimeInterval = Date().timeIntervalSince1970
     ) -> ARIndoorNavigationTargetResolution {
         guard currentIdentity.status == .confirmed else {
             return .invalid(.captureNotConfirmed)
@@ -230,6 +231,10 @@ public struct ARIndoorNavigationTargetAdapter: Sendable {
             metadata.position.coordinateFrameID == currentIdentity.coordinateFrameID
         else {
             return .invalid(.coordinateContextMismatch)
+        }
+        guard now.isFinite, now >= 0, metadata.position.observedAt <= now,
+            metadata.object.lastSeenAt <= now, metadata.object.stateUpdatedAt <= now else {
+            return .invalid(.targetStale)
         }
         return .ready(metadata)
     }
@@ -250,7 +255,11 @@ public struct ARIndoorNavigationTargetAdapter: Sendable {
             groundedTarget.resolvedAt.isFinite,
             groundedTarget.resolvedAt >= 0,
             now - groundedTarget.resolvedAt <= maximumGroundedTargetAge,
-            groundedTarget.resolvedAt - now <= maximumFutureTimestampSkew
+            groundedTarget.resolvedAt - now <= maximumFutureTimestampSkew,
+            groundedTarget.currentFramePosition.observedAt <= now,
+            sourceMetadata.position.observedAt <= now,
+            sourceMetadata.object.lastSeenAt <= now,
+            sourceMetadata.object.stateUpdatedAt <= now
         else {
             return .invalid(.targetStale)
         }
@@ -316,7 +325,8 @@ public struct ARIndoorNavigationTargetAdapter: Sendable {
                 firstSeenAt: original.firstSeenAt,
                 lastSeenAt: original.lastSeenAt,
                 stateUpdatedAt: original.stateUpdatedAt,
-                displayName: original.displayName
+                displayName: original.displayName,
+                temporalRevision: original.temporalRevision
             ),
             let transformedMetadata = try? SpatialObjectMetadata(
                 mapID: currentMapID,
@@ -1153,7 +1163,7 @@ public final class IndoorNavigationController: ObservableObject {
                     current.object == metadata.object
                 else { return .invalid(.searchTargetMismatch) }
             }
-            return targetAdapter.resolve(metadata: metadata, currentIdentity: identity)
+            return targetAdapter.resolve(metadata: metadata, currentIdentity: identity, now: nowProvider())
         case .grounded(let target, let suppliedMetadata):
             let metadata: SpatialObjectMetadata?
             if let sourceMetadataProvider {

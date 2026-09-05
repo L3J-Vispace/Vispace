@@ -3,6 +3,28 @@ import XCTest
 @testable import VispaceCore
 
 final class SpatialObjectQuerySearchTests: XCTestCase {
+    func testFutureObservationAndStateDatesCannotGroundOrGainJustSeenRecency() throws {
+        let engine = DeterministicSpatialObjectSearchEngine()
+        for observedAt in [90.0, 110.0] {
+            let source = try makeMetadata(id: objectID(50_099), mapID: currentMapID,
+                frameID: currentFrameID, label: "chair", lastSeenAt: observedAt,
+                uncertainty: .highConfidenceDepth)
+            var object = source.object
+            object.stateUpdatedAt = 110
+            let metadata = try SpatialObjectMetadata(mapID: source.mapID, object: object, position: source.position)
+            let context = try SpatialObjectSearchContext(currentMapID: currentMapID, now: 100)
+            let result = engine.search(utterance: "chair", records: [record(metadata)], context: context)
+            XCTAssertEqual(result.status, .lowConfidence)
+            XCTAssertTrue(result.issues.contains(.observationTimeInFuture))
+            XCTAssertNil(result.groundedPosition)
+            XCTAssertEqual(result.candidates.first?.record.metadata, metadata)
+            XCTAssertEqual(result.candidates.first?.secondsSinceLastSeen, 100 - observedAt)
+            let chosen = engine.select(record: record(metadata), route: result.route, context: context)
+            XCTAssertEqual(chosen.status, .lowConfidence)
+            XCTAssertNil(chosen.selectedCandidate)
+        }
+    }
+
     private let currentMapID = MapID(rawValue: testUUID(50_001))
     private let otherMapID = MapID(rawValue: testUUID(50_002))
     private let currentFrameID = CoordinateFrameID(rawValue: testUUID(50_003))

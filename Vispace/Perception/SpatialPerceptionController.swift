@@ -136,6 +136,7 @@ public final class SpatialPerceptionController: ObservableObject {
     private var temporalIdentityByPromotedObjectID: [ObjectID: TemporalIdentityResolution] = [:]
     private var latestTemporalMetadataByObjectID: [ObjectID: SpatialObjectMetadata] = [:]
     private var lastTemporalSequenceNumber: UInt64?
+    private var lastCalendarSample: (wall: TimeInterval, monotonic: TimeInterval)?
 
     public convenience init(
         frames: AsyncStream<ARFrameSnapshot>,
@@ -318,6 +319,16 @@ public final class SpatialPerceptionController: ObservableObject {
             resetPipeline(incrementGeneration: true)
             activeFrameToken = frame.pose.sessionToken
         }
+        if let lastCalendarSample, frame.pose.timestamp > lastCalendarSample.monotonic,
+            frame.pose.capturedAt < lastCalendarSample.wall
+        {
+            // Promotion windows must contain actual observations from one
+            // uninterrupted calendar interval. Start fresh evidence after a
+            // system-clock correction; never shift or fabricate their dates.
+            resetPipeline(incrementGeneration: true)
+            activeFrameToken = frame.pose.sessionToken
+        }
+        lastCalendarSample = (frame.pose.capturedAt, frame.pose.timestamp)
         state = identity.mapID == nil ? .waitingForMap : .scanning
 
         if let lastResourceAcceptedTimestamp,
@@ -986,19 +997,16 @@ public final class SpatialPerceptionController: ObservableObject {
     private func nextTemporalSequence(
         for capturedAt: TimeInterval
     ) throws -> UInt64 {
-        let scaled = capturedAt * 1_000_000
-        guard scaled.isFinite, scaled >= 0, scaled < Double(UInt64.max) else {
+        guard capturedAt.isFinite, capturedAt >= 0 else {
             throw TemporalMemoryPipelineError.invalidCaptureTime
         }
-        let wallClockSequence = UInt64(scaled.rounded(.down))
-        guard let lastTemporalSequenceNumber else {
-            return wallClockSequence
-        }
-        let (next, overflow) = lastTemporalSequenceNumber.addingReportingOverflow(1)
+        // The service continues the durable journal sequence across launches;
+        // this local admission counter never derives ordering from calendar time.
+        let (next, overflow) = (lastTemporalSequenceNumber ?? 0).addingReportingOverflow(1)
         guard !overflow else {
             throw TemporalMemoryPipelineError.sequenceOverflow
         }
-        return max(wallClockSequence, next)
+        return next
     }
 
     private func removeTerminalCoverageObjects(
@@ -1357,6 +1365,7 @@ public final class SpatialPerceptionController: ObservableObject {
         activeTracks.removeAll(keepingCapacity: false)
         lastDetectorTimestamp = nil
         lastResourceAcceptedTimestamp = nil
+        lastCalendarSample = nil
     }
 
     private func cancelProcessingTasks() {

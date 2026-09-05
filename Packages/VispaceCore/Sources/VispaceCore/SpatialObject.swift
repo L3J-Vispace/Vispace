@@ -4,6 +4,7 @@ public enum SpatialObjectError: Error, Equatable, Sendable {
     case emptySemanticLabel
     case invalidTimestamp
     case invalidDisplayName
+    case invalidTemporalRevision
 }
 
 public enum ObjectCertainty: String, Codable, Hashable, Sendable {
@@ -35,6 +36,7 @@ public struct SpatialObject: Codable, Hashable, Sendable {
     public var stateUpdatedAt: TimeInterval
     /// User annotation; never replaces the detector's semantic class.
     public private(set) var displayName: String?
+    public var temporalRevision: UInt64?
     public var displayLabel: String { displayName ?? semanticLabel }
 
     public init(
@@ -49,16 +51,21 @@ public struct SpatialObject: Codable, Hashable, Sendable {
         firstSeenAt: TimeInterval,
         lastSeenAt: TimeInterval,
         stateUpdatedAt: TimeInterval? = nil,
-        displayName: String? = nil
+        displayName: String? = nil,
+        temporalRevision: UInt64? = nil
     ) throws {
         let normalizedLabel = semanticLabel.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedStateUpdatedAt = stateUpdatedAt ?? lastSeenAt
         guard !normalizedLabel.isEmpty else {
             throw SpatialObjectError.emptySemanticLabel
         }
+        guard temporalRevision == nil || temporalRevision! > 0 else {
+            throw SpatialObjectError.invalidTemporalRevision
+        }
         guard firstSeenAt.isFinite, firstSeenAt >= 0,
-            lastSeenAt.isFinite, lastSeenAt >= firstSeenAt,
-            resolvedStateUpdatedAt.isFinite, resolvedStateUpdatedAt >= lastSeenAt
+            lastSeenAt.isFinite, lastSeenAt >= 0,
+            resolvedStateUpdatedAt.isFinite, resolvedStateUpdatedAt >= 0,
+            temporalRevision != nil || (lastSeenAt >= firstSeenAt && resolvedStateUpdatedAt >= lastSeenAt)
         else {
             throw SpatialObjectError.invalidTimestamp
         }
@@ -75,6 +82,7 @@ public struct SpatialObject: Codable, Hashable, Sendable {
         self.lastSeenAt = lastSeenAt
         self.stateUpdatedAt = resolvedStateUpdatedAt
         self.displayName = nil
+        self.temporalRevision = temporalRevision
         try setDisplayName(displayName)
     }
 
@@ -101,6 +109,7 @@ public struct SpatialObject: Codable, Hashable, Sendable {
         case lastSeenAt
         case stateUpdatedAt
         case displayName
+        case temporalRevision
     }
 
     public init(from decoder: Decoder) throws {
@@ -118,7 +127,8 @@ public struct SpatialObject: Codable, Hashable, Sendable {
                 firstSeenAt: container.decode(TimeInterval.self, forKey: .firstSeenAt),
                 lastSeenAt: container.decode(TimeInterval.self, forKey: .lastSeenAt),
                 stateUpdatedAt: container.decode(TimeInterval.self, forKey: .stateUpdatedAt),
-                displayName: container.decodeIfPresent(String.self, forKey: .displayName)
+                displayName: container.decodeIfPresent(String.self, forKey: .displayName),
+                temporalRevision: container.decodeIfPresent(UInt64.self, forKey: .temporalRevision)
             )
         } catch let error as DecodingError {
             throw error
@@ -145,6 +155,7 @@ public struct SpatialObject: Codable, Hashable, Sendable {
         try container.encode(lastSeenAt, forKey: .lastSeenAt)
         try container.encode(stateUpdatedAt, forKey: .stateUpdatedAt)
         try container.encodeIfPresent(displayName, forKey: .displayName)
+        try container.encodeIfPresent(temporalRevision, forKey: .temporalRevision)
     }
 }
 

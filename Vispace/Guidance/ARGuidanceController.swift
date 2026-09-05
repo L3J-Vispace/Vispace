@@ -283,6 +283,11 @@ public final class ARGuidanceController: ObservableObject {
         let now = nowProvider()
         return now.isFinite && now >= 0 && now - target.resolvedAt <= maximumTargetAge
             && target.resolvedAt - now <= 0.25
+            && target.position.observedAt <= now
+            && (target.sourceMetadata.map {
+                $0.position.observedAt <= now && $0.object.lastSeenAt <= now
+                    && $0.object.stateUpdatedAt <= now
+            } ?? true)
     }
 
     private func invalidateTarget() {
@@ -317,7 +322,12 @@ public final class ARGuidanceController: ObservableObject {
                     do {
                         let current = try await provider(target.objectID, source.mapID)
                         guard !Task.isCancelled, self.targetGeneration == generation else { return }
+                        let now = self.nowProvider()
                         guard let current,
+                            now.isFinite, now >= 0,
+                            current.position.observedAt <= now,
+                            current.object.lastSeenAt <= now,
+                            current.object.stateUpdatedAt <= now,
                             current.mapID == source.mapID,
                             current.object.id == source.object.id,
                             current.object.semanticLabel == source.object.semanticLabel,

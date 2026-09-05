@@ -76,7 +76,9 @@ enum SpatialStorageDirectory {
 
     /// Probe versions before model decoders can wrap compatibility failures in
     /// DecodingError. A newer writer's bytes must remain at their original URL.
-    static func validateJSONSchemas(_ data: Data, allowsLegacyRoot: Bool = false) throws {
+    static func validateJSONSchemas(
+        _ data: Data, allowsLegacyRoot: Bool = false, maximumSchemaVersion: Int = 1
+    ) throws {
         let object: Any
         do { object = try JSONSerialization.jsonObject(with: data) }
         catch { throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Invalid JSON catalog.")) }
@@ -93,7 +95,8 @@ enum SpatialStorageDirectory {
                     if ["schemaVersion", "policyVersion"].contains(key),
                         let number = child as? NSNumber {
                         let version = try checkedVersion(number)
-                        if version != 1,
+                        let supported = key == "schemaVersion" ? (1...maximumSchemaVersion).contains(version) : version == 1
+                        if !supported,
                             !(isRoot && key == "schemaVersion" && allowsLegacyRoot && version == 0) {
                             throw SpatialStorageError.unsupportedSchema(actual: version)
                         }

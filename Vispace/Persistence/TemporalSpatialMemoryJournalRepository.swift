@@ -147,6 +147,11 @@ public struct TemporalSpatialMemoryJournalEntry: Codable, Hashable, Sendable {
             delta.newRevision == expectedRevision,
             update.sequence == delta.sequence,
             update.timestamp == delta.timestamp,
+            update.clock == delta.clock,
+            update.clock.map({
+                $0.captureSegmentID == provenance.captureSegmentID
+                    && $0.monotonicTimestamp == provenance.sessionTimestamp
+            }) ?? true,
             update.mapID == delta.mapID,
             update.coordinateFrameID == delta.coordinateFrameID,
             provenance.mapID == update.mapID,
@@ -289,7 +294,7 @@ public struct TemporalSpatialMemoryJournalRecord: Codable, Hashable, Sendable {
 }
 
 public struct TemporalSpatialMemoryJournalCatalog: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 1
+    public static let currentSchemaVersion: UInt16 = 2
     public static let absoluteMaximumJournalCount = 64
 
     public let schemaVersion: UInt16
@@ -299,7 +304,7 @@ public struct TemporalSpatialMemoryJournalCatalog: Codable, Hashable, Sendable {
         schemaVersion: UInt16 = Self.currentSchemaVersion,
         journals: [TemporalSpatialMemoryJournalRecord] = []
     ) throws {
-        guard schemaVersion == Self.currentSchemaVersion else {
+        guard (1...Self.currentSchemaVersion).contains(schemaVersion) else {
             throw TemporalSpatialMemoryJournalError.unsupportedCatalogSchema(
                 actual: schemaVersion
             )
@@ -312,7 +317,7 @@ public struct TemporalSpatialMemoryJournalCatalog: Codable, Hashable, Sendable {
         guard Set(journals.map(\.mapID)).count == journals.count else {
             throw TemporalSpatialMemoryJournalError.invalidJournal
         }
-        self.schemaVersion = schemaVersion
+        self.schemaVersion = Self.currentSchemaVersion
         self.journals = journals.sorted(by: Self.journalOrder)
     }
 
@@ -574,7 +579,7 @@ public actor TemporalSpatialMemoryJournalRepository {
         }
 
         do {
-            try SpatialStorageDirectory.validateJSONSchemas(data)
+            try SpatialStorageDirectory.validateJSONSchemas(data, maximumSchemaVersion: 2)
             return try JSONDecoder().decode(
                 TemporalSpatialMemoryJournalCatalog.self,
                 from: data

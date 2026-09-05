@@ -5,6 +5,76 @@ import XCTest
 @testable import Vispace
 
 final class SceneGraphRepositoryTests: XCTestCase {
+    @MainActor
+    func testClockRollbackRebuildsRelationsAtRealTimeAndFencesOlderEndpointRevisions() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = SceneGraphRepository(directoryURL: directory)
+        let service = SpatialSceneGraphService(repository: repository)
+        let context = MetadataContext()
+        func observed(_ original: SpatialObjectMetadata, at time: TimeInterval, revision: UInt64) throws -> SpatialObjectMetadata {
+            var object = original.object
+            object.lastSeenAt = time
+            object.stateUpdatedAt = time
+            object.temporalRevision = revision
+            return try SpatialObjectMetadata(mapID: original.mapID, object: object, position: FramedPosition(
+                coordinateFrameID: original.position.coordinateFrameID, value: original.position.value,
+                observedAt: time, trackingQuality: .normal, uncertainty: .highConfidenceDepth
+            ))
+        }
+        let oldTable = try observed(context.box(label: "table", x: 0, time: 1_000), at: 1_000, revision: 1)
+        let oldCup = try observed(context.box(label: "cup", x: 0.8, time: 1_000), at: 1_000, revision: 1)
+        _ = try await service.ingest(changed: oldCup, allObjects: [oldTable, oldCup], at: 1_000)
+        let oldRecord = try await repository.load(mapID: context.mapID)
+        let oldGraph = try XCTUnwrap(oldRecord?.graph)
+        // Cold projection after clock correction succeeds while removing the
+        // old future-dated relations; it does not need a fabricated timestamp.
+        _ = try await service.ingest(changed: oldCup, allObjects: [oldTable, oldCup], at: 99)
+        let coldProjection = try await repository.load(mapID: context.mapID)
+        XCTAssertTrue(coldProjection?.graph.relations().isEmpty == true)
+        let table = try observed(oldTable, at: 100, revision: 2)
+        let cup = try observed(oldCup, at: 101, revision: 3)
+        let records = [
+            StoredSpatialObjectRecord(metadata: table, memoryTier: .localMap, semanticAliases: ["테이블"]),
+            StoredSpatialObjectRecord(metadata: cup, memoryTier: .localMap, semanticAliases: ["컵"]),
+        ]
+        let identity = ARCaptureIdentity(coordinateFrameID: context.frameID, mapID: context.mapID, status: .confirmed)
+        let staleController = SpatialRelationQueryController(
+            snapshotProvider: { _ in SpatialRelationQuerySnapshot(
+                mapID: context.mapID, coordinateFrameID: context.frameID, records: records, graph: oldGraph
+            ) }, currentIdentityProvider: { identity }
+        )
+        staleController.submit("테이블 근처 뭐가 있어?", now: 1_001)
+        for _ in 0..<200 where staleController.isProcessingForTesting {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertNotEqual(staleController.latestPresentation?.result.status, .answered)
+
+        _ = try await service.ingest(changed: table, allObjects: [table, oldCup], at: 100)
+        let whileOtherIsFuture = try await repository.load(mapID: context.mapID)
+        XCTAssertTrue(whileOtherIsFuture?.graph.relations().isEmpty == true)
+        _ = try await service.ingest(changed: cup, allObjects: [table, cup], at: 101)
+        let rebuiltRecord = try await SceneGraphRepository(directoryURL: directory).load(mapID: context.mapID)
+        let rebuilt = try XCTUnwrap(rebuiltRecord)
+        // A stale writer argument cannot replace the authoritative durable
+        // geometry/revision used to derive relations.
+        _ = try await service.ingest(changed: oldCup, allObjects: [table, cup], at: 102)
+        let afterStaleArgument = try await repository.load(mapID: context.mapID)
+        XCTAssertEqual(afterStaleArgument?.graph, rebuilt.graph)
+        XCTAssertTrue(rebuilt.graph.relations().allSatisfy { $0.validFrom == 101 })
+        let controller = SpatialRelationQueryController(
+            snapshotProvider: { _ in SpatialRelationQuerySnapshot(
+                mapID: context.mapID, coordinateFrameID: context.frameID, records: records, graph: rebuilt.graph
+            ) }, currentIdentityProvider: { identity }
+        )
+        controller.submit("테이블 근처 뭐가 있어?", now: 102)
+        for _ in 0..<200 where controller.isProcessingForTesting {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(controller.latestPresentation?.result.status, .answered)
+        XCTAssertEqual(controller.latestPresentation?.result.matches.map(\.subject.objectID), [cup.object.id])
+    }
+
     func testSustainedUpdatesRollDeduplicationWindowAndRejectEvictedReplay() async throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

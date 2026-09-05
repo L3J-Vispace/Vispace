@@ -4,6 +4,114 @@ import XCTest
 @testable import Vispace
 
 final class TemporalSpatialMemoryServiceTests: XCTestCase {
+    func testFutureLegacySeedReplaysProjectionAtRealTimeBeforeNewObservation() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(42)
+        let frameID = temporalTestFrameID(42)
+        let objectID = temporalTestObjectID(42)
+        let future = try temporalTestMetadata(
+            mapID: mapID, coordinateFrameID: frameID, objectID: objectID, at: 2_000
+        )
+        let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)], objects: [future]
+        ))
+        let graphRepository = SceneGraphRepository(directoryURL: root.appendingPathComponent("graph"))
+        let graphService = SpatialSceneGraphService(repository: graphRepository)
+        let service = TemporalSpatialMemoryService(
+            journalRepository: TemporalSpatialMemoryJournalRepository(directoryURL: root.appendingPathComponent("journal")),
+            policy: temporalTestPolicy(), metadataProvider: { try await store.snapshot() },
+            metadataWriter: { metadata in
+                try await store.upsert(metadata)
+                _ = try await graphService.ingest(changed: metadata, allObjects: await store.allObjects(), at: 100)
+            }
+        )
+        let seed = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(seed.metadata(for: objectID), future)
+        let graph = try await graphRepository.load(mapID: mapID)
+        XCTAssertNotNil(graph)
+        XCTAssertTrue(graph?.graph.relations().isEmpty == true)
+        let reobserved = try TemporalSpatialObservation(
+            metadata: temporalTestMetadata(mapID: mapID, coordinateFrameID: frameID, objectID: objectID, at: 100),
+            promotionEvidence: temporalTestPromotionEvidence(mapID: mapID, coordinateFrameID: frameID, at: 100),
+            identityDecision: .confirmedExisting(PersistentObjectReidentificationCandidate(
+                objectID: objectID, score: temporalTestScore(0.95), geometryScore: temporalTestScore(0.95),
+                spatialContextScore: temporalTestScore(0.95), visualSimilarity: nil, positionDistance: 0
+            ))
+        )
+        _ = try await service.process(TemporalSpatialRecognitionBatch(
+            sequence: 1, observations: [reobserved], expectedVisibleObjectIDs: [objectID]
+        ), pose: temporalTestPose(
+            mapID: mapID, coordinateFrameID: frameID, capturedAt: 100, sessionTimestamp: 1, sequence: 1
+        ))
+        let updated = await store.metadata(for: objectID)
+        XCTAssertEqual(updated?.object.firstSeenAt, future.object.firstSeenAt)
+        XCTAssertEqual(updated?.object.lastSeenAt, 100)
+        XCTAssertEqual(updated?.object.temporalRevision, 1)
+    }
+
+    func testRestartAfterClockRollbackPreservesDatesAndRejectsRetiredEpoch() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(41)
+        let frameID = temporalTestFrameID(41)
+        let objectID = temporalTestObjectID(41)
+        let oldSegment = CaptureSegmentID()
+        let newSegment = CaptureSegmentID()
+        let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)]
+        ))
+        let repository = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let original = makeService(repository: repository, store: store)
+        _ = try await original.process(TemporalSpatialRecognitionBatch(
+            sequence: 5_000,
+            observations: [temporalTestNewObservation(
+                mapID: mapID, coordinateFrameID: frameID, objectID: objectID, at: 2_000
+            )], expectedVisibleObjectIDs: [objectID]
+        ), pose: temporalTestPose(
+            mapID: mapID, coordinateFrameID: frameID, capturedAt: 2_000,
+            sessionTimestamp: 1_000, sequence: 1, captureSegmentID: oldSegment
+        ))
+        let restarted = makeService(repository: repository, store: store)
+        let reobserved = try TemporalSpatialObservation(
+            metadata: temporalTestMetadata(mapID: mapID, coordinateFrameID: frameID, objectID: objectID, at: 100),
+            promotionEvidence: temporalTestPromotionEvidence(mapID: mapID, coordinateFrameID: frameID, at: 100),
+            identityDecision: .confirmedExisting(PersistentObjectReidentificationCandidate(
+                objectID: objectID, score: temporalTestScore(0.95), geometryScore: temporalTestScore(0.95),
+                spatialContextScore: temporalTestScore(0.95), visualSimilarity: nil, positionDistance: 0
+            ))
+        )
+        _ = try await restarted.process(TemporalSpatialRecognitionBatch(
+            sequence: 1, observations: [reobserved], expectedVisibleObjectIDs: [objectID]
+        ), pose: temporalTestPose(
+            mapID: mapID, coordinateFrameID: frameID, capturedAt: 100,
+            sessionTimestamp: 1, sequence: 2, captureSegmentID: newSegment
+        ))
+        let durable = await store.metadata(for: objectID)
+        XCTAssertEqual(durable?.object.firstSeenAt, 1_999.6)
+        XCTAssertEqual(durable?.object.lastSeenAt, 100)
+        XCTAssertEqual(durable?.object.stateUpdatedAt, 100)
+        XCTAssertEqual(durable?.object.temporalRevision, 2)
+        let cold = makeService(repository: repository, store: store)
+        let recovered = try await cold.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(recovered.latestSequence, 5_001)
+        XCTAssertEqual(recovered.latestClock?.epoch, 2)
+        XCTAssertEqual(recovered.metadata(for: objectID), durable)
+        do {
+            _ = try await cold.process(TemporalSpatialRecognitionBatch(
+                sequence: 6_000, observations: [], expectedVisibleObjectIDs: []
+            ), pose: temporalTestPose(
+                mapID: mapID, coordinateFrameID: frameID, capturedAt: 2_001,
+                sessionTimestamp: 1_001, sequence: 3, captureSegmentID: oldSegment
+            ))
+            XCTFail("A retired epoch must not be reborn after service restart")
+        } catch {
+            XCTAssertEqual(error as? TemporalSpatialMemoryError, .clockEpochConflict)
+        }
+        let after = try await cold.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(after, recovered)
+    }
+
     func testRecognitionAndPoseCommitThenRestartRecoverExactState() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -99,7 +207,7 @@ final class TemporalSpatialMemoryServiceTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: url), firstBytes)
     }
 
-    func testOutOfOrderPoseTimeIsRejectedWithoutJournalMutation() async throws {
+    func testOutOfOrderMonotonicPoseTimeIsRejectedWithoutJournalMutation() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let mapID = temporalTestMapID(23)
@@ -139,8 +247,8 @@ final class TemporalSpatialMemoryServiceTests: XCTestCase {
                 pose: temporalTestPose(
                     mapID: mapID,
                     coordinateFrameID: frameID,
-                    capturedAt: 99,
-                    sessionTimestamp: 11,
+                    capturedAt: 101,
+                    sessionTimestamp: 9,
                     sequence: 11
                 )
             )
@@ -148,7 +256,7 @@ final class TemporalSpatialMemoryServiceTests: XCTestCase {
         } catch {
             XCTAssertEqual(
                 error as? TemporalSpatialMemoryError,
-                .outOfOrderTimestamp(previous: 100, incoming: 99)
+                .outOfOrderTimestamp(previous: 10, incoming: 9)
             )
         }
         let after = try await repository.catalogSnapshot()
@@ -366,7 +474,7 @@ final class TemporalSpatialMemoryServiceTests: XCTestCase {
         XCTAssertTrue(after.objects.isEmpty)
         XCTAssertEqual(after.revision, 0)
         let writes = await store.writeAttemptCount()
-        XCTAssertEqual(writes, 0)
+        XCTAssertEqual(writes, 1)
     }
 
     func testResetInvalidatesRecoverySuspendedInsideMetadataProvider() async throws {
@@ -624,7 +732,14 @@ private actor TemporalMetadataStore {
         }) {
             let existing = document.objects[index]
             if existing != metadata {
-                guard metadata.object.stateUpdatedAt > existing.object.stateUpdatedAt else {
+                let newer: Bool
+                switch (metadata.object.temporalRevision, existing.object.temporalRevision) {
+                case (.some(let incoming), .some(let previous)): newer = incoming > previous
+                case (.some, .none): newer = true
+                case (.none, .some): newer = false
+                case (.none, .none): newer = metadata.object.stateUpdatedAt > existing.object.stateUpdatedAt
+                }
+                guard newer else {
                     throw TemporalMetadataStoreError.staleWrite
                 }
                 document.objects[index] = metadata

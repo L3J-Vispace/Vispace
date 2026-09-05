@@ -256,7 +256,7 @@ public struct SpatialObjectMetadata: Codable, Hashable, Sendable {
 }
 
 public struct SpatialMetadataDocument: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion = 1
+    public static let currentSchemaVersion = 2
 
     public let schemaVersion: Int
     public var maps: [SpatialMapMetadata]
@@ -280,10 +280,12 @@ public struct SpatialMetadataDocument: Codable, Hashable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let version = try container.decode(Int.self, forKey: .schemaVersion)
-        guard version == Self.currentSchemaVersion else {
+        guard (1...Self.currentSchemaVersion).contains(version) else {
             throw SpatialCaptureMetadataError.invalidSchemaVersion(version)
         }
-        schemaVersion = version
+        // v1 contains calendar-ordered objects; their nil temporalRevision is
+        // preserved until a protected v2 journal update explicitly migrates it.
+        schemaVersion = Self.currentSchemaVersion
         maps = try container.decode([SpatialMapMetadata].self, forKey: .maps)
         objects = try container.decode([SpatialObjectMetadata].self, forKey: .objects)
         try validate()
@@ -351,7 +353,7 @@ public enum SpatialMetadataMigrator {
 
         do {
             switch probe.schemaVersion {
-            case SpatialMetadataDocument.currentSchemaVersion:
+            case 1, SpatialMetadataDocument.currentSchemaVersion:
                 return try decoder.decode(SpatialMetadataDocument.self, from: data)
             case 0:
                 let legacy = try decoder.decode(LegacyDocumentV0.self, from: data)

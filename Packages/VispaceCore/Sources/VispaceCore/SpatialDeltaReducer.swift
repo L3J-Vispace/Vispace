@@ -301,11 +301,15 @@ public struct SpatialDeltaReducer: Sendable {
             else {
                 throw SpatialReducerError.insufficientConfidence(object.id)
             }
-            let existingTimestamp =
-                state.confirmedObjects[object.id]?.stateUpdatedAt
-                ?? state.provisionalObjects[object.id]?.stateUpdatedAt
-            if let existingTimestamp, object.stateUpdatedAt < existingTimestamp {
-                throw SpatialReducerError.outOfOrderEvent(object.id)
+            if let existing = state.confirmedObjects[object.id] ?? state.provisionalObjects[object.id] {
+                let outOfOrder: Bool
+                switch (object.temporalRevision, existing.temporalRevision) {
+                case (.some(let incoming), .some(let previous)): outOfOrder = incoming <= previous && object != existing
+                case (.some, .none): outOfOrder = false
+                case (.none, .some): outOfOrder = true
+                case (.none, .none): outOfOrder = object.stateUpdatedAt < existing.stateUpdatedAt
+                }
+                guard !outOfOrder else { throw SpatialReducerError.outOfOrderEvent(object.id) }
             }
             state.provisionalObjects.removeValue(forKey: object.id)
             state.confirmedObjects[object.id] = object

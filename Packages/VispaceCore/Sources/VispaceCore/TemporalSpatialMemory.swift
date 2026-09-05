@@ -19,6 +19,9 @@ public enum TemporalSpatialMemoryError: Error, Equatable, Sendable {
     case revisionConflict(expected: UInt64, actualBase: UInt64)
     case outOfOrderSequence(previous: UInt64, incoming: UInt64)
     case outOfOrderTimestamp(previous: TimeInterval, incoming: TimeInterval)
+    case invalidClock
+    case clockEpochConflict
+    case clockEpochCapacityExceeded
     case unknownExpectedObject(ObjectID)
     case insufficientObservationConfidence(ObjectID)
     case promotionEvidenceMismatch(ObjectID)
@@ -318,6 +321,34 @@ public struct TemporalSpatialObservation: Codable, Hashable, Sendable {
     }
 }
 
+/// Versioned ordering evidence independent of the unmodified calendar capture
+/// date. A new capture segment starts the next durable epoch; elapsed-time
+/// evidence is never carried across that boundary.
+public struct TemporalSpatialClock: Codable, Hashable, Sendable {
+    public let epoch: UInt64
+    public let captureSegmentID: CaptureSegmentID
+    public let monotonicTimestamp: TimeInterval
+
+    public init(epoch: UInt64, captureSegmentID: CaptureSegmentID, monotonicTimestamp: TimeInterval) throws {
+        guard epoch > 0, monotonicTimestamp.isFinite, monotonicTimestamp >= 0 else {
+            throw TemporalSpatialMemoryError.invalidClock
+        }
+        self.epoch = epoch
+        self.captureSegmentID = captureSegmentID
+        self.monotonicTimestamp = monotonicTimestamp
+    }
+
+    private enum CodingKeys: String, CodingKey { case epoch, captureSegmentID, monotonicTimestamp }
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            epoch: container.decode(UInt64.self, forKey: .epoch),
+            captureSegmentID: container.decode(CaptureSegmentID.self, forKey: .captureSegmentID),
+            monotonicTimestamp: container.decode(TimeInterval.self, forKey: .monotonicTimestamp)
+        )
+    }
+}
+
 /// One complete coverage decision. `expectedVisibleObjectIDs` must contain only
 /// objects that were actually inside a reliable detector/tracker coverage
 /// region; absence outside that set is deliberately ignored.
@@ -326,6 +357,7 @@ public struct TemporalSpatialUpdate: Codable, Hashable, Sendable {
     public let baseRevision: UInt64
     public let sequence: UInt64
     public let timestamp: TimeInterval
+    public let clock: TemporalSpatialClock?
     public let mapID: MapID
     public let coordinateFrameID: CoordinateFrameID
     public let observations: [TemporalSpatialObservation]
@@ -339,7 +371,8 @@ public struct TemporalSpatialUpdate: Codable, Hashable, Sendable {
         mapID: MapID,
         coordinateFrameID: CoordinateFrameID,
         observations: [TemporalSpatialObservation],
-        expectedVisibleObjectIDs: [ObjectID]
+        expectedVisibleObjectIDs: [ObjectID],
+        clock: TemporalSpatialClock? = nil
     ) throws {
         guard timestamp.isFinite, timestamp >= 0 else {
             throw TemporalSpatialMemoryError.invalidTimestamp
@@ -396,6 +429,7 @@ public struct TemporalSpatialUpdate: Codable, Hashable, Sendable {
         self.baseRevision = baseRevision
         self.sequence = sequence
         self.timestamp = timestamp
+        self.clock = clock
         self.mapID = mapID
         self.coordinateFrameID = coordinateFrameID
         self.observations = observations.sorted {
@@ -409,6 +443,7 @@ public struct TemporalSpatialUpdate: Codable, Hashable, Sendable {
         case baseRevision
         case sequence
         case timestamp
+        case clock
         case mapID
         case coordinateFrameID
         case observations
@@ -435,7 +470,8 @@ public struct TemporalSpatialUpdate: Codable, Hashable, Sendable {
                 expectedVisibleObjectIDs: container.decode(
                     [ObjectID].self,
                     forKey: .expectedVisibleObjectIDs
-                )
+                ),
+                clock: container.decodeIfPresent(TemporalSpatialClock.self, forKey: .clock)
             )
         } catch let error as DecodingError {
             throw error
@@ -450,6 +486,8 @@ public struct TemporalSpatialUpdate: Codable, Hashable, Sendable {
 }
 
 public enum TemporalSpatialChange: Codable, Hashable, Sendable {
+    case clockEpochStarted(epoch: UInt64, at: TimeInterval)
+    case calendarClockMovedBackward(at: TimeInterval)
     /// The durable object limit prevents only this new identity's admission;
     /// existing identities and visibility evidence in the batch still advance.
     case deferredDueToCapacity(objectID: ObjectID, at: TimeInterval)
@@ -490,6 +528,7 @@ public struct TemporalSpatialDelta: Codable, Hashable, Sendable {
     public let newRevision: UInt64
     public let sequence: UInt64
     public let timestamp: TimeInterval
+    public let clock: TemporalSpatialClock?
     public let mapID: MapID
     public let coordinateFrameID: CoordinateFrameID
     public let spatialDelta: SpatialDelta
@@ -515,6 +554,7 @@ public struct TemporalSpatialDelta: Codable, Hashable, Sendable {
         self.newRevision = newRevision
         sequence = update.sequence
         timestamp = update.timestamp
+        clock = update.clock
         mapID = update.mapID
         coordinateFrameID = update.coordinateFrameID
         spatialDelta = SpatialDelta(
@@ -538,6 +578,7 @@ private struct TemporalMovementSample: Codable, Hashable, Sendable {
     let bounds: AABB?
     let confidence: ConfidenceVector
     let reidentificationConfidence: ConfidenceScore
+    let monotonicTimestamp: TimeInterval?
 }
 
 private struct TemporalObjectState: Codable, Hashable, Sendable {
@@ -559,11 +600,13 @@ private struct TemporalObjectState: Codable, Hashable, Sendable {
 }
 
 public struct TemporalSpatialMemorySnapshot: Codable, Hashable, Sendable {
-    private static let schemaVersion = 1
+    private static let schemaVersion = 2
 
     public fileprivate(set) var revision: UInt64
     public fileprivate(set) var latestSequence: UInt64?
     public fileprivate(set) var latestTimestamp: TimeInterval?
+    public fileprivate(set) var latestClock: TemporalSpatialClock?
+    public fileprivate(set) var retiredCaptureSegmentIDs: Set<CaptureSegmentID>
     public let mapID: MapID
     public let coordinateFrameID: CoordinateFrameID
     fileprivate var objectStates: [ObjectID: TemporalObjectState]
@@ -574,6 +617,8 @@ public struct TemporalSpatialMemorySnapshot: Codable, Hashable, Sendable {
         revision = 0
         latestSequence = nil
         latestTimestamp = nil
+        latestClock = nil
+        retiredCaptureSegmentIDs = []
         self.mapID = mapID
         self.coordinateFrameID = coordinateFrameID
         objectStates = [:]
@@ -611,6 +656,8 @@ public struct TemporalSpatialMemorySnapshot: Codable, Hashable, Sendable {
         case revision
         case latestSequence
         case latestTimestamp
+        case latestClock
+        case retiredCaptureSegmentIDs
         case mapID
         case coordinateFrameID
         case objectStates
@@ -621,7 +668,7 @@ public struct TemporalSpatialMemorySnapshot: Codable, Hashable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let version = try container.decode(Int.self, forKey: .schemaVersion)
-        guard version == Self.schemaVersion else {
+        guard (1...Self.schemaVersion).contains(version) else {
             throw TemporalSpatialMemoryError.unsupportedSchemaVersion(version)
         }
         revision = try container.decode(UInt64.self, forKey: .revision)
@@ -630,6 +677,10 @@ public struct TemporalSpatialMemorySnapshot: Codable, Hashable, Sendable {
             TimeInterval.self,
             forKey: .latestTimestamp
         )
+        latestClock = try container.decodeIfPresent(TemporalSpatialClock.self, forKey: .latestClock)
+        retiredCaptureSegmentIDs = try container.decodeIfPresent(
+            Set<CaptureSegmentID>.self, forKey: .retiredCaptureSegmentIDs
+        ) ?? []
         mapID = try container.decode(MapID.self, forKey: .mapID)
         coordinateFrameID = try container.decode(
             CoordinateFrameID.self,
@@ -666,6 +717,8 @@ public struct TemporalSpatialMemorySnapshot: Codable, Hashable, Sendable {
         try container.encode(revision, forKey: .revision)
         try container.encodeIfPresent(latestSequence, forKey: .latestSequence)
         try container.encodeIfPresent(latestTimestamp, forKey: .latestTimestamp)
+        try container.encodeIfPresent(latestClock, forKey: .latestClock)
+        try container.encode(retiredCaptureSegmentIDs.sorted(), forKey: .retiredCaptureSegmentIDs)
         try container.encode(mapID, forKey: .mapID)
         try container.encode(coordinateFrameID, forKey: .coordinateFrameID)
         try container.encode(objectStates, forKey: .objectStates)
@@ -740,6 +793,13 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
             }
             restored.objectStates[objectID] = TemporalObjectState(metadata: metadata)
         }
+        // Imported current metadata may outlive its derived journal. Continue
+        // above its durable revision instead of reusing revision one.
+        if let durableRevision = objects.compactMap({ $0.object.temporalRevision }).max() {
+            restored.revision = durableRevision
+            restored.latestSequence = durableRevision
+            restored.latestTimestamp = objects.map(\.object.stateUpdatedAt).max()
+        }
         snapshot = restored
         try validate(restored)
     }
@@ -786,14 +846,7 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
                 incoming: update.sequence
             )
         }
-        if let latestTimestamp = snapshot.latestTimestamp,
-            update.timestamp <= latestTimestamp
-        {
-            throw TemporalSpatialMemoryError.outOfOrderTimestamp(
-                previous: latestTimestamp,
-                incoming: update.timestamp
-            )
-        }
+        let startsClockEpoch = try validateClock(update)
         guard update.observations.count <= policy.maximumObservationsPerUpdate else {
             throw TemporalSpatialMemoryError.tooManyObservations(
                 maximum: policy.maximumObservationsPerUpdate
@@ -826,10 +879,33 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
         let orderedNewIDs = incomingNewIDs.subtracting(snapshot.objectStates.keys).sorted()
         let deferredIDs = Set(orderedNewIDs.dropFirst(availableSlots))
 
+        let (newRevision, overflow) = snapshot.revision.addingReportingOverflow(1)
+        guard !overflow else {
+            throw TemporalSpatialMemoryError.revisionOverflow
+        }
+        let observationRevision = update.clock == nil ? nil : newRevision
         var working = snapshot
         var spatialEvents: [ObjectEvent] = []
         var changes: [TemporalSpatialChange] = deferredIDs.sorted().map {
             .deferredDueToCapacity(objectID: $0, at: update.timestamp)
+        }
+        let calendarMovedBackward = update.clock != nil
+            && snapshot.latestTimestamp.map { update.timestamp < $0 } == true
+        if startsClockEpoch || calendarMovedBackward {
+            if startsClockEpoch, let previous = working.latestClock {
+                working.retiredCaptureSegmentIDs.insert(previous.captureSegmentID)
+            }
+            for objectID in Array(working.objectStates.keys) {
+                guard var state = working.objectStates[objectID] else { continue }
+                resetMissEvidence(in: &state)
+                state.pendingMovementSamples.removeAll()
+                working.objectStates[objectID] = state
+            }
+            if startsClockEpoch, let clock = update.clock {
+                changes.append(.clockEpochStarted(epoch: clock.epoch, at: update.timestamp))
+            } else {
+                changes.append(.calendarClockMovedBackward(at: update.timestamp))
+            }
         }
         let observedIDs = Set(update.observations.map { $0.metadata.object.id })
 
@@ -837,6 +913,8 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
         where !deferredIDs.contains(observation.metadata.object.id) {
             try applyObservation(
                 observation,
+                monotonicTimestamp: update.clock?.monotonicTimestamp,
+                temporalRevision: observationRevision,
                 to: &working,
                 spatialEvents: &spatialEvents,
                 changes: &changes
@@ -848,15 +926,37 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
             try applyMiss(
                 objectID,
                 at: update.timestamp,
+                elapsedTimestamp: update.clock?.monotonicTimestamp ?? update.timestamp,
+                temporalRevision: observationRevision,
                 to: &working,
                 spatialEvents: &spatialEvents,
                 changes: &changes
             )
         }
 
-        let (newRevision, overflow) = working.revision.addingReportingOverflow(1)
-        guard !overflow else {
-            throw TemporalSpatialMemoryError.revisionOverflow
+        if update.clock != nil {
+            var changedIDs: [ObjectID] = []
+            for objectID in working.objectStates.keys.sorted() {
+                guard var state = working.objectStates[objectID],
+                    state.metadata != snapshot.objectStates[objectID]?.metadata
+                else { continue }
+                var object = state.metadata.object
+                object.temporalRevision = newRevision
+                state.metadata = try SpatialObjectMetadata(
+                    mapID: state.metadata.mapID, object: object, position: state.metadata.position
+                )
+                working.objectStates[objectID] = state
+                changedIDs.append(objectID)
+            }
+            // Full revision-addressed upserts are the v2 reducer contract.
+            // Calendar-only events cannot safely order a backward clock jump.
+            spatialEvents = changedIDs.compactMap { working.objectStates[$0].map { .upsert($0.metadata.object) } }
+            changes = changes.map { change in
+                if case .added(let metadata, let time) = change,
+                    let committed = working.objectStates[metadata.object.id]?.metadata
+                { return .added(object: committed, at: time) }
+                return change
+            }
         }
         let delta = TemporalSpatialDelta(
             update: update,
@@ -867,6 +967,7 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
         working.revision = newRevision
         working.latestSequence = update.sequence
         working.latestTimestamp = update.timestamp
+        working.latestClock = update.clock
         working.recentDeltas.append(delta)
         trim(
             &working.recentDeltas,
@@ -879,6 +980,45 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
         )
         snapshot = working
         return .applied(delta)
+    }
+
+    private func validateClock(_ update: TemporalSpatialUpdate) throws -> Bool {
+        guard let clock = update.clock else {
+            guard snapshot.latestClock == nil else { throw TemporalSpatialMemoryError.clockEpochConflict }
+            if let latestTimestamp = snapshot.latestTimestamp, update.timestamp <= latestTimestamp {
+                throw TemporalSpatialMemoryError.outOfOrderTimestamp(previous: latestTimestamp, incoming: update.timestamp)
+            }
+            return false
+        }
+        guard !snapshot.retiredCaptureSegmentIDs.contains(clock.captureSegmentID) else {
+            throw TemporalSpatialMemoryError.clockEpochConflict
+        }
+        guard let previous = snapshot.latestClock else {
+            guard clock.epoch == 1 else { throw TemporalSpatialMemoryError.clockEpochConflict }
+            return true
+        }
+        if clock.epoch == previous.epoch {
+            guard clock.captureSegmentID == previous.captureSegmentID else {
+                throw TemporalSpatialMemoryError.clockEpochConflict
+            }
+            guard clock.monotonicTimestamp > previous.monotonicTimestamp else {
+                throw TemporalSpatialMemoryError.outOfOrderTimestamp(
+                    previous: previous.monotonicTimestamp, incoming: clock.monotonicTimestamp
+                )
+            }
+            return false
+        }
+        let (nextEpoch, overflow) = previous.epoch.addingReportingOverflow(1)
+        guard !overflow, clock.epoch == nextEpoch,
+            clock.captureSegmentID != previous.captureSegmentID else {
+            throw TemporalSpatialMemoryError.clockEpochConflict
+        }
+        // Durable tombstones cannot be silently dropped: doing so would allow
+        // old capture segments to be reintroduced as a fresh epoch.
+        guard snapshot.retiredCaptureSegmentIDs.count < 4_096 else {
+            throw TemporalSpatialMemoryError.clockEpochCapacityExceeded
+        }
+        return true
     }
 
     private func validateObservations(
@@ -939,6 +1079,8 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
 
     private func applyObservation(
         _ observation: TemporalSpatialObservation,
+        monotonicTimestamp: TimeInterval?,
+        temporalRevision: UInt64?,
         to state: inout TemporalSpatialMemorySnapshot,
         spatialEvents: inout [ObjectEvent],
         changes: inout [TemporalSpatialChange]
@@ -965,6 +1107,8 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
             try stageMovement(
                 incoming,
                 reidentificationConfidence: identityCandidate.score,
+                monotonicTimestamp: monotonicTimestamp,
+                temporalRevision: temporalRevision,
                 in: &objectState,
                 spatialEvents: &spatialEvents,
                 changes: &changes
@@ -977,7 +1121,8 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
         let previousPresence = objectState.metadata.object.presence
         objectState.metadata = try refreshedMetadata(
             existing: objectState.metadata,
-            from: incoming
+            from: incoming,
+            temporalRevision: temporalRevision
         )
         objectState.pendingMovementSamples.removeAll(keepingCapacity: true)
         resetMissEvidence(in: &objectState)
@@ -1006,6 +1151,8 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
     private func stageMovement(
         _ incoming: SpatialObjectMetadata,
         reidentificationConfidence: ConfidenceScore,
+        monotonicTimestamp: TimeInterval?,
+        temporalRevision: UInt64?,
         in state: inout TemporalObjectState,
         spatialEvents: inout [ObjectEvent],
         changes: inout [TemporalSpatialChange]
@@ -1017,7 +1164,8 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
             position: incoming.position,
             bounds: incoming.object.bounds,
             confidence: incoming.object.confidence,
-            reidentificationConfidence: reidentificationConfidence
+            reidentificationConfidence: reidentificationConfidence,
+            monotonicTimestamp: monotonicTimestamp
         )
 
         if let latest = state.pendingMovementSamples.last,
@@ -1038,7 +1186,8 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
                 >= policy.minimumMovementObservationCount,
             let first = state.pendingMovementSamples.first,
             let last = state.pendingMovementSamples.last,
-            last.position.observedAt - first.position.observedAt
+            (last.monotonicTimestamp ?? last.position.observedAt)
+                - (first.monotonicTimestamp ?? first.position.observedAt)
                 >= policy.minimumMovementObservationInterval
         else {
             return
@@ -1059,7 +1208,8 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
         let previousStablePosition = state.stablePosition
         let committedMetadata = try refreshedMetadata(
             existing: previousMetadata,
-            from: incoming
+            from: incoming,
+            temporalRevision: temporalRevision
         )
         state.metadata = committedMetadata
         state.stablePosition = incoming.position.value
@@ -1098,6 +1248,8 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
     private func applyMiss(
         _ objectID: ObjectID,
         at timestamp: TimeInterval,
+        elapsedTimestamp: TimeInterval,
+        temporalRevision: UInt64?,
         to state: inout TemporalSpatialMemorySnapshot,
         spatialEvents: inout [ObjectEvent],
         changes: inout [TemporalSpatialChange]
@@ -1110,14 +1262,14 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
         }
 
         if objectState.consecutiveMissCount == 0 {
-            objectState.firstMissedAt = timestamp
+            objectState.firstMissedAt = elapsedTimestamp
         }
         objectState.consecutiveMissCount = min(
             objectState.consecutiveMissCount + 1,
             policy.minimumMissesForRemoval
         )
-        objectState.lastMissedAt = timestamp
-        let elapsed = timestamp - (objectState.firstMissedAt ?? timestamp)
+        objectState.lastMissedAt = elapsedTimestamp
+        let elapsed = elapsedTimestamp - (objectState.firstMissedAt ?? elapsedTimestamp)
         let previousPresence = objectState.metadata.object.presence
         let nextPresence: ObjectPresence?
         switch previousPresence {
@@ -1141,7 +1293,8 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
             objectState.metadata = try metadataByChangingPresence(
                 objectState.metadata,
                 to: nextPresence,
-                at: timestamp
+                at: timestamp,
+                temporalRevision: temporalRevision
             )
             changes.append(
                 .stateChanged(
@@ -1189,9 +1342,11 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
 
     private func refreshedMetadata(
         existing: SpatialObjectMetadata,
-        from incoming: SpatialObjectMetadata
+        from incoming: SpatialObjectMetadata,
+        temporalRevision: UInt64?
     ) throws -> SpatialObjectMetadata {
         var object = existing.object
+        object.temporalRevision = temporalRevision ?? object.temporalRevision
         object.nodeID = existing.object.nodeID ?? incoming.object.nodeID
         object.position = incoming.position.value
         object.bounds = incoming.object.bounds ?? existing.object.bounds
@@ -1209,9 +1364,11 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
     private func metadataByChangingPresence(
         _ metadata: SpatialObjectMetadata,
         to presence: ObjectPresence,
-        at timestamp: TimeInterval
+        at timestamp: TimeInterval,
+        temporalRevision: UInt64?
     ) throws -> SpatialObjectMetadata {
         var object = metadata.object
+        object.temporalRevision = temporalRevision ?? object.temporalRevision
         object.presence = presence
         object.stateUpdatedAt = timestamp
         return try SpatialObjectMetadata(
@@ -1235,12 +1392,21 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
 
     private func validate(_ snapshot: TemporalSpatialMemorySnapshot) throws {
         guard snapshot.objectStates.count <= policy.maximumObjectCount,
+            snapshot.retiredCaptureSegmentIDs.count <= 4_096,
+            snapshot.latestClock.map({ !snapshot.retiredCaptureSegmentIDs.contains($0.captureSegmentID) }) ?? true,
+            snapshot.latestClock.map({
+                snapshot.revision > 0 && $0.epoch == UInt64(snapshot.retiredCaptureSegmentIDs.count) + 1
+            }) ?? snapshot.retiredCaptureSegmentIDs.isEmpty,
             snapshot.recentDeltas.count <= policy.maximumRetainedDeltaCount,
             snapshot.rememberedUpdateIDs.count <= policy.maximumRememberedUpdateCount,
             Set(snapshot.rememberedUpdateIDs).count == snapshot.rememberedUpdateIDs.count,
             (snapshot.revision == 0) == (snapshot.latestSequence == nil),
             (snapshot.revision == 0) == (snapshot.latestTimestamp == nil)
         else {
+            throw TemporalSpatialMemoryError.invalidSnapshot
+        }
+        if let latestDeltaClock = snapshot.recentDeltas.last?.clock,
+            snapshot.latestClock != latestDeltaClock {
             throw TemporalSpatialMemoryError.invalidSnapshot
         }
 
@@ -1261,6 +1427,7 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
                 )
             }
             guard state.metadata.object.certainty == .confirmed,
+                state.metadata.object.temporalRevision.map({ $0 > 0 && $0 <= snapshot.revision }) ?? true,
                 state.consecutiveMissCount >= 0,
                 state.consecutiveMissCount <= policy.minimumMissesForRemoval,
                 state.pendingMovementSamples.count <= policy.maximumPendingMovementCount,
@@ -1270,13 +1437,20 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
                 state.lastMissedAt.map({ $0.isFinite && $0 >= 0 }) ?? true,
                 state.lastMissedAt.map({ last in
                     state.firstMissedAt.map({ $0 <= last }) ?? false
+                }) ?? true,
+                snapshot.latestClock.map({ clock in
+                    state.lastMissedAt.map({ $0 <= clock.monotonicTimestamp }) ?? true
                 }) ?? true
             else {
                 throw TemporalSpatialMemoryError.invalidSnapshot
             }
             for sample in state.pendingMovementSamples {
                 guard sample.position.coordinateFrameID == snapshot.coordinateFrameID,
-                    sample.position.trackingQuality == .normal
+                    sample.position.trackingQuality == .normal,
+                    sample.monotonicTimestamp.map({ $0.isFinite && $0 >= 0 }) ?? true,
+                    snapshot.latestClock.map({ clock in
+                        sample.monotonicTimestamp.map({ $0 <= clock.monotonicTimestamp }) ?? false
+                    }) ?? true
                 else {
                     throw TemporalSpatialMemoryError.invalidSnapshot
                 }

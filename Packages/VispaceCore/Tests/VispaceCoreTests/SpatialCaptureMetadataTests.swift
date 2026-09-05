@@ -40,7 +40,7 @@ struct SpatialCaptureMetadataTests {
         let decoded = try SpatialMetadataMigrator.decodeAndMigrate(encoded)
 
         #expect(decoded == document)
-        #expect(decoded.schemaVersion == 1)
+        #expect(decoded.schemaVersion == SpatialMetadataDocument.currentSchemaVersion)
     }
 
     @Test

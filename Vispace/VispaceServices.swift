@@ -47,14 +47,14 @@ final class VispaceServices: ObservableObject {
         let durableMetadataWriter: @Sendable (SpatialObjectMetadata) async throws -> Void = {
             metadata in
             try await repository.upsertObjectMetadata(metadata)
+            let now = Date().timeIntervalSince1970
+            // Preserve observation dates after clock correction. The graph
+            // service uses actual current time to retire future-dated evidence.
             let objects = try await repository.metadataSnapshot().objects
             _ = try await sceneGraphService.ingest(
                 changed: metadata,
                 allObjects: objects,
-                at: max(
-                    Date().timeIntervalSince1970,
-                    metadata.object.stateUpdatedAt
-                )
+                at: now
             )
         }
         let temporalJournalRepository = TemporalSpatialMemoryJournalRepository(

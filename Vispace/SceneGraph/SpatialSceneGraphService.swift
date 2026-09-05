@@ -41,15 +41,12 @@ public actor SpatialSceneGraphService {
         guard timestamp.isFinite, timestamp >= 0 else {
             throw SpatialSceneGraphServiceError.invalidTimestamp
         }
-        guard timestamp >= changed.object.stateUpdatedAt else {
-            throw SpatialSceneGraphServiceError.outOfOrderObservation
-        }
         let sameMap = allObjects.filter { metadata in
             metadata.mapID == changed.mapID
                 && metadata.position.coordinateFrameID
                     == changed.position.coordinateFrameID
         }
-        guard sameMap.contains(where: { $0.object.id == changed.object.id }) else {
+        guard let authoritative = sameMap.first(where: { $0.object.id == changed.object.id }) else {
             throw SpatialSceneGraphServiceError.missingChangedObject
         }
         guard
@@ -63,6 +60,10 @@ public actor SpatialSceneGraphService {
             throw SpatialSceneGraphServiceError.mapCoordinateFrameMismatch
         }
 
+        // The writer may have received a retried/stale projection argument.
+        // Always derive from the metadata that actually committed to storage.
+        let changed = authoritative
+
         let existing = try await repository.load(mapID: changed.mapID)
         if let existing,
             existing.coordinateFrameID != changed.position.coordinateFrameID
@@ -72,16 +73,9 @@ public actor SpatialSceneGraphService {
         guard existing?.revision != UInt64.max else {
             throw SpatialSceneGraphServiceError.revisionOverflow
         }
-        let latestObjectStateUpdatedAt = sameMap.reduce(0) {
-            max($0, $1.object.stateUpdatedAt)
-        }
-        let effectiveTimestamp = max(
-            max(timestamp, latestObjectStateUpdatedAt),
-            existing?.updatedAt.nextUp ?? 0
-        )
-        guard effectiveTimestamp.isFinite else {
-            throw SpatialSceneGraphServiceError.invalidTimestamp
-        }
+        // Wall time describes evidence validity, never the storage ordering.
+        // Repository revision fences updates even after the calendar moves back.
+        let effectiveTimestamp = timestamp
         var stateUpdatedAtByObjectID: [ObjectID: TimeInterval] = [:]
         for metadata in sameMap {
             stateUpdatedAtByObjectID[metadata.object.id] = max(
@@ -115,6 +109,8 @@ public actor SpatialSceneGraphService {
             }
             guard relation.confidence == replacement.confidence,
                 relation.certainty == replacement.certainty,
+                relation.subjectTemporalRevision == replacement.subjectTemporalRevision,
+                relation.objectTemporalRevision == replacement.objectTemporalRevision,
                 relation.validUntil == nil,
                 relationIsFresh(
                     relation,
@@ -161,13 +157,17 @@ public actor SpatialSceneGraphService {
         sameMapObjects: [SpatialObjectMetadata],
         timestamp: TimeInterval
     ) throws -> [RelationKey: SpatialRelation] {
-        guard isEligible(changed), let changedBounds = changed.object.bounds else {
+        guard isEligible(changed), changed.object.lastSeenAt <= timestamp,
+            changed.object.stateUpdatedAt <= timestamp,
+            let changedBounds = changed.object.bounds else {
             return [:]
         }
         var desired: [RelationKey: SpatialRelation] = [:]
         for other in sameMapObjects.sorted(by: { $0.object.id < $1.object.id }) {
             guard other.object.id != changed.object.id,
                 isEligible(other),
+                other.object.lastSeenAt <= timestamp,
+                other.object.stateUpdatedAt <= timestamp,
                 let otherBounds = other.object.bounds
             else {
                 continue
@@ -188,7 +188,9 @@ public actor SpatialSceneGraphService {
                     key: key,
                     confidence: confidence,
                     certainty: certainty,
-                    validFrom: timestamp
+                    validFrom: timestamp,
+                    subjectTemporalRevision: changed.object.temporalRevision,
+                    objectTemporalRevision: other.object.temporalRevision
                 )
             }
             for predicate in deriver.predicates(subject: otherBounds, object: changedBounds) {
@@ -201,7 +203,9 @@ public actor SpatialSceneGraphService {
                     key: key,
                     confidence: confidence,
                     certainty: certainty,
-                    validFrom: timestamp
+                    validFrom: timestamp,
+                    subjectTemporalRevision: other.object.temporalRevision,
+                    objectTemporalRevision: changed.object.temporalRevision
                 )
             }
         }
@@ -266,7 +270,9 @@ public actor SpatialSceneGraphService {
                 confidence: relation.confidence,
                 certainty: relation.certainty,
                 validFrom: relation.validFrom,
-                validUntil: end
+                validUntil: end,
+                subjectTemporalRevision: relation.subjectTemporalRevision,
+                objectTemporalRevision: relation.objectTemporalRevision
             )
         )
     }

@@ -5,6 +5,41 @@ import XCTest
 @testable import Vispace
 
 final class WorldMapCheckpointRepositoryTests: XCTestCase {
+    func testTemporalRevisionAllowsRealClockRollbackAndRejectsOlderRevisionsAfterRestart() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = makeRepository(root: directory)
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let map = try await repository.saveCheckpoint(archive: Data("clock-map".utf8), captureIdentity: identity)
+        let id = ObjectID()
+        func value(at time: TimeInterval, revision: UInt64?) throws -> SpatialObjectMetadata {
+            let object = try SpatialObject(
+                id: id, semanticLabel: "chair", position: Vec3.zero, certainty: .confirmed,
+                confidence: ConfidenceVector(semantic: .one, geometry: .one, tracking: .one, identity: .one, objectState: .one),
+                firstSeenAt: 999, lastSeenAt: time, temporalRevision: revision
+            )
+            return try SpatialObjectMetadata(mapID: map.mapID, object: object, position: FramedPosition(
+                coordinateFrameID: identity.coordinateFrameID, value: .zero,
+                observedAt: time, trackingQuality: .normal, uncertainty: .highConfidenceDepth
+            ))
+        }
+        let legacy = try value(at: 1_000, revision: nil)
+        try await repository.upsertObjectMetadata(legacy)
+        let corrected = try value(at: 100, revision: 2)
+        try await repository.upsertObjectMetadata(corrected)
+        let restarted = makeRepository(root: directory)
+        let snapshot = try await restarted.metadataSnapshot()
+        XCTAssertEqual(snapshot.schemaVersion, 2)
+        XCTAssertEqual(snapshot.objects, [corrected])
+        for stale in [try value(at: 2_000, revision: 1), try value(at: 2_001, revision: nil)] {
+            await assertThrowsErrorAsync { try await restarted.upsertObjectMetadata(stale) } verify: { error in
+                XCTAssertEqual(error as? WorldMapCheckpointRepositoryError, .staleObjectUpdate(id))
+            }
+        }
+        let after = try await restarted.metadataSnapshot()
+        XCTAssertEqual(after.objects, [corrected])
+    }
+
     func testFutureWorldMapEnvelopeIsNotQuarantinedOrUnpublished() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

@@ -106,6 +106,7 @@ public enum SpatialObjectSearchIssue: String, Codable, Hashable, Sendable {
     case multipleSemanticTargets
     case multiplePlausibleObjects
     case groundedPositionLowConfidence
+    case observationTimeInFuture
     case unsupportedIntent
 }
 
@@ -118,6 +119,7 @@ public struct GroundedSpatialObjectCandidate: Hashable, Sendable {
     public let matchesCurrentMap: Bool?
     public let matchesCurrentFloor: Bool?
     public let secondsSinceLastSeen: TimeInterval
+    public let hasFutureObservationTime: Bool
 
     public var groundedPosition: FramedPosition {
         record.metadata.position
@@ -129,7 +131,8 @@ public struct GroundedSpatialObjectCandidate: Hashable, Sendable {
         confidenceGrade: ConfidenceGrade,
         matchesCurrentMap: Bool?,
         matchesCurrentFloor: Bool?,
-        secondsSinceLastSeen: TimeInterval
+        secondsSinceLastSeen: TimeInterval,
+        hasFutureObservationTime: Bool = false
     ) {
         self.record = record
         self.effectiveConfidence = effectiveConfidence
@@ -137,6 +140,7 @@ public struct GroundedSpatialObjectCandidate: Hashable, Sendable {
         self.matchesCurrentMap = matchesCurrentMap
         self.matchesCurrentFloor = matchesCurrentFloor
         self.secondsSinceLastSeen = secondsSinceLastSeen
+        self.hasFutureObservationTime = hasFutureObservationTime
     }
 }
 
@@ -285,7 +289,9 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
                 status: .lowConfidence,
                 matchedSemanticLabels: canonicalLabels,
                 candidates: candidates,
-                issues: [.groundedPositionLowConfidence]
+                issues: ranked[0].candidate.hasFutureObservationTime
+                    ? [.groundedPositionLowConfidence, .observationTimeInFuture]
+                    : [.groundedPositionLowConfidence]
             )
         }
 
@@ -326,7 +332,9 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
         let isLow = candidate.confidenceGrade == .low
         return SpatialObjectSearchResult(route: route, status: isLow ? .lowConfidence : .found,
             matchedSemanticLabels: [record.metadata.object.semanticLabel], candidates: [candidate],
-            issues: isLow ? [.groundedPositionLowConfidence] : [])
+            issues: candidate.hasFutureObservationTime
+                ? [.groundedPositionLowConfidence, .observationTimeInFuture]
+                : (isLow ? [.groundedPositionLowConfidence] : []))
     }
 
     private func routeForBareSemanticLabelIfNeeded(
@@ -355,7 +363,11 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
         context: SpatialObjectSearchContext
     ) -> RankedCandidate {
         let object = record.metadata.object
-        let effectiveConfidence = effectiveLocationConfidence(for: record.metadata)
+        let hasFutureObservationTime = object.lastSeenAt > context.now
+            || object.stateUpdatedAt > context.now
+            || record.metadata.position.observedAt > context.now
+        let effectiveConfidence = hasFutureObservationTime
+            ? ConfidenceScore.zero : effectiveLocationConfidence(for: record.metadata)
         let mapRank: Int
         let mapMatch: Bool?
         if let currentMapID = context.currentMapID {
@@ -389,7 +401,10 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
             confidenceGrade: policy.confidencePolicy.grade(for: effectiveConfidence),
             matchesCurrentMap: mapMatch,
             matchesCurrentFloor: floorMatch,
-            secondsSinceLastSeen: max(0, context.now - object.lastSeenAt)
+            // Keep the actual signed clock difference. A future calendar date
+            // is unavailable recency evidence, never a just-observed record.
+            secondsSinceLastSeen: context.now - object.lastSeenAt,
+            hasFutureObservationTime: hasFutureObservationTime
         )
         return RankedCandidate(
             candidate: candidate,
@@ -447,6 +462,9 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
         }
         let lhsObject = lhs.candidate.record.metadata.object
         let rhsObject = rhs.candidate.record.metadata.object
+        if lhs.candidate.hasFutureObservationTime != rhs.candidate.hasFutureObservationTime {
+            return !lhs.candidate.hasFutureObservationTime
+        }
         if lhs.candidate.secondsSinceLastSeen != rhs.candidate.secondsSinceLastSeen {
             return lhs.candidate.secondsSinceLastSeen < rhs.candidate.secondsSinceLastSeen
         }

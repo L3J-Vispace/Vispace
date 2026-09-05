@@ -6,6 +6,22 @@ import XCTest
 
 @MainActor
 final class SpatialObjectQueryControllerTests: XCTestCase {
+    func testFutureStateTimeKeepsOriginalDateButCannotPublishGuidance() async throws {
+        let map = mapID(970), frame = frameID(970)
+        let original = try metadata(id: objectID(970), mapID: map, frameID: frame, label: "chair")
+        var object = original.object
+        object.stateUpdatedAt = 1_000
+        let future = try SpatialObjectMetadata(mapID: map, object: object, position: original.position)
+        let controller = self.controller(identityBox: QueryIdentityBox(identity(mapID: map, frameID: frame)),
+            records: [record(future, aliases: ["의자"])])
+        controller.submit("의자 찾아줘", now: 100)
+        try await waitForIdle(controller)
+        XCTAssertNil(controller.latestGroundedTarget)
+        XCTAssertEqual(controller.latestPresentation?.result.status, .lowConfidence)
+        XCTAssertEqual(controller.latestPresentation?.result.candidates.first?.record.metadata, future)
+        XCTAssertTrue(controller.latestPresentation?.message.contains("기록 시각") == true)
+    }
+
     func testExplicitChoiceAmongThreeCandidatesPublishesOnlyChosenCurrentRecord() async throws {
         let map = mapID(980), frame = frameID(980)
         let current = identity(mapID: map, frameID: frame)

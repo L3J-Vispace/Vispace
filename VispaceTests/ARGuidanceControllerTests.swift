@@ -6,6 +6,24 @@ import simd
 
 @MainActor
 final class ARGuidanceControllerTests: XCTestCase {
+    func testFutureSourceStateCannotDisplayMarkerEvenWithFreshResolution() async throws {
+        let (stream, continuation) = AsyncStream<ARPoseSnapshot>.makeStream()
+        let context = ContextFixture()
+        let original = try context.metadata()
+        var object = original.object
+        object.stateUpdatedAt = 100
+        let source = try SpatialObjectMetadata(mapID: original.mapID, object: object, position: original.position)
+        let controller = ARGuidanceController(poses: stream,
+            sourceMetadataProvider: { _, _ in source }, nowProvider: { 10 })
+        controller.activate()
+        controller.show(try context.target(sourceMetadata: source))
+        continuation.yield(context.pose())
+        await settle()
+        XCTAssertNil(controller.renderableWorldPosition)
+        XCTAssertNil(controller.target)
+        await controller.deactivateAndWaitForPendingWork()
+    }
+
     func testExplicitLastSeenMarkerAllowsUnchangedRemovedSourceRecord() async throws {
         let (stream, continuation) = AsyncStream<ARPoseSnapshot>.makeStream()
         let context = ContextFixture()
@@ -45,7 +63,7 @@ final class ARGuidanceControllerTests: XCTestCase {
     func testRemovedMovedOrDegradedRecordRevokesMarkerWithoutPose() async throws {
         let context = ContextFixture()
         let source = try context.metadata()
-        for change in 0..<3 {
+        for change in 0..<4 {
             let (stream, continuation) = AsyncStream<ARPoseSnapshot>.makeStream()
             let records = GuidanceRecordStore(source)
             let controller = ARGuidanceController(poses: stream,
@@ -60,6 +78,11 @@ final class ARGuidanceControllerTests: XCTestCase {
             XCTAssertNotNil(controller.renderableWorldPosition)
             if change == 0 {
                 await records.set(nil)
+            } else if change == 3 {
+                var object = source.object
+                object.stateUpdatedAt = 100
+                await records.set(try SpatialObjectMetadata(mapID: source.mapID,
+                    object: object, position: source.position))
             } else {
                 await records.set(try context.metadata(
                     position: change == 1 ? Vec3(x: 1, y: 0, z: -2) : nil,

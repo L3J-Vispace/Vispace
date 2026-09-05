@@ -321,8 +321,12 @@ public final class SpatialRelationQueryController: ObservableObject {
         records: [StoredSpatialObjectRecord]
     ) throws -> SceneGraph {
         var stateUpdatedAtByObjectID: [ObjectID: TimeInterval] = [:]
+        var temporalRevisionByObjectID: [ObjectID: UInt64] = [:]
         for record in records {
             let object = record.metadata.object
+            if let revision = object.temporalRevision {
+                temporalRevisionByObjectID[object.id] = max(temporalRevisionByObjectID[object.id] ?? 0, revision)
+            }
             stateUpdatedAtByObjectID[object.id] = max(
                 stateUpdatedAtByObjectID[object.id] ?? 0,
                 object.stateUpdatedAt
@@ -333,12 +337,17 @@ public final class SpatialRelationQueryController: ObservableObject {
             guard case .object(let subjectID) = relation.key.subject,
                 case .object(let objectID) = relation.key.object,
                 let subjectStateUpdatedAt = stateUpdatedAtByObjectID[subjectID],
-                let objectStateUpdatedAt = stateUpdatedAtByObjectID[objectID],
-                relation.validFrom >= subjectStateUpdatedAt,
-                relation.validFrom >= objectStateUpdatedAt
+                let objectStateUpdatedAt = stateUpdatedAtByObjectID[objectID]
             else {
                 continue
             }
+            let subjectIsFresh = temporalRevisionByObjectID[subjectID].map {
+                relation.subjectTemporalRevision == $0
+            } ?? (relation.validFrom >= subjectStateUpdatedAt)
+            let objectIsFresh = temporalRevisionByObjectID[objectID].map {
+                relation.objectTemporalRevision == $0
+            } ?? (relation.validFrom >= objectStateUpdatedAt)
+            guard subjectIsFresh, objectIsFresh else { continue }
             try freshGraph.upsert(relation)
         }
         return freshGraph

@@ -168,7 +168,8 @@ func temporalTestPose(
     sequence: UInt64,
     trackingState: ARTrackingStateSnapshot = .normal,
     worldMappingStatus: ARWorldMappingStatusSnapshot = .mapped,
-    coordinateFrameStatus: ARCaptureIdentity.Status = .confirmed
+    coordinateFrameStatus: ARCaptureIdentity.Status = .confirmed,
+    captureSegmentID: CaptureSegmentID? = nil
 ) -> ARPoseSnapshot {
     ARPoseSnapshot(
         id: ARFrameID(rawValue: temporalTestUUID(700_000 + Int(sequence))),
@@ -177,7 +178,7 @@ func temporalTestPose(
             attachmentEpoch: 1
         ),
         coordinateFrameID: coordinateFrameID,
-        segmentID: CaptureSegmentID(rawValue: temporalTestUUID(800_000)),
+        segmentID: captureSegmentID ?? CaptureSegmentID(rawValue: temporalTestUUID(800_000)),
         mapID: mapID,
         coordinateFrameStatus: coordinateFrameStatus,
         capturedAt: capturedAt,

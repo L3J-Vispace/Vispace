@@ -6,6 +6,28 @@ import simd
 
 @MainActor
 final class IndoorNavigationControllerTests: XCTestCase {
+    func testFutureSourceStateCannotBecomeDirectOrGroundedNavigationDestination() throws {
+        let fixture = NavigationAppFixture()
+        let original = try fixture.metadata(x: 2)
+        var object = original.object
+        object.stateUpdatedAt = 100
+        let source = try SpatialObjectMetadata(mapID: original.mapID, object: object, position: original.position)
+        let adapter = ARIndoorNavigationTargetAdapter()
+        guard case .invalid(.targetStale) = adapter.resolve(metadata: source,
+            currentIdentity: fixture.identity, now: 10) else {
+            return XCTFail("Future state evidence must not become a direct navigation target")
+        }
+        let target = GroundedSpatialObjectQueryTarget(semanticLabel: object.semanticLabel,
+            objectID: object.id, sourceMapID: source.mapID, currentMapID: fixture.identity.mapID,
+            currentSegmentID: fixture.identity.segmentID, sourcePosition: source.position,
+            currentFramePosition: source.position, intent: .navigate,
+            effectiveConfidence: .one, confidenceGrade: .high, alignmentConfidence: nil, resolvedAt: 10)
+        guard case .invalid(.targetStale) = adapter.resolve(groundedTarget: target,
+            sourceMetadata: source, currentIdentity: fixture.identity, now: 10) else {
+            return XCTFail("A fresh query resolution cannot renew future observation evidence")
+        }
+    }
+
     func testPublishedPathExpiresWhenCaptureStreamsStop() async throws {
         let fixture = NavigationAppFixture()
         let harness = makeHarness(fixture: fixture, engine: IndoorARNavigationEngine(

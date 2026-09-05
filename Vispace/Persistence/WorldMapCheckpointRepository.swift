@@ -436,7 +436,14 @@ public actor WorldMapCheckpointRepository {
             if existing == metadata {
                 return
             }
-            guard metadata.object.stateUpdatedAt > existing.object.stateUpdatedAt else {
+            let newer: Bool
+            switch (metadata.object.temporalRevision, existing.object.temporalRevision) {
+            case (.some(let incoming), .some(let previous)): newer = incoming > previous
+            case (.some, .none): newer = true
+            case (.none, .some): newer = false
+            case (.none, .none): newer = metadata.object.stateUpdatedAt > existing.object.stateUpdatedAt
+            }
+            guard newer else {
                 throw WorldMapCheckpointRepositoryError.staleObjectUpdate(metadata.object.id)
             }
             document.objects[index] = metadata
@@ -561,7 +568,7 @@ public actor WorldMapCheckpointRepository {
         }
 
         do {
-            try SpatialStorageDirectory.validateJSONSchemas(data, allowsLegacyRoot: true)
+            try SpatialStorageDirectory.validateJSONSchemas(data, allowsLegacyRoot: true, maximumSchemaVersion: 2)
             return try SpatialMetadataMigrator.decodeAndMigrate(data)
         } catch let error as SpatialStorageError {
             throw error
@@ -603,7 +610,7 @@ public actor WorldMapCheckpointRepository {
         if fileManager.fileExists(atPath: backupURL.path) {
             let data = try readBoundedMetadata(at: backupURL)
             do {
-                try SpatialStorageDirectory.validateJSONSchemas(data, allowsLegacyRoot: true)
+                try SpatialStorageDirectory.validateJSONSchemas(data, allowsLegacyRoot: true, maximumSchemaVersion: 2)
                 recovered = try SpatialMetadataMigrator.decodeAndMigrate(data)
                 backupData = data
             } catch let error as SpatialStorageError { throw error }
@@ -661,7 +668,7 @@ public actor WorldMapCheckpointRepository {
             try SpatialStorageDirectory.atomicWrite(data, to: backupURL, directory: directoryURL, fileManager: fileManager, reclaiming: !preservePrevious)
         } else if fileManager.fileExists(atPath: metadataURL.path) {
             let previous = try readBoundedMetadata()
-            try SpatialStorageDirectory.validateJSONSchemas(previous, allowsLegacyRoot: true)
+            try SpatialStorageDirectory.validateJSONSchemas(previous, allowsLegacyRoot: true, maximumSchemaVersion: 2)
             _ = try SpatialMetadataMigrator.decodeAndMigrate(previous)
             try SpatialStorageDirectory.atomicWrite(previous, to: backupURL, directory: directoryURL, fileManager: fileManager, reclaiming: !preservePrevious)
         }
