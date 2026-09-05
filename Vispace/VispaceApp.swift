@@ -6,6 +6,7 @@ struct VispaceApp: App {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var services = VispaceServices()
     @StateObject private var onboardingState = OnboardingState()
+    @StateObject private var privacyShield = PrivacySnapshotShield()
 
     var body: some Scene {
         WindowGroup {
@@ -36,6 +37,7 @@ struct VispaceApp: App {
     }
 
     private func updateActivity(_ phase: ScenePhase) {
+        _ = privacyShield
         switch phase {
         case .active:
             services.lifecycle.setActive(onboardingState.hasCompleted)
