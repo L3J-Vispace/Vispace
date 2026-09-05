@@ -165,19 +165,23 @@ public struct ARSurfaceObservationBatch: Sendable {
     /// True when `observations` and `failures` describe every current surface
     /// anchor, so an omitted prior anchor can be removed deterministically.
     public let isAuthoritative: Bool
+    /// Actual delegate callback times, separate from full-list capture time.
+    public let observedAnchorTimestamps: [UUID: TimeInterval]
 
     public init(
         captureIdentity: ARCaptureIdentity,
         timestamp: TimeInterval,
         observations: [ARSurfaceObservation],
         failures: [ARSurfaceObservationFailure],
-        isAuthoritative: Bool = false
+        isAuthoritative: Bool = false,
+        observedAnchorTimestamps: [UUID: TimeInterval] = [:]
     ) {
         self.captureIdentity = captureIdentity
         self.timestamp = timestamp
         self.observations = observations
         self.failures = failures
         self.isAuthoritative = isAuthoritative
+        self.observedAnchorTimestamps = observedAnchorTimestamps
     }
 }
 
@@ -189,6 +193,55 @@ struct ARSurfaceRawCaptureBatch: Sendable {
     let captures: [ARSurfaceRawCapture]
     let failures: [ARSurfaceObservationFailure]
     let isAuthoritative: Bool
+    var observedAnchorTimestamps: [UUID: TimeInterval] = [:]
+}
+
+/// Retaining callback provenance until the session boundary means replacing a
+/// pending full snapshot cannot erase an earlier coalesced anchor update.
+struct ARSurfaceAnchorObservationHistory: Sendable {
+    private struct Event: Sendable {
+        let timestamp: TimeInterval
+        let change: ARSurfaceObservationChange
+        let kind: ARSurfaceKind
+    }
+    private var events: [UUID: Event] = [:]
+
+    mutating func record(
+        anchorID: UUID, kind: ARSurfaceKind, change: ARSurfaceObservationChange,
+        timestamp: TimeInterval
+    ) {
+        guard timestamp.isFinite, timestamp >= 0,
+            events[anchorID].map({ timestamp >= $0.timestamp }) != false
+        else { return }
+        events[anchorID] = Event(timestamp: timestamp, change: change, kind: kind)
+        // Removed anchor IDs can accumulate during long captures. Eviction
+        // only loses freshness evidence; it never manufactures a new time.
+        if events.count > 4_096,
+            let oldest = events.min(by: { $0.value.timestamp < $1.value.timestamp })?.key
+        {
+            events.removeValue(forKey: oldest)
+        }
+    }
+
+    func applying(to batch: ARSurfaceRawCaptureBatch) -> ARSurfaceRawCaptureBatch {
+        var timestamps: [UUID: TimeInterval] = [:]
+        let captures = batch.captures.map { capture -> ARSurfaceRawCapture in
+            guard let event = events[capture.anchorID], event.timestamp <= batch.timestamp else {
+                return capture
+            }
+            timestamps[capture.anchorID] = event.timestamp
+            if event.change == .removed {
+                return ARSurfaceRawCapture(
+                    anchorID: capture.anchorID, change: .removed,
+                    payload: .removed(anchorID: capture.anchorID, kind: event.kind))
+            }
+            return capture
+        }
+        return ARSurfaceRawCaptureBatch(
+            captureIdentity: batch.captureIdentity, timestamp: batch.timestamp,
+            captures: captures, failures: batch.failures, isAuthoritative: batch.isAuthoritative,
+            observedAnchorTimestamps: timestamps)
+    }
 }
 
 struct ARSurfaceRawCapture: Sendable {
@@ -291,6 +344,7 @@ final class ARSurfaceStateAccumulator: @unchecked Sendable {
             startsNewIdentity ? [:] : unresolvedFailures
 
         for observation in batch.observations {
+            let observedAt = batch.observedAnchorTimestamps[observation.anchorID] ?? observation.timestamp
             guard
                 observation.coordinateFrameID == incomingIdentity.coordinateFrameID,
                 observation.segmentID == incomingIdentity.segmentID,
@@ -298,20 +352,25 @@ final class ARSurfaceStateAccumulator: @unchecked Sendable {
                 observation.coordinateFrameStatus == incomingIdentity.status,
                 observation.timestamp.isFinite, observation.timestamp >= 0,
                 observation.timestamp <= batch.timestamp,
-                nextObservedAt[observation.anchorID].map({ observation.timestamp >= $0 }) != false
+                observedAt.isFinite, observedAt >= 0, observedAt <= observation.timestamp,
+                nextObservedAt[observation.anchorID].map({ observedAt >= $0 }) != false
             else {
                 continue
             }
             switch observation.payload {
             case .plane(let plane):
-                if !batch.isAuthoritative || nextPlanes[plane.anchorID] != plane {
-                    nextObservedAt[plane.anchorID] = observation.timestamp
+                if batch.observedAnchorTimestamps[plane.anchorID] != nil
+                    || !batch.isAuthoritative || nextPlanes[plane.anchorID] != plane
+                {
+                    nextObservedAt[plane.anchorID] = observedAt
                 }
                 nextPlanes[plane.anchorID] = plane
                 nextFailures.removeValue(forKey: plane.anchorID)
             case .mesh(let mesh):
-                if !batch.isAuthoritative || nextMeshes[mesh.anchorID] != mesh {
-                    nextObservedAt[mesh.anchorID] = observation.timestamp
+                if batch.observedAnchorTimestamps[mesh.anchorID] != nil
+                    || !batch.isAuthoritative || nextMeshes[mesh.anchorID] != mesh
+                {
+                    nextObservedAt[mesh.anchorID] = observedAt
                 }
                 nextMeshes[mesh.anchorID] = mesh
                 nextFailures.removeValue(forKey: mesh.anchorID)
@@ -619,7 +678,8 @@ public struct ARSurfaceObservationAdapter: Sendable {
             timestamp: rawBatch.timestamp,
             observations: observations,
             failures: failures,
-            isAuthoritative: rawBatch.isAuthoritative
+            isAuthoritative: rawBatch.isAuthoritative,
+            observedAnchorTimestamps: rawBatch.observedAnchorTimestamps
         )
     }
 

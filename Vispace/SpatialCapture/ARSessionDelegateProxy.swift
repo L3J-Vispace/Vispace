@@ -98,6 +98,7 @@ public final class ARSessionDelegateProxy: NSObject, ARSessionDelegate, @uncheck
     private var pendingSurfaceUpdate: DispatchWorkItem?
     private var surfaceIdentityRepublishEpoch: UInt64?
     private var surfaceScheduleGeneration: UInt64 = 0
+    private var surfaceAnchorObservationHistory = ARSurfaceAnchorObservationHistory()
     private let minimumSurfaceUpdateInterval: TimeInterval = 0.5
 
     public init(
@@ -232,37 +233,43 @@ public final class ARSessionDelegateProxy: NSObject, ARSessionDelegate, @uncheck
     }
 
     public func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
-        guard let attachmentEpoch = activeAttachmentEpoch(for: session) else {
+        guard let context = surfaceCallbackContext(for: session),
+            recordSurfaceAnchorCallbacks(anchors, change: .added, context: context)
+        else {
             return
         }
         publishCurrentSurfaceState(
             session: session,
             fallbackAnchors: anchors,
             fallbackChange: .added,
-            attachmentEpoch: attachmentEpoch
+            attachmentEpoch: context.attachmentEpoch, expectedGeneration: context.generation
         )
     }
 
     public func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
-        guard let attachmentEpoch = activeAttachmentEpoch(for: session) else {
+        guard let context = surfaceCallbackContext(for: session),
+            recordSurfaceAnchorCallbacks(anchors, change: .updated, context: context)
+        else {
             return
         }
         publishCoalescedSurfaceState(
             from: anchors,
             session: session,
-            attachmentEpoch: attachmentEpoch
+            attachmentEpoch: context.attachmentEpoch, expectedGeneration: context.generation
         )
     }
 
     public func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
-        guard let attachmentEpoch = activeAttachmentEpoch(for: session) else {
+        guard let context = surfaceCallbackContext(for: session),
+            recordSurfaceAnchorCallbacks(anchors, change: .removed, context: context)
+        else {
             return
         }
         publishCurrentSurfaceState(
             session: session,
             fallbackAnchors: anchors,
             fallbackChange: .removed,
-            attachmentEpoch: attachmentEpoch
+            attachmentEpoch: context.attachmentEpoch, expectedGeneration: context.generation
         )
     }
 
@@ -465,11 +472,43 @@ public final class ARSessionDelegateProxy: NSObject, ARSessionDelegate, @uncheck
         controllerEventChannel?.send(event)
     }
 
+    private func surfaceCallbackContext(for session: ARSession) -> SurfaceCallbackContext? {
+        surfaceUpdateLock.lock()
+        defer { surfaceUpdateLock.unlock() }
+        guard let epoch = activeAttachmentEpoch(for: session) else { return nil }
+        return SurfaceCallbackContext(attachmentEpoch: epoch, generation: surfaceScheduleGeneration)
+    }
+
+    private func recordSurfaceAnchorCallbacks(
+        _ anchors: [ARAnchor], change: ARSurfaceObservationChange, context: SurfaceCallbackContext
+    ) -> Bool {
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        surfaceUpdateLock.lock()
+        defer { surfaceUpdateLock.unlock() }
+        guard surfaceCaptureGate.isEnabled, context.generation == surfaceScheduleGeneration,
+            activeAttachmentEpochIsCurrent(context.attachmentEpoch)
+        else { return false }
+        for anchor in anchors {
+            let kind: ARSurfaceKind
+            if anchor is ARPlaneAnchor {
+                kind = .plane
+            } else if anchor is ARMeshAnchor {
+                kind = .mesh
+            } else {
+                continue
+            }
+            surfaceAnchorObservationHistory.record(
+                anchorID: anchor.identifier, kind: kind, change: change, timestamp: timestamp)
+        }
+        return true
+    }
+
     private func publishSurfaceState(
         from anchors: [ARAnchor],
         change: ARSurfaceObservationChange,
         isAuthoritative: Bool = false,
-        attachmentEpoch: UInt64
+        attachmentEpoch: UInt64,
+        expectedGeneration: UInt64? = nil
     ) {
         guard
             surfaceCaptureGate.isEnabled,
@@ -479,15 +518,18 @@ public final class ARSessionDelegateProxy: NSObject, ARSessionDelegate, @uncheck
         }
         surfaceUpdateLock.lock()
         let generation = surfaceScheduleGeneration
+        let observationHistory = surfaceAnchorObservationHistory
         surfaceUpdateLock.unlock()
+        guard expectedGeneration.map({ $0 == generation }) != false else { return }
         let timestamp = ProcessInfo.processInfo.systemUptime
-        let rawCapture = surfaceAdapter.makeRawCapture(
-            from: anchors,
+        let rawCapture = observationHistory.applying(
+            to: surfaceAdapter.makeRawCapture(
+                from: anchors,
             change: change,
             captureIdentity: captureIdentityProvider(),
             timestamp: timestamp,
             isAuthoritative: isAuthoritative
-        )
+            ))
         let request = SurfaceProcessingRequest(
             rawCapture: rawCapture,
             generation: generation,
@@ -569,7 +611,7 @@ public final class ARSessionDelegateProxy: NSObject, ARSessionDelegate, @uncheck
         session: ARSession,
         fallbackAnchors: [ARAnchor],
         fallbackChange: ARSurfaceObservationChange,
-        attachmentEpoch: UInt64
+        attachmentEpoch: UInt64, expectedGeneration: UInt64
     ) {
         guard isActive(session, attachmentEpoch: attachmentEpoch) else {
             return
@@ -579,13 +621,13 @@ public final class ARSessionDelegateProxy: NSObject, ARSessionDelegate, @uncheck
                 from: currentAnchors,
                 change: .updated,
                 isAuthoritative: true,
-                attachmentEpoch: attachmentEpoch
+                attachmentEpoch: attachmentEpoch, expectedGeneration: expectedGeneration
             )
         } else {
             publishSurfaceState(
                 from: fallbackAnchors,
                 change: fallbackChange,
-                attachmentEpoch: attachmentEpoch
+                attachmentEpoch: attachmentEpoch, expectedGeneration: expectedGeneration
             )
         }
     }
@@ -596,7 +638,7 @@ public final class ARSessionDelegateProxy: NSObject, ARSessionDelegate, @uncheck
     private func publishCoalescedSurfaceState(
         from fallbackAnchors: [ARAnchor],
         session: ARSession,
-        attachmentEpoch: UInt64
+        attachmentEpoch: UInt64, expectedGeneration: UInt64
     ) {
         guard surfaceCaptureGate.isEnabled else {
             return
@@ -605,6 +647,10 @@ public final class ARSessionDelegateProxy: NSObject, ARSessionDelegate, @uncheck
         var publishesImmediately = false
 
         surfaceUpdateLock.lock()
+        guard expectedGeneration == surfaceScheduleGeneration else {
+            surfaceUpdateLock.unlock()
+            return
+        }
         if pendingSurfaceUpdate == nil,
             lastSurfaceUpdateTimestamp.map({
                 now - $0 >= minimumSurfaceUpdateInterval
@@ -633,7 +679,7 @@ public final class ARSessionDelegateProxy: NSObject, ARSessionDelegate, @uncheck
                 session: session,
                 fallbackAnchors: fallbackAnchors,
                 fallbackChange: .updated,
-                attachmentEpoch: attachmentEpoch
+                attachmentEpoch: attachmentEpoch, expectedGeneration: expectedGeneration
             )
         }
     }
@@ -664,13 +710,14 @@ public final class ARSessionDelegateProxy: NSObject, ARSessionDelegate, @uncheck
             from: anchors,
             change: .updated,
             isAuthoritative: true,
-            attachmentEpoch: attachmentEpoch
+            attachmentEpoch: attachmentEpoch, expectedGeneration: generation
         )
     }
 
     private func resetSurfaceUpdateScheduling(clearQueue: Bool = false) {
         surfaceUpdateLock.lock()
         surfaceScheduleGeneration &+= 1
+        surfaceAnchorObservationHistory = ARSurfaceAnchorObservationHistory()
         pendingSurfaceUpdate?.cancel()
         pendingSurfaceUpdate = nil
         surfaceIdentityRepublishEpoch = nil
@@ -765,6 +812,11 @@ private struct SurfaceProcessingRequest: Sendable {
     let rawCapture: ARSurfaceRawCaptureBatch
     let generation: UInt64
     let attachmentEpoch: UInt64
+}
+
+private struct SurfaceCallbackContext {
+    let attachmentEpoch: UInt64
+    let generation: UInt64
 }
 
 private struct ActiveSessionCallbackContext {

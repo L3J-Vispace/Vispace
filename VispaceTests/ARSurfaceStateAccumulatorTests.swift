@@ -4,6 +4,96 @@ import simd
 @testable import Vispace
 
 final class ARSurfaceStateAccumulatorTests: XCTestCase {
+    func testCoalescedCallbackTimesRefreshOnlyActuallyObservedAnchors() throws {
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let first = UUID()
+        let second = UUID()
+        let accumulator = ARSurfaceStateAccumulator()
+        let adapter = ARSurfaceObservationAdapter()
+        var history = ARSurfaceAnchorObservationHistory()
+        func raw(at timestamp: TimeInterval) -> ARSurfaceRawCaptureBatch {
+            ARSurfaceRawCaptureBatch(
+                captureIdentity: identity, timestamp: timestamp,
+                captures: [first, second].map { id in
+                    ARSurfaceRawCapture(
+                        anchorID: id, change: .updated,
+                        payload: .plane(
+                            ARPlaneObservationSnapshot(
+                                anchorID: id,
+                                transform: Matrix4x4Snapshot(matrix_identity_float4x4), center: .zero,
+                                extent: SIMD3<Float>(2, 0, 2), extentRotationOnYAxis: 0, boundaryVertices: [],
+                                alignment: .horizontal, classification: .floor)))
+                }, failures: [], isAuthoritative: true)
+        }
+        for id in [first, second] {
+            history.record(anchorID: id, kind: .plane, change: .added, timestamp: 1)
+        }
+        _ = accumulator.applying(adapter.makeObservations(from: history.applying(to: raw(at: 2))))
+        history.record(anchorID: first, kind: .plane, change: .updated, timestamp: 9)
+        history.record(anchorID: first, kind: .plane, change: .updated, timestamp: 10)
+        // Both intermediate full snapshots may be dropped while mesh work is
+        // in flight; the latest capture still carries the actual callback10.
+        let latest = try XCTUnwrap(
+            accumulator.applying(
+                adapter.makeObservations(from: history.applying(to: raw(at: 12)))))
+        XCTAssertEqual(latest.anchorObservedAt[first], 10)
+        XCTAssertEqual(latest.anchorObservedAt[second], 1)
+        XCTAssertFalse(latest.hasFreshSurfaces(at: 12, maximumAge: 5))
+        let replay = try XCTUnwrap(
+            accumulator.applying(
+                adapter.makeObservations(from: history.applying(to: raw(at: 14)))))
+        XCTAssertEqual(replay.anchorObservedAt, latest.anchorObservedAt)
+        history.record(anchorID: second, kind: .plane, change: .updated, timestamp: 14.5)
+        let merged = try XCTUnwrap(
+            accumulator.applying(
+                adapter.makeObservations(from: history.applying(to: raw(at: 15)))))
+        XCTAssertEqual(merged.anchorObservedAt[first], 10)
+        XCTAssertEqual(merged.anchorObservedAt[second], 14.5)
+        XCTAssertTrue(merged.hasFreshSurfaces(at: 15, maximumAge: 5))
+    }
+
+    func testCallbackRemovalAndGenerationResetDoNotReplayOldFreshness() throws {
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let anchorID = UUID()
+        let plane = ARPlaneObservationSnapshot(
+            anchorID: anchorID,
+            transform: Matrix4x4Snapshot(matrix_identity_float4x4), center: .zero,
+            extent: SIMD3<Float>(2, 0, 2), extentRotationOnYAxis: 0, boundaryVertices: [],
+            alignment: .horizontal, classification: .floor)
+        func raw(at timestamp: TimeInterval) -> ARSurfaceRawCaptureBatch {
+            ARSurfaceRawCaptureBatch(
+                captureIdentity: identity, timestamp: timestamp,
+                captures: [ARSurfaceRawCapture(anchorID: anchorID, change: .updated, payload: .plane(plane))],
+                failures: [], isAuthoritative: true)
+        }
+        let accumulator = ARSurfaceStateAccumulator()
+        let adapter = ARSurfaceObservationAdapter()
+        var history = ARSurfaceAnchorObservationHistory()
+        history.record(anchorID: anchorID, kind: .plane, change: .added, timestamp: 1)
+        _ = accumulator.applying(adapter.makeObservations(from: history.applying(to: raw(at: 2))))
+        history.record(anchorID: anchorID, kind: .plane, change: .removed, timestamp: 3)
+        history.record(anchorID: anchorID, kind: .plane, change: .updated, timestamp: 2.5)
+        // A stale ARFrame anchor list cannot undo a more recent remove callback.
+        let removed = try XCTUnwrap(
+            accumulator.applying(
+                adapter.makeObservations(from: history.applying(to: raw(at: 4)))))
+        XCTAssertNil(removed.planes[anchorID])
+        XCTAssertNil(removed.anchorObservedAt[anchorID])
+        history.record(anchorID: anchorID, kind: .plane, change: .added, timestamp: 5)
+        let restored = try XCTUnwrap(
+            accumulator.applying(
+                adapter.makeObservations(from: history.applying(to: raw(at: 6)))))
+        XCTAssertEqual(restored.anchorObservedAt[anchorID], 5)
+        history.record(anchorID: anchorID, kind: .plane, change: .updated, timestamp: .nan)
+        XCTAssertEqual(history.applying(to: raw(at: 7)).observedAnchorTimestamps[anchorID], 5)
+        history = ARSurfaceAnchorObservationHistory()
+        XCTAssertTrue(history.applying(to: raw(at: 8)).observedAnchorTimestamps.isEmpty)
+        let replay = try XCTUnwrap(
+            accumulator.applying(
+                adapter.makeObservations(from: history.applying(to: raw(at: 8)))))
+        XCTAssertEqual(replay.anchorObservedAt[anchorID], 5)
+    }
+
     func testUnrelatedDeltaAndAuthoritativeReplayDoNotRefreshOldSurface() throws {
         let accumulator = ARSurfaceStateAccumulator()
         let identity = ARCaptureIdentity(status: .confirmed)
