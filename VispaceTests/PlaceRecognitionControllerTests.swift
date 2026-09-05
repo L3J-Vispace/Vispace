@@ -375,7 +375,14 @@ final class PlaceRecognitionControllerTests: XCTestCase {
         let store = try RecordingPlaceStore(fingerprints: [targetRecord])
         let checkpoint = CheckpointCounter()
         let mergeRecorder = LogicalMergeRecorder()
-        let resolver = PlaceCoordinateAlignmentResolver()
+        // This fixture supplies physical identity independently of the shared
+        // class labels; production must remain unresolved without that proof.
+        let verifiedTargetBySource = Dictionary(uniqueKeysWithValues:
+            zip(sourceObjects, targetObjects).map { ($0.object.id, $1.object.id) }
+        )
+        let resolver = PlaceCoordinateAlignmentResolver(identityVerifier: {
+            verifiedTargetBySource[$0.source.objectID] == $0.target.objectID
+        })
         let controller = PlaceRecognitionController(
             surfaces: channel.stream,
             objectMetadataProvider: { sourceObjects + targetObjects },

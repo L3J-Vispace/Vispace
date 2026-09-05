@@ -172,12 +172,26 @@ final class ARSurfaceStateAccumulatorTests: XCTestCase {
                 )
             )
         )
-        let recovered = try XCTUnwrap(accumulator.applying([observation]))
+        // Replaying geometry from before the failed read cannot clear the
+        // failure or attest that the anchor has been observed again.
+        XCTAssertNil(accumulator.applying([observation]))
+        let recovered = try XCTUnwrap(accumulator.applying([
+            ARSurfaceObservation(
+                coordinateFrameID: identity.coordinateFrameID,
+                segmentID: identity.segmentID,
+                mapID: identity.mapID,
+                coordinateFrameStatus: identity.status,
+                timestamp: 3,
+                change: .updated,
+                payload: .plane(plane)
+            )
+        ]))
 
         XCTAssertFalse(incomplete.isComplete)
         XCTAssertEqual(incomplete.unresolvedFailures.first?.anchorID, anchorID)
         XCTAssertEqual(incomplete.planes[anchorID], plane)
         XCTAssertTrue(recovered.isComplete)
+        XCTAssertEqual(recovered.anchorObservedAt[anchorID], 3)
     }
 
     func testAuthoritativeSnapshotRemovesAnchorsMissingFromLatestFrame() throws {
