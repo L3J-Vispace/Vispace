@@ -14,106 +14,31 @@ struct SpatialDataSettingsScreen: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                Section("data.storage.section") {
-                    Label("data.storage.local", systemImage: "iphone")
-                    Label("data.storage.rawFrames", systemImage: "video.slash")
-                    Label("data.storage.retention", systemImage: "clock.arrow.circlepath")
-                }
+            presentedSettings
+        }
+    }
 
-                if let overview = controller.overview {
-                    Section("data.storage.usage") {
-                        LabeledContent("data.storage.used", value: ByteCountFormatter.string(fromByteCount: overview.usedBytes, countStyle: .file))
-                        LabeledContent("data.storage.available", value: ByteCountFormatter.string(fromByteCount: overview.availableBytes, countStyle: .file))
-                        Text("data.storage.budget")
-                    }
-                    Section("data.places.title") {
-                        ForEach(overview.places) { place in
-                            HStack {
-                                VStack(alignment: .leading) {
-                                    Text(String(place.id.description.prefix(8)))
-                                    Text(Date(timeIntervalSince1970: place.updatedAt), format: .dateTime)
-                                        .font(.caption)
-                                    Text("\(place.objectCount) objects")
-                                        .font(.caption)
-                                    Button("data.place.select") { controller.selectPlace(place.id) }
-                                        .disabled(controller.isBusy)
-                                    if controller.supportsPlaceTransfer {
-                                        Button("data.transfer.export") { controller.preparePlaceExport(place.id) }
-                                            .disabled(controller.isBusy)
-                                    }
-                                }
-                                Spacer()
-                                Button(role: .destructive) {
-                                    selectedPlace = place.id
-                                    confirmsPlaceDeletion = true
-                                } label: {
-                                    Image(systemName: "trash")
-                                }
-                                .accessibilityLabel(Text("data.place.delete"))
-                                .disabled(controller.isBusy)
-                            }
-                            .buttonStyle(.borderless)
-                        }
-                    }
-                } else if controller.overviewFailed {
-                    Section { Text("data.storage.read.failed") }
-                }
-
-                if controller.supportsPlaceTransfer {
-                    Section("data.transfer.title") {
-                        Button("data.transfer.import") { selectsImportFile = true }
-                            .disabled(controller.isBusy)
-                        if controller.state == .exporting || controller.state == .importing {
-                            ProgressView("data.transfer.progress")
-                        }
-                        if controller.state == .imported {
-                            Label("data.transfer.import.success", systemImage: "checkmark.circle")
-                        }
-                        if fileSelectionFailed { Text("data.transfer.file.failed").foregroundStyle(.red) }
-                    } footer: { Text("data.transfer.scope") }
-                }
-
-                Section("data.support.title") {
-                    Text("data.support.objects")
-                    Text("data.support.device")
-                    Text("data.support.routes")
-                }
-
-                Section {
-                    Button(role: .destructive) {
-                        confirmsDeletion = true
-                    } label: {
-                        Label("data.delete.action", systemImage: "trash")
-                    }
-                    .disabled(controller.isBusy)
-                    .accessibilityIdentifier("vispace.data.delete")
-
-                    if controller.state == .deleting {
-                        HStack {
-                            ProgressView()
-                            Text("data.delete.progress")
-                        }
-                        .accessibilityElement(children: .combine)
-                    }
-                } footer: {
-                    Text("data.delete.detail")
-                }
-
-                if controller.state == .deleted {
-                    Section {
-                        Label("data.delete.success", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                            .accessibilityIdentifier("vispace.data.delete.success")
-                    }
-                } else if case .failed(let message) = controller.state {
-                    Section {
-                        Label(message, systemImage: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.red)
-                            .accessibilityIdentifier("vispace.data.delete.failure")
-                    }
+    private var presentedSettings: some View {
+        settingsWithDeletionDialogs
+            .fileImporter(
+                isPresented: $selectsImportFile,
+                allowedContentTypes: [.data],
+                allowsMultipleSelection: false
+            ) { result in
+                handleImportFileSelection(result)
+            }
+            .sheet(item: $selectedImportFile) { file in
+                SpatialPlaceImportSheet(controller: controller, selectedFile: file.url)
+            }
+            .sheet(isPresented: presentsPreparedExport) {
+                if let export = controller.preparedExport {
+                    SpatialPlaceExportSheet(export: export) { controller.discardPreparedExport() }
                 }
             }
+    }
+
+    private var settingsWithDeletionDialogs: some View {
+        settingsList
             .navigationTitle("data.title")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -147,28 +72,188 @@ struct SpatialDataSettingsScreen: View {
                 Button("data.delete.confirm.cancel", role: .cancel) {}
             } message: { Text("data.place.delete.detail") }
             .interactiveDismissDisabled(controller.isBusy)
-            .fileImporter(isPresented: $selectsImportFile, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
-                switch result {
-                case .success(let files):
-                    if let file = files.first {
-                        fileSelectionFailed = false
-                        selectedImportFile = SelectedSpatialPlaceArchive(url: file)
+    }
+
+    private var settingsList: some View {
+        List {
+            storagePolicySection
+            storageOverviewSections
+            transferSection
+            supportSection
+            deletionSection
+            statusSection
+        }
+    }
+
+    private var storagePolicySection: some View {
+        Section("data.storage.section") {
+            Label("data.storage.local", systemImage: "iphone")
+            Label("data.storage.rawFrames", systemImage: "video.slash")
+            Label("data.storage.retention", systemImage: "clock.arrow.circlepath")
+        }
+    }
+
+    @ViewBuilder
+    private var storageOverviewSections: some View {
+        if let overview = controller.overview {
+            storageUsageSection(overview)
+            storedPlacesSection(overview.places)
+        } else if controller.overviewFailed {
+            Section { Text("data.storage.read.failed") }
+        }
+    }
+
+    private func storageUsageSection(_ overview: SpatialStorageOverview) -> some View {
+        Section("data.storage.usage") {
+            LabeledContent("data.storage.used", value: ByteCountFormatter.string(fromByteCount: overview.usedBytes, countStyle: .file))
+            LabeledContent("data.storage.available", value: ByteCountFormatter.string(fromByteCount: overview.availableBytes, countStyle: .file))
+            Text("data.storage.budget")
+        }
+    }
+
+    private func storedPlacesSection(_ places: [SpatialStoredPlace]) -> some View {
+        Section("data.places.title") {
+            ForEach(places) { place in
+                SpatialStoredPlaceRow(
+                    place: place,
+                    isBusy: controller.isBusy,
+                    supportsTransfer: controller.supportsPlaceTransfer,
+                    select: { controller.selectPlace(place.id) },
+                    export: { controller.preparePlaceExport(place.id) },
+                    delete: {
+                        selectedPlace = place.id
+                        confirmsPlaceDeletion = true
                     }
-                case .failure: fileSelectionFailed = true
-                }
-            }
-            .sheet(item: $selectedImportFile) { file in
-                SpatialPlaceImportSheet(controller: controller, selectedFile: file.url)
-            }
-            .sheet(isPresented: Binding(
-                get: { controller.preparedExport != nil },
-                set: { if !$0 { controller.discardPreparedExport() } }
-            )) {
-                if let export = controller.preparedExport {
-                    SpatialPlaceExportSheet(export: export) { controller.discardPreparedExport() }
-                }
+                )
             }
         }
+    }
+
+    @ViewBuilder
+    private var transferSection: some View {
+        if controller.supportsPlaceTransfer {
+            Section {
+                Button("data.transfer.import") { selectsImportFile = true }
+                    .disabled(controller.isBusy)
+                if controller.state == .exporting || controller.state == .importing {
+                    ProgressView("data.transfer.progress")
+                }
+                if controller.state == .imported {
+                    Label("data.transfer.import.success", systemImage: "checkmark.circle")
+                }
+                if fileSelectionFailed {
+                    Text("data.transfer.file.failed").foregroundStyle(.red)
+                }
+            } header: {
+                Text("data.transfer.title")
+            } footer: {
+                Text("data.transfer.scope")
+            }
+        }
+    }
+
+    private var supportSection: some View {
+        Section("data.support.title") {
+            Text("data.support.objects")
+            Text("data.support.device")
+            Text("data.support.routes")
+        }
+    }
+
+    private var deletionSection: some View {
+        Section {
+            Button(role: .destructive) {
+                confirmsDeletion = true
+            } label: {
+                Label("data.delete.action", systemImage: "trash")
+            }
+            .disabled(controller.isBusy)
+            .accessibilityIdentifier("vispace.data.delete")
+
+            if controller.state == .deleting {
+                HStack {
+                    ProgressView()
+                    Text("data.delete.progress")
+                }
+                .accessibilityElement(children: .combine)
+            }
+        } footer: {
+            Text("data.delete.detail")
+        }
+    }
+
+    @ViewBuilder
+    private var statusSection: some View {
+        if controller.state == .deleted {
+            Section {
+                Label("data.delete.success", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .accessibilityIdentifier("vispace.data.delete.success")
+            }
+        } else if case .failed(let message) = controller.state {
+            Section {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                    .accessibilityIdentifier("vispace.data.delete.failure")
+            }
+        }
+    }
+
+    private var presentsPreparedExport: Binding<Bool> {
+        Binding(
+            get: { controller.preparedExport != nil },
+            set: { if !$0 { controller.discardPreparedExport() } }
+        )
+    }
+
+    private func handleImportFileSelection(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let files):
+            if let file = files.first {
+                fileSelectionFailed = false
+                selectedImportFile = SelectedSpatialPlaceArchive(url: file)
+            }
+        case .failure:
+            fileSelectionFailed = true
+        }
+    }
+}
+
+private struct SpatialStoredPlaceRow: View {
+    let place: SpatialStoredPlace
+    let isBusy: Bool
+    let supportsTransfer: Bool
+    let select: () -> Void
+    let export: () -> Void
+    let delete: () -> Void
+
+    private var shortIdentifier: String {
+        String(place.id.description.prefix(8))
+    }
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading) {
+                Text(verbatim: shortIdentifier)
+                Text(Date(timeIntervalSince1970: place.updatedAt), format: .dateTime)
+                    .font(.caption)
+                Text("\(place.objectCount) objects")
+                    .font(.caption)
+                Button("data.place.select", action: select)
+                    .disabled(isBusy)
+                if supportsTransfer {
+                    Button("data.transfer.export", action: export)
+                        .disabled(isBusy)
+                }
+            }
+            Spacer()
+            Button(role: .destructive, action: delete) {
+                Image(systemName: "trash")
+            }
+            .accessibilityLabel(Text("data.place.delete"))
+            .disabled(isBusy)
+        }
+        .buttonStyle(.borderless)
     }
 }
 
