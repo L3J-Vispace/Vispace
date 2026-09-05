@@ -46,10 +46,17 @@ Insufficient or incompatible evidence returns an explicit unavailable, unsuitabl
 
 ## Status vocabulary
 
+- **Source connected:** the application path and corresponding tests are present; the latest build and tests may still be pending.
 - **Implemented:** the source path is connected end to end and covered by the repository's current automated verification.
 - **Physically accepted:** the signed build has also passed the phase's recorded real-device and real-space measurements.
 
 An implemented phase is not described as physically accepted until that evidence exists.
+
+The phase descriptions below summarize the earlier milestone. They do not establish
+completion of every edge case. The [G01–G08 follow-up](FEATURE_GAPS_2026-09-05.md)
+is the authority for the later continuous-identity, long-gap confirmation,
+classification-correction, cross-coordinate appearance, observed-relation,
+named-entity grounding, and door-passage work and its latest execution status.
 
 ## Phase 0 — production shell and informed camera start
 

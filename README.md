@@ -81,10 +81,17 @@ The review records the tested source manifest separately from historical test ru
 
 Follow-up findings and their implementation, verification, and remaining feature limits are tracked in the [audit remediation record](docs/AUDIT_REMEDIATION_2026-09-05.md).
 
+The eight subsequent functional gaps at `a5ae285`, their implementation boundaries,
+and current validation status are tracked in the [feature gap follow-up](docs/FEATURE_GAPS_2026-09-05.md).
+Long-gap object identity uses explicit user confirmation; classification correction
+is a separate action from naming. Cross-map appearance matching and observed
+door passage have conservative admission rules that still require device calibration.
+
 ## Privacy and retention
 
 - Raw camera frames and raw camera video are processed ephemerally. They are neither persisted nor transmitted by Vispace.
 - Durable maps, object metadata, and spatial relations stay on the device until user deletion. Replay, inference, and association bookkeeping is bounded and may rotate; historical mutation proposals are not silently discarded without acknowledgement.
+- Bounded Vision appearance feature vectors and their capture provenance also remain in the protected local spatial store. They are removed by whole-store or owning-map deletion; the current export format does not include these descriptors.
 - The dedicated store is excluded from new OS backups and uses iOS file protection. Copies already present in older backups cannot be removed by the app.
 - The spatial-data settings screen deletes the dedicated local Vispace spatial-capture store after confirmation.
 - Search, last-seen, relation, placement, and navigation logic run locally and do not depend on an LLM or network connection.
