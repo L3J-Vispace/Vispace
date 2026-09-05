@@ -321,12 +321,21 @@ final class SpatialPlaceArchiveServiceTests: XCTestCase {
     }
 
     private func makeRepository(
-        _ directory: URL, failCatalogWrites: Bool = false, fileManager: FileManager? = nil
+        _ directory: URL, failCatalogWrites: Bool = false,
+        fileManager: ArchiveCatalogCollisionFileManager? = nil
     ) -> WorldMapCheckpointRepository {
         let blobs = ARWorldMapBlobStore(directoryURL: directory.appendingPathComponent("WorldMaps"),
             maximumArchiveBytes: ARWorldMapArchiveCodec.maximumArchiveBytes, archiveValidator: { _ in })
+        if let fileManager {
+            return WorldMapCheckpointRepository(directoryURL: directory, blobStore: blobs,
+                fileManager: fileManager)
+        }
+        if failCatalogWrites {
+            return WorldMapCheckpointRepository(directoryURL: directory, blobStore: blobs,
+                fileManager: ArchiveFullDiskFileManager())
+        }
         return WorldMapCheckpointRepository(directoryURL: directory, blobStore: blobs,
-            fileManager: fileManager ?? (failCatalogWrites ? ArchiveFullDiskFileManager() : FileManager()))
+            fileManager: FileManager())
     }
 
     private func activeBlobNames(in directory: URL) throws -> [String] {
