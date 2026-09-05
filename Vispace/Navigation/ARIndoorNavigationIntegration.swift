@@ -12,6 +12,8 @@ public enum ARIndoorNavigationEvidenceIssue: String, Equatable, Sendable {
     case floorCoverageUnavailable
     case freeSpaceCoverageUnavailable
     case coverageAttestationUnavailable
+    case surfaceObservationStale
+    case dynamicOccupancyUnavailable
 }
 
 public enum ARIndoorNavigationEvidenceAdaptation: Sendable {
@@ -415,6 +417,7 @@ public enum ARIndoorNavigationControllerState: String, Equatable, Sendable {
     case ready
     case routing
     case navigating
+    case arrived
     case noPath
     case invalidated
 }
@@ -490,12 +493,19 @@ public final class IndoorNavigationController: ObservableObject {
     private var isActive = false
     private var latestSurface: ARSurfaceStateSnapshot?
     private var latestPose: ARPoseSnapshot?
+    private var latestPoseReceivedUptime: TimeInterval?
+    private var evaluationClockAnchor: (timestamp: TimeInterval, uptime: TimeInterval)?
     private var monitoredIdentity: ARCaptureIdentity?
     private var latestPoseSessionToken: ARSessionFrameToken?
     private var pendingDestination: PendingNavigationDestination?
     private var requestID: UInt64 = 0
     private var operationID: UInt64 = 0
     private var contextGeneration: UInt64 = 0
+    private var routeOriginPose: ARPoseSnapshot?
+    private var routeLeaseTask: Task<Void, Never>?
+    private var hasArrived = false
+    private let movementReevaluationDistance = 0.25
+    private let arrivalDistance = 0.35
 
     public convenience init(
         surfaces: AsyncStream<ARSurfaceStateSnapshot>,
@@ -612,6 +622,7 @@ public final class IndoorNavigationController: ObservableObject {
         poseMonitorTask?.cancel()
         routeTask?.cancel()
         routeDebounceTask?.cancel()
+        routeLeaseTask?.cancel()
         for task in trackedRouteTasks.values {
             task.cancel()
         }
@@ -679,6 +690,7 @@ public final class IndoorNavigationController: ObservableObject {
     public func clearRoute() {
         requestID &+= 1
         pendingDestination = nil
+        hasArrived = false
         cancelRoute(countCancellation: true)
         revokePublishedRoute(countInvalidation: false)
         updateReadyState()
@@ -687,6 +699,7 @@ public final class IndoorNavigationController: ObservableObject {
     private func beginRequest(_ destination: PendingNavigationDestination) {
         requestID &+= 1
         pendingDestination = destination
+        hasArrived = false
         cancelRoute(countCancellation: true)
         revokePublishedRoute(countInvalidation: false)
         guard isActive else {
@@ -782,12 +795,40 @@ public final class IndoorNavigationController: ObservableObject {
             latestPoseSessionToken = pose.sessionToken
         }
         latestPose = pose
+        latestPoseReceivedUptime = ProcessInfo.processInfo.systemUptime
         guard poseIsUsableForNavigation(pose) else {
             contextGeneration &+= 1
             cancelRoute(countCancellation: true)
             revokePublishedRoute(countInvalidation: true)
             updateReadyState()
             return
+        }
+        if let path = renderablePath, let destination = path.waypoints.last,
+            hypot(Double(pose.cameraTransform.column3.x) - destination.x,
+                  Double(pose.cameraTransform.column3.z) - destination.z) <= arrivalDistance
+        {
+            cancelRoute(countCancellation: true)
+            revokePublishedRoute(countInvalidation: false)
+            hasArrived = true
+            if let pendingDestination {
+                latestPresentation = ARIndoorNavigationPresentation(
+                    destinationObjectID: pendingDestination.objectID,
+                    semanticLabel: pendingDestination.semanticLabel,
+                    result: nil, evidenceIssue: nil, poseIssue: nil, targetIssue: nil,
+                    pathOutput: nil, message: "목적지의 기록된 위치에 도착했어요. 주변에서 물체를 확인해 주세요."
+                )
+            }
+            state = .arrived
+            return
+        }
+        if let origin = routeOriginPose,
+            horizontalDistance(origin, pose) >= movementReevaluationDistance
+                || (renderablePath == nil && latestPresentation != nil
+                    && pose.timestamp - origin.timestamp >= 1)
+        {
+            contextGeneration &+= 1
+            cancelRoute(countCancellation: true)
+            revokePublishedRoute(countInvalidation: true)
         }
         updateReadyState()
         if latestPresentation == nil {
@@ -801,7 +842,11 @@ public final class IndoorNavigationController: ObservableObject {
         monitoredIdentity = identity
         latestSurface = nil
         latestPose = nil
+        latestPoseReceivedUptime = nil
+        evaluationClockAnchor = nil
         latestPoseSessionToken = nil
+        routeOriginPose = nil
+        hasArrived = false
         contextGeneration &+= 1
         cancelRoute(countCancellation: true)
         revokePublishedRoute(countInvalidation: hadIdentity)
@@ -810,6 +855,10 @@ public final class IndoorNavigationController: ObservableObject {
     private func updateReadyState() {
         guard isActive else {
             state = .inactive
+            return
+        }
+        if hasArrived {
+            state = .arrived
             return
         }
         if routeTask != nil || routeDebounceTask != nil {
@@ -836,7 +885,7 @@ public final class IndoorNavigationController: ObservableObject {
     }
 
     private func scheduleRouteIfPossible() {
-        guard isActive, routeTask == nil, routeDebounceTask == nil,
+        guard isActive, !hasArrived, routeTask == nil, routeDebounceTask == nil,
             pendingDestination != nil,
             let surface = latestSurface,
             let pose = latestPose
@@ -905,6 +954,7 @@ public final class IndoorNavigationController: ObservableObject {
 
         let capturedRequestID = requestID
         operationID &+= 1
+        routeOriginPose = pose
         let capturedOperationID = operationID
         let capturedGeneration = contextGeneration
         let evidenceProvider = self.evidenceProvider
@@ -997,13 +1047,12 @@ public final class IndoorNavigationController: ObservableObject {
                 // dated, and geometry is never restamped to hide its age.
                 // Omitted providers retain snapshot-only compatibility for
                 // existing clients; live composition supplies the session clock.
-                let evaluatedAt =
-                    self.evaluationTimestampProvider.map { $0() ?? .nan }
-                    ?? max(
+                let evaluatedAt = self.currentEvaluationTime(fallback: max(
                         evidence.observedAt,
                         startPosition.observedAt,
                         self.latestPose?.timestamp ?? pose.timestamp
-                    )
+                    ))
+                let evaluationUptime = ProcessInfo.processInfo.systemUptime
                 let routeWork = Task.detached(priority: .userInitiated) {
                     engine.route(
                         from: startPosition, to: metadata, using: evidence, evaluatedAt: evaluatedAt
@@ -1030,12 +1079,31 @@ public final class IndoorNavigationController: ObservableObject {
                     )
                     return
                 }
+                let currentEvaluationTime = self.currentEvaluationTime(
+                    fallback: evaluatedAt + max(0, ProcessInfo.processInfo.systemUptime - evaluationUptime)
+                )
+                guard result.status != .success || (currentEvaluationTime.isFinite &&
+                    currentEvaluationTime - evidence.observedAt <= engine.policy.maximumEvidenceAge &&
+                    currentEvaluationTime - startPosition.observedAt <= engine.policy.maximumStartAge &&
+                    self.latestPose.map({ self.horizontalDistance(pose, $0) < self.movementReevaluationDistance }) == true)
+                else {
+                    self.publishEvidenceIssue(.surfaceObservationStale, destination: destination)
+                    self.finish(requestID: capturedRequestID, operationID: capturedOperationID)
+                    return
+                }
                 self.publish(
                     result: result,
                     destination: destination,
                     identity: identity,
                     surfaceRevision: surface.revision
                 )
+                if self.renderablePath != nil {
+                    self.startRouteLease(duration: min(
+                        1,
+                        engine.policy.maximumEvidenceAge - (currentEvaluationTime - evidence.observedAt),
+                        engine.policy.maximumStartAge - (currentEvaluationTime - startPosition.observedAt)
+                    ))
+                }
                 self.finish(
                     requestID: capturedRequestID,
                     operationID: capturedOperationID
@@ -1078,13 +1146,19 @@ public final class IndoorNavigationController: ObservableObject {
     ) async throws -> ARIndoorNavigationTargetResolution {
         switch destination {
         case .metadata(let metadata):
+            if let sourceMetadataProvider {
+                guard let current = try await sourceMetadataProvider(metadata.object.id, metadata.mapID),
+                    current.position == metadata.position,
+                    current.object == metadata.object
+                else { return .invalid(.searchTargetMismatch) }
+            }
             return targetAdapter.resolve(metadata: metadata, currentIdentity: identity)
         case .grounded(let target, let suppliedMetadata):
             let metadata: SpatialObjectMetadata?
-            if let suppliedMetadata {
-                metadata = suppliedMetadata
-            } else if let sourceMetadataProvider {
+            if let sourceMetadataProvider {
                 metadata = try await sourceMetadataProvider(target.objectID, target.sourceMapID)
+            } else if let suppliedMetadata {
+                metadata = suppliedMetadata
             } else {
                 metadata = nil
             }
@@ -1246,12 +1320,50 @@ public final class IndoorNavigationController: ObservableObject {
     }
 
     private func revokePublishedRoute(countInvalidation: Bool) {
+        routeLeaseTask?.cancel()
+        routeLeaseTask = nil
         let hadRoute = renderablePath != nil || latestPresentation != nil
         renderablePath = nil
         latestPresentation = nil
         if countInvalidation, hadRoute {
             metrics.routeInvalidations &+= 1
             state = .invalidated
+        }
+    }
+
+    private func horizontalDistance(_ first: ARPoseSnapshot, _ second: ARPoseSnapshot) -> Double {
+        hypot(Double(first.cameraTransform.column3.x - second.cameraTransform.column3.x),
+              Double(first.cameraTransform.column3.z - second.cameraTransform.column3.z))
+    }
+
+    private func currentEvaluationTime(fallback: TimeInterval) -> TimeInterval {
+        if let evaluationTimestampProvider {
+            guard let supplied = evaluationTimestampProvider(), supplied.isFinite else { return .nan }
+            let uptime = ProcessInfo.processInfo.systemUptime
+            if evaluationClockAnchor?.timestamp != supplied {
+                evaluationClockAnchor = (supplied, uptime)
+            }
+            return supplied + max(0, uptime - (evaluationClockAnchor?.uptime ?? uptime))
+        }
+        guard let latestPose, let latestPoseReceivedUptime else { return fallback }
+        return max(fallback, latestPose.timestamp
+            + max(0, ProcessInfo.processInfo.systemUptime - latestPoseReceivedUptime))
+    }
+
+    /// A short render lease expires even when surface and pose streams stop.
+    /// Re-evaluation fetches current metadata and current obstacle evidence.
+    private func startRouteLease(duration: TimeInterval) {
+        routeLeaseTask?.cancel()
+        let generation = contextGeneration
+        let request = requestID
+        routeLeaseTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(max(0, duration))) } catch { return }
+            guard let self, self.isActive, self.contextGeneration == generation,
+                self.requestID == request else { return }
+            self.contextGeneration &+= 1
+            self.cancelRoute(countCancellation: true)
+            self.revokePublishedRoute(countInvalidation: true)
+            self.scheduleRouteIfPossible()
         }
     }
 
@@ -1306,7 +1418,7 @@ public final class IndoorNavigationController: ObservableObject {
         case .success:
             let distance = result.path?.totalDistance ?? 0
             return String(
-                format: "‘%@’까지 확인된 안전 경로예요. 약 %.1f미터 이동하세요.",
+                format: "관측된 바닥을 따라 ‘%@’까지 약 %.1f미터예요. 이동 중 주변 장애물을 직접 확인해 주세요.",
                 label,
                 distance
             )
@@ -1341,6 +1453,10 @@ public final class IndoorNavigationController: ObservableObject {
             return "AR 표면만으로 빈 통로와 장애물 누락 여부를 확인할 수 없어 경로를 추정하지 않았어요."
         case .coverageAttestationUnavailable:
             return "벽, 문, 장애물의 확인 범위가 부족해 안전한 경로를 확정할 수 없어요."
+        case .surfaceObservationStale:
+            return "관측한 공간 정보가 오래되어 경로를 지웠어요. 바닥과 통로를 다시 비춰 주세요."
+        case .dynamicOccupancyUnavailable:
+            return "현재 통로의 장애물 정보를 확인하지 못해 경로를 표시하지 않았어요."
         }
     }
 

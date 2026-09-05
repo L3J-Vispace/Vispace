@@ -6,6 +6,52 @@ import simd
 
 @MainActor
 final class IndoorNavigationControllerTests: XCTestCase {
+    func testPublishedPathExpiresWhenCaptureStreamsStop() async throws {
+        let fixture = NavigationAppFixture()
+        let harness = makeHarness(fixture: fixture, engine: IndoorARNavigationEngine(
+            policy: try IndoorNavigationPolicy(maximumStartAge: 0.08, maximumEvidenceAge: 0.08)
+        ))
+        harness.controller.activate()
+        harness.surfaceContinuation.yield(fixture.surface(revision: 1))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10))
+        harness.controller.navigate(to: try fixture.metadata(x: 2))
+        await eventually { harness.controller.renderablePath != nil }
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertNil(harness.controller.renderablePath)
+        XCTAssertGreaterThanOrEqual(harness.controller.metrics.routeInvalidations, 1)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
+    func testWalkingInvalidatesPreviousOriginAndReevaluates() async throws {
+        let fixture = NavigationAppFixture()
+        let harness = makeHarness(fixture: fixture)
+        harness.controller.activate()
+        harness.surfaceContinuation.yield(fixture.surface(revision: 1))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10))
+        harness.controller.navigate(to: try fixture.metadata(x: 2))
+        await eventually { harness.controller.renderablePath != nil }
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10.2, x: 0.5))
+        await eventually { harness.controller.metrics.requestsStarted >= 2 }
+        XCTAssertNil(harness.controller.renderablePath)
+        XCTAssertGreaterThanOrEqual(harness.controller.metrics.routeInvalidations, 1)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
+    func testArrivalRemovesPathAndFinishesNavigation() async throws {
+        let fixture = NavigationAppFixture()
+        let harness = makeHarness(fixture: fixture)
+        harness.controller.activate()
+        harness.surfaceContinuation.yield(fixture.surface(revision: 1))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10))
+        harness.controller.navigate(to: try fixture.metadata(x: 2))
+        await eventually { harness.controller.renderablePath != nil }
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10.1, x: 1.9))
+        await eventually { harness.controller.state == .arrived }
+        XCTAssertNil(harness.controller.renderablePath)
+        XCTAssertTrue(harness.controller.latestPresentation?.message.contains("도착") == true)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
     func testRawSurfaceAdapterNeverInventsFreeSpaceCoverage() throws {
         let fixture = NavigationAppFixture()
         let snapshot = fixture.surface(revision: 1)
@@ -892,6 +938,7 @@ final class IndoorNavigationControllerTests: XCTestCase {
 
     private func makeHarness(
         fixture: NavigationAppFixture,
+        engine: IndoorARNavigationEngine = IndoorARNavigationEngine(),
         evidence: IndoorNavigationEvidence? = nil,
         metadataProvider: IndoorNavigationController.SourceMetadataProvider? = nil,
         surfaceStabilityDelay: Duration = .zero,
@@ -921,6 +968,7 @@ final class IndoorNavigationControllerTests: XCTestCase {
                 )
             },
             sourceMetadataProvider: metadataProvider,
+            engine: engine,
             surfaceStabilityDelay: surfaceStabilityDelay,
             evaluationTimestampProvider: evaluationTimestampProvider,
             nowProvider: { now }

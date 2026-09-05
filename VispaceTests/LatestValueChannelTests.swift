@@ -170,6 +170,21 @@ final class ARSessionDelegateProxyEventRoutingTests: XCTestCase {
         proxy.endControllerEvents()
     }
 
+    func testCheckpointFailureReachesControllerInsteadOfOnlyDiagnostics() async {
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let runContext = ARSessionRunContext(generation: 1, startedAt: 0)
+        let proxy = ARSessionDelegateProxy(
+            imageOrientationProvider: { .right }, captureIdentityProvider: { identity },
+            sessionRunContextProvider: { runContext }, displayGeometryProvider: { nil }
+        )
+        let events = proxy.beginControllerEvents()
+        proxy.emit(.worldMapArchiveFailed(message: "storage unavailable"))
+        proxy.endControllerEvents()
+        var iterator = events.makeAsyncIterator()
+        let event = await iterator.next()
+        XCTAssertEqual(event, .worldMapArchiveFailed(message: "storage unavailable"))
+    }
+
     @MainActor
     func testCallbackFromPreviouslyInstalledSessionIsDiscarded() async {
         let identity = ARCaptureIdentity(status: .confirmed)

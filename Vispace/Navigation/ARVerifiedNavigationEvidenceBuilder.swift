@@ -49,6 +49,111 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
 
     public func adapt(
         _ snapshot: ARSurfaceStateSnapshot,
+        currentIdentity: ARCaptureIdentity,
+        currentDepthFrame: ARFrameSnapshot? = nil,
+        recentDepthFrames: [ARNavigationDepthFrame] = [],
+        dynamicObjects: [SpatialObjectMetadata] = []
+    ) -> ARIndoorNavigationEvidenceAdaptation {
+        let staticResult = adaptStaticGeometry(snapshot, currentIdentity: currentIdentity)
+        guard case .ready(let candidate) = staticResult else { return staticResult }
+        guard let frame = currentDepthFrame,
+            frame.pose.coordinateFrameStatus == .confirmed,
+            frame.pose.trackingState == .normal,
+            frame.pose.mapID == snapshot.mapID,
+            frame.pose.coordinateFrameID == snapshot.coordinateFrameID,
+            frame.pose.segmentID == snapshot.segmentID,
+            frame.pose.timestamp.isFinite,
+            frame.pose.timestamp - snapshot.timestamp >= -0.25,
+            snapshot.hasFreshSurfaces(at: frame.pose.timestamp, maximumAge: 5),
+            let currentDepth = ARNavigationDepthFrame(frame)
+        else { return .insufficientEvidence(.dynamicOccupancyUnavailable) }
+
+        var seenFrames: Set<ARFrameID> = []
+        let frames = ([currentDepth] + recentDepthFrames)
+            .filter {
+                $0.pose.sessionToken == frame.pose.sessionToken
+                    && $0.pose.mapID == frame.pose.mapID
+                    && $0.pose.coordinateFrameID == frame.pose.coordinateFrameID
+                    && $0.pose.segmentID == frame.pose.segmentID
+                    && $0.pose.coordinateFrameStatus == .confirmed
+                    && $0.pose.trackingState == .normal
+                    && frame.pose.timestamp - $0.pose.timestamp >= 0
+                    && frame.pose.timestamp - $0.pose.timestamp <= 3
+            }
+            .sorted { $0.pose.timestamp > $1.pose.timestamp }
+            .filter { seenFrames.insert($0.pose.id).inserted }
+            .prefix(16)
+        let occupancies = frames.compactMap {
+            ARDepthNavigationOccupancy(pose: $0.pose, intrinsics: $0.intrinsics,
+                imageDimensions: $0.imageDimensions, depth: $0.depth)
+        }
+        guard !occupancies.isEmpty, occupancies.count == frames.count else {
+            return .insufficientEvidence(.dynamicOccupancyUnavailable)
+        }
+
+        var checks = 0
+        let elevations = Dictionary(uniqueKeysWithValues: candidate.floors.map { ($0.cell, $0.elevation) })
+        let mesh = candidate.mesh.map { cell -> IndoorNavigationMeshEvidence in
+            guard cell.occupancy == .free, let elevation = elevations[cell.cell] else { return cell }
+            var state: IndoorNavigationMeshOccupancy = .unknown
+            for occupancy in occupancies {
+                let observation = occupancy.observation(
+                    centerX: candidate.gridOrigin.x + Double(cell.cell.column) * cellSize,
+                    centerZ: candidate.gridOrigin.z + Double(cell.cell.row) * cellSize,
+                    floorElevation: elevation, halfWidth: cellSize / 2,
+                    remainingChecks: &checks
+                )
+                switch observation {
+                case .free: state = .free
+                case .blocked: state = .blocked
+                case .uncertain: state = .unknown
+                case .unobserved: continue
+                }
+                break
+            }
+            return IndoorNavigationMeshEvidence(cell: cell.cell, occupancy: state, confidence: cell.confidence)
+        }
+        guard mesh.contains(where: { $0.occupancy == .free }) else {
+            return .insufficientEvidence(.dynamicOccupancyUnavailable)
+        }
+        let currentObjects = dynamicObjects.filter {
+            $0.mapID == snapshot.mapID
+                && $0.position.coordinateFrameID == snapshot.coordinateFrameID
+                && $0.object.presence != .removed
+        }
+        guard currentObjects.count <= 2_048 else {
+            return .insufficientEvidence(.coverageAttestationUnavailable)
+        }
+        var obstacles: [IndoorNavigationObstacleEvidence] = []
+        for record in currentObjects {
+            // Keep known objects conservative even when they are temporarily
+            // not visible. Fresh depth additionally catches unrecognized motion.
+            let position = record.position.value
+            guard let bounds = record.object.bounds ?? (try? AABB(
+                min: Vec3(x: position.x - 0.35, y: position.y - 0.35, z: position.z - 0.35),
+                max: Vec3(x: position.x + 0.35, y: position.y + 0.35, z: position.z + 0.35)
+            )), let obstacle = try? IndoorNavigationObstacleEvidence(
+                identifier: "object-\(record.object.id.rawValue)", objectID: record.object.id,
+                bounds: bounds, confidence: evidenceConfidence
+            ) else { return .insufficientEvidence(.coverageAttestationUnavailable) }
+            obstacles.append(obstacle)
+        }
+        guard let verified = try? IndoorNavigationEvidence(
+            mapID: candidate.mapID, coordinateFrameID: candidate.coordinateFrameID,
+            revision: candidate.revision, observedAt: candidate.observedAt,
+            gridOrigin: candidate.gridOrigin, cellSize: candidate.cellSize,
+            floors: candidate.floors, mesh: mesh, doors: candidate.doors,
+            walls: candidate.walls, obstacles: obstacles, completeness: .complete
+        ) else { return .insufficientEvidence(.coverageAttestationUnavailable) }
+        return ARSurfaceIndoorNavigationEvidenceAdapter().adapt(
+            snapshot, currentIdentity: currentIdentity, verifiedEvidence: verified
+        )
+    }
+
+    /// Geometry candidate only. Public routing also requires current raw depth
+    /// coverage and current object obstacles; static floors do not prove this.
+    func adaptStaticGeometry(
+        _ snapshot: ARSurfaceStateSnapshot,
         currentIdentity: ARCaptureIdentity
     ) -> ARIndoorNavigationEvidenceAdaptation {
         guard !Task.isCancelled else {
@@ -61,6 +166,9 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
         }
         guard snapshot.isComplete else {
             return .insufficientEvidence(.surfaceSnapshotIncomplete)
+        }
+        guard snapshot.hasFreshSurfaces(at: snapshot.timestamp, maximumAge: 5) else {
+            return .insufficientEvidence(.surfaceObservationStale)
         }
         guard let mapID = currentIdentity.mapID,
             snapshot.mapID == mapID

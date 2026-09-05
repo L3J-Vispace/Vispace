@@ -100,6 +100,39 @@ public struct ARSurfaceStateSnapshot: Equatable, Sendable {
     /// An empty snapshot is not safe evidence that a space contains no obstacle
     /// until it was produced by the currently active ARSession.
     public let isCurrentSessionData: Bool
+    /// Last actual anchor observation; an unrelated delta or full-state replay
+    /// must not refresh every retained surface's age.
+    public let anchorObservedAt: [UUID: TimeInterval]
+
+    public init(
+        coordinateFrameID: CoordinateFrameID, segmentID: CaptureSegmentID, mapID: MapID?,
+        coordinateFrameStatus: ARCaptureIdentity.Status, revision: UInt64,
+        timestamp: TimeInterval, planes: [UUID: ARPlaneObservationSnapshot],
+        meshes: [UUID: ARMeshObservationSnapshot], unresolvedFailures: [ARSurfaceObservationFailure],
+        isCurrentSessionData: Bool, anchorObservedAt: [UUID: TimeInterval] = [:]
+    ) {
+        self.coordinateFrameID = coordinateFrameID
+        self.segmentID = segmentID
+        self.mapID = mapID
+        self.coordinateFrameStatus = coordinateFrameStatus
+        self.revision = revision
+        self.timestamp = timestamp
+        self.planes = planes
+        self.meshes = meshes
+        self.unresolvedFailures = unresolvedFailures
+        self.isCurrentSessionData = isCurrentSessionData
+        self.anchorObservedAt = anchorObservedAt
+    }
+
+    public func hasFreshSurfaces(at evaluatedAt: TimeInterval, maximumAge: TimeInterval) -> Bool {
+        guard evaluatedAt.isFinite, maximumAge.isFinite, maximumAge >= 0 else { return false }
+        return Set(planes.keys).union(meshes.keys).allSatisfy { anchorID in
+            guard let observedAt = anchorObservedAt[anchorID], observedAt.isFinite,
+                observedAt >= 0 else { return false }
+            let age = evaluatedAt - observedAt
+            return age >= -0.25 && age <= maximumAge
+        }
+    }
 
     public var isComplete: Bool {
         isCurrentSessionData
@@ -204,6 +237,8 @@ final class ARSurfaceStateAccumulator: @unchecked Sendable {
     private var planes: [UUID: ARPlaneObservationSnapshot] = [:]
     private var meshes: [UUID: ARMeshObservationSnapshot] = [:]
     private var unresolvedFailures: [UUID: ARSurfaceObservationError] = [:]
+    private var anchorObservedAt: [UUID: TimeInterval] = [:]
+    private var latestBatchTimestamp: TimeInterval?
 
     func applying(_ observations: [ARSurfaceObservation]) -> ARSurfaceStateSnapshot? {
         guard let first = observations.first else {
@@ -241,6 +276,11 @@ final class ARSurfaceStateAccumulator: @unchecked Sendable {
         let startsNewIdentity =
             identity?.coordinateFrameID != incomingIdentity.coordinateFrameID
             || identity?.segmentID != incomingIdentity.segmentID
+        guard batch.timestamp.isFinite, batch.timestamp >= 0,
+            startsNewIdentity || latestBatchTimestamp.map({ batch.timestamp >= $0 }) != false
+        else { return nil }
+        let baselineObservedAt = startsNewIdentity ? [:] : anchorObservedAt
+        var nextObservedAt = baselineObservedAt
         let baselinePlanes: [UUID: ARPlaneObservationSnapshot] =
             startsNewIdentity ? [:] : planes
         let baselineMeshes: [UUID: ARMeshObservationSnapshot] =
@@ -253,15 +293,26 @@ final class ARSurfaceStateAccumulator: @unchecked Sendable {
         for observation in batch.observations {
             guard
                 observation.coordinateFrameID == incomingIdentity.coordinateFrameID,
-                observation.segmentID == incomingIdentity.segmentID
+                observation.segmentID == incomingIdentity.segmentID,
+                observation.mapID == incomingIdentity.mapID,
+                observation.coordinateFrameStatus == incomingIdentity.status,
+                observation.timestamp.isFinite, observation.timestamp >= 0,
+                observation.timestamp <= batch.timestamp,
+                nextObservedAt[observation.anchorID].map({ observation.timestamp >= $0 }) != false
             else {
                 continue
             }
             switch observation.payload {
             case .plane(let plane):
+                if !batch.isAuthoritative || nextPlanes[plane.anchorID] != plane {
+                    nextObservedAt[plane.anchorID] = observation.timestamp
+                }
                 nextPlanes[plane.anchorID] = plane
                 nextFailures.removeValue(forKey: plane.anchorID)
             case .mesh(let mesh):
+                if !batch.isAuthoritative || nextMeshes[mesh.anchorID] != mesh {
+                    nextObservedAt[mesh.anchorID] = observation.timestamp
+                }
                 nextMeshes[mesh.anchorID] = mesh
                 nextFailures.removeValue(forKey: mesh.anchorID)
             case .removed(let anchorID, let kind):
@@ -272,6 +323,7 @@ final class ARSurfaceStateAccumulator: @unchecked Sendable {
                     nextMeshes.removeValue(forKey: anchorID)
                 }
                 nextFailures.removeValue(forKey: anchorID)
+                nextObservedAt.removeValue(forKey: anchorID)
             }
         }
 
@@ -281,6 +333,7 @@ final class ARSurfaceStateAccumulator: @unchecked Sendable {
             nextPlanes = nextPlanes.filter { presentAnchorIDs.contains($0.key) }
             nextMeshes = nextMeshes.filter { presentAnchorIDs.contains($0.key) }
             nextFailures = nextFailures.filter { presentAnchorIDs.contains($0.key) }
+            nextObservedAt = nextObservedAt.filter { presentAnchorIDs.contains($0.key) }
         }
 
         let capacityError: ARSurfaceObservationError?
@@ -311,6 +364,7 @@ final class ARSurfaceStateAccumulator: @unchecked Sendable {
         if let capacityError {
             nextPlanes = baselinePlanes
             nextMeshes = baselineMeshes
+            nextObservedAt = baselineObservedAt
             for observation in batch.observations {
                 nextFailures[observation.anchorID] = capacityError
             }
@@ -325,6 +379,8 @@ final class ARSurfaceStateAccumulator: @unchecked Sendable {
         identity = incomingIdentity
         planes = nextPlanes
         meshes = nextMeshes
+        anchorObservedAt = nextObservedAt
+        latestBatchTimestamp = batch.timestamp
         unresolvedFailures = nextFailures
         revision &+= 1
         return ARSurfaceStateSnapshot(
@@ -340,7 +396,8 @@ final class ARSurfaceStateAccumulator: @unchecked Sendable {
                 unresolvedFailures
                 .map { ARSurfaceObservationFailure(anchorID: $0.key, error: $0.value) }
                 .sorted { $0.anchorID.uuidString < $1.anchorID.uuidString },
-            isCurrentSessionData: true
+            isCurrentSessionData: true,
+            anchorObservedAt: anchorObservedAt
         )
     }
 
@@ -357,6 +414,8 @@ final class ARSurfaceStateAccumulator: @unchecked Sendable {
         planes.removeAll(keepingCapacity: false)
         meshes.removeAll(keepingCapacity: false)
         unresolvedFailures.removeAll(keepingCapacity: false)
+        anchorObservedAt.removeAll(keepingCapacity: false)
+        latestBatchTimestamp = nil
 
         return ARSurfaceStateSnapshot(
             coordinateFrameID: captureIdentity.coordinateFrameID,
@@ -379,6 +438,8 @@ final class ARSurfaceStateAccumulator: @unchecked Sendable {
         planes.removeAll(keepingCapacity: false)
         meshes.removeAll(keepingCapacity: false)
         unresolvedFailures.removeAll(keepingCapacity: false)
+        anchorObservedAt.removeAll(keepingCapacity: false)
+        latestBatchTimestamp = nil
         lock.unlock()
     }
 }

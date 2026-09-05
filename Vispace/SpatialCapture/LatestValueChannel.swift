@@ -11,6 +11,11 @@ public enum LatestValueSendResult: Equatable, Sendable {
 /// a consumer lags. Every stream request creates an independent subscriber so
 /// feature controllers cannot steal AR snapshots from one another.
 public final class LatestValueChannel<Element: Sendable>: @unchecked Sendable {
+    public var latest: Element? {
+        lock.lock()
+        defer { lock.unlock() }
+        return isFinished ? nil : latestValue
+    }
     public var stream: AsyncStream<Element> {
         let subscriberID = UUID()
         let pair = AsyncStream<Element>.makeStream(

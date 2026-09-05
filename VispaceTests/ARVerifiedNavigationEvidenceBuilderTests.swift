@@ -1,4 +1,5 @@
 import Foundation
+import CoreVideo
 import VispaceCore
 import XCTest
 import simd
@@ -6,6 +7,86 @@ import simd
 @testable import Vispace
 
 final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
+    func testRecentDepthScanAllowsRouteFromActualCurrentFootprint() throws {
+        let context = makeContext()
+        let current = try depthFrame(identity: context.identity, timestamp: 10, cameraZ: 0.25, meters: 5)
+        let previous = try depthFrame(identity: context.identity, timestamp: 9, cameraZ: 3, meters: 5)
+        let evidence = try unwrapReady(ARVerifiedNavigationEvidenceBuilder().adapt(
+            context.snapshot, currentIdentity: context.identity, currentDepthFrame: current,
+            recentDepthFrames: [try XCTUnwrap(ARNavigationDepthFrame(previous))]
+        ))
+        let result = try routeFromCurrentFootprint(evidence: evidence, identity: context.identity)
+        XCTAssertEqual(result.status, .success)
+        XCTAssertEqual(result.path?.waypoints.first?.position, vec(0.25, 0, 0.25))
+    }
+
+    func testCurrentObstacleOverridesEarlierFreeScanAtStart() throws {
+        let context = makeContext()
+        let current = try depthFrame(identity: context.identity, timestamp: 10, cameraZ: 0.25, meters: 0.2)
+        let previous = try depthFrame(identity: context.identity, timestamp: 9, cameraZ: 3, meters: 5)
+        let result = ARVerifiedNavigationEvidenceBuilder().adapt(
+            context.snapshot, currentIdentity: context.identity, currentDepthFrame: current,
+            recentDepthFrames: [try XCTUnwrap(ARNavigationDepthFrame(previous))]
+        )
+        if case .ready(let evidence) = result {
+            XCTAssertNil(try routeFromCurrentFootprint(evidence: evidence, identity: context.identity).path)
+        }
+    }
+
+    func testExpiredScanCannotRestoreUnobservedCurrentStart() throws {
+        let context = makeContext()
+        let current = try depthFrame(identity: context.identity, timestamp: 10, cameraZ: 0.25, meters: 5)
+        let previous = try depthFrame(identity: context.identity, timestamp: 6.9, cameraZ: 3, meters: 5)
+        let result = ARVerifiedNavigationEvidenceBuilder().adapt(
+            context.snapshot, currentIdentity: context.identity, currentDepthFrame: current,
+            recentDepthFrames: [try XCTUnwrap(ARNavigationDepthFrame(previous))]
+        )
+        if case .ready(let evidence) = result {
+            XCTAssertNil(try routeFromCurrentFootprint(evidence: evidence, identity: context.identity).path)
+        }
+    }
+
+    @MainActor
+    func testDepthHistoryIsBoundedExpiresAndClearsOnDeactivate() throws {
+        let context = makeContext()
+        let history = ARRecentNavigationDepthHistory(frameStreamProvider: { AsyncStream { $0.finish() } })
+        for index in 0..<180 {
+            history.consume(try depthFrame(identity: context.identity,
+                timestamp: 10 + Double(index) / 60, cameraZ: 3, meters: 5))
+        }
+        let retained = history.frames(matching: context.identity, evaluatedAt: 13)
+        XCTAssertLessThanOrEqual(retained.count, 16)
+        XCTAssertGreaterThanOrEqual(retained.count, 14)
+        let earliest = try XCTUnwrap(retained.first?.pose.timestamp)
+        let latest = try XCTUnwrap(retained.last?.pose.timestamp)
+        XCTAssertGreaterThan(latest - earliest, 2.5)
+        XCTAssertTrue(history.frames(matching: context.identity, evaluatedAt: 16).isEmpty)
+        history.deactivate()
+        XCTAssertTrue(history.frames(matching: context.identity, evaluatedAt: 13).isEmpty)
+    }
+
+    func testStaticFloorCannotAttestCurrentDynamicFreeSpace() throws {
+        let context = makeContext()
+        XCTAssertEqual(try unwrapIssue(ARVerifiedNavigationEvidenceBuilder().adapt(
+            context.snapshot, currentIdentity: context.identity
+        )), .dynamicOccupancyUnavailable)
+    }
+
+    func testFreshSnapshotCannotHideStaleIndividualSurface() throws {
+        let context = makeContext()
+        let original = context.snapshot
+        let stale = ARSurfaceStateSnapshot(
+            coordinateFrameID: original.coordinateFrameID, segmentID: original.segmentID,
+            mapID: original.mapID, coordinateFrameStatus: original.coordinateFrameStatus,
+            revision: original.revision, timestamp: 10, planes: original.planes, meshes: original.meshes,
+            unresolvedFailures: [], isCurrentSessionData: true,
+            anchorObservedAt: original.anchorObservedAt.mapValues { _ in 1 }
+        )
+        XCTAssertEqual(try unwrapIssue(ARVerifiedNavigationEvidenceBuilder().adapt(
+            stale, currentIdentity: context.identity
+        )), .surfaceObservationStale)
+    }
+
     func testDenseFullyClassifiedCurrentFloorProducesBoundedEvidence() throws {
         let context = makeContext()
         let builder = ARVerifiedNavigationEvidenceBuilder(
@@ -15,7 +96,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         )
 
         let evidence = try unwrapReady(
-            builder.adapt(context.snapshot, currentIdentity: context.identity)
+            builder.adaptStaticGeometry(context.snapshot, currentIdentity: context.identity)
         )
 
         XCTAssertEqual(evidence.mapID, context.mapID)
@@ -53,7 +134,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
 
             XCTAssertEqual(
                 try unwrapIssue(
-                    ARVerifiedNavigationEvidenceBuilder().adapt(
+                    ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
                         snapshot,
                         currentIdentity: context.identity
                     )
@@ -75,7 +156,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
             )
 
             XCTAssertEqual(
-                try unwrapIssue(builder.adapt(snapshot, currentIdentity: context.identity)),
+                try unwrapIssue(builder.adaptStaticGeometry(snapshot, currentIdentity: context.identity)),
                 .coverageAttestationUnavailable
             )
         }
@@ -109,11 +190,11 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         let builder = ARVerifiedNavigationEvidenceBuilder()
 
         XCTAssertEqual(
-            try unwrapIssue(builder.adapt(sparseSnapshot, currentIdentity: context.identity)),
+            try unwrapIssue(builder.adaptStaticGeometry(sparseSnapshot, currentIdentity: context.identity)),
             .coverageAttestationUnavailable
         )
         XCTAssertEqual(
-            try unwrapIssue(builder.adapt(noPlaneSnapshot, currentIdentity: context.identity)),
+            try unwrapIssue(builder.adaptStaticGeometry(noPlaneSnapshot, currentIdentity: context.identity)),
             .coverageAttestationUnavailable
         )
     }
@@ -128,7 +209,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         )
 
         let evidence = try unwrapReady(
-            ARVerifiedNavigationEvidenceBuilder().adapt(
+            ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
                 snapshot,
                 currentIdentity: context.identity
             )
@@ -161,7 +242,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         )
 
         let evidence = try unwrapReady(
-            ARVerifiedNavigationEvidenceBuilder().adapt(
+            ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
                 snapshot,
                 currentIdentity: context.identity
             )
@@ -188,7 +269,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         )
 
         let evidence = try unwrapReady(
-            ARVerifiedNavigationEvidenceBuilder().adapt(
+            ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
                 snapshot,
                 currentIdentity: context.identity
             )
@@ -227,7 +308,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         for snapshot in [doorPlaneSnapshot, doorMeshSnapshot] {
             XCTAssertEqual(
                 try unwrapIssue(
-                    ARVerifiedNavigationEvidenceBuilder().adapt(
+                    ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
                         snapshot,
                         currentIdentity: context.identity
                     )
@@ -256,7 +337,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
 
         XCTAssertEqual(
             try unwrapIssue(
-                ARVerifiedNavigationEvidenceBuilder().adapt(
+                ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
                     snapshot,
                     currentIdentity: context.identity
                 )
@@ -286,7 +367,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         let builder = ARVerifiedNavigationEvidenceBuilder(obstacleClearance: 0.01)
 
         let evidence = try unwrapReady(
-            builder.adapt(snapshot, currentIdentity: context.identity)
+            builder.adaptStaticGeometry(snapshot, currentIdentity: context.identity)
         )
 
         XCTAssertTrue(evidence.walls.isEmpty)
@@ -331,19 +412,19 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            try unwrapIssue(builder.adapt(context.snapshot, currentIdentity: relocalizing)),
+            try unwrapIssue(builder.adaptStaticGeometry(context.snapshot, currentIdentity: relocalizing)),
             .captureNotConfirmed
         )
         XCTAssertEqual(
-            try unwrapIssue(builder.adapt(context.snapshot, currentIdentity: foreignMap)),
+            try unwrapIssue(builder.adaptStaticGeometry(context.snapshot, currentIdentity: foreignMap)),
             .currentMapUnavailable
         )
         XCTAssertEqual(
-            try unwrapIssue(builder.adapt(context.snapshot, currentIdentity: foreignFrame)),
+            try unwrapIssue(builder.adaptStaticGeometry(context.snapshot, currentIdentity: foreignFrame)),
             .coordinateContextMismatch
         )
         XCTAssertEqual(
-            try unwrapIssue(builder.adapt(context.snapshot, currentIdentity: foreignSegment)),
+            try unwrapIssue(builder.adaptStaticGeometry(context.snapshot, currentIdentity: foreignSegment)),
             .coordinateContextMismatch
         )
     }
@@ -370,11 +451,11 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         let builder = ARVerifiedNavigationEvidenceBuilder()
 
         XCTAssertEqual(
-            try unwrapIssue(builder.adapt(inactive, currentIdentity: context.identity)),
+            try unwrapIssue(builder.adaptStaticGeometry(inactive, currentIdentity: context.identity)),
             .surfaceSnapshotIncomplete
         )
         XCTAssertEqual(
-            try unwrapIssue(builder.adapt(failed, currentIdentity: context.identity)),
+            try unwrapIssue(builder.adaptStaticGeometry(failed, currentIdentity: context.identity)),
             .surfaceSnapshotIncomplete
         )
     }
@@ -385,7 +466,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
             ARVerifiedNavigationEvidenceBuilder(
                 maximumTriangleCount: 2,
                 maximumCellCount: 16
-            ).adapt(context.snapshot, currentIdentity: context.identity)
+            ).adaptStaticGeometry(context.snapshot, currentIdentity: context.identity)
         )
         XCTAssertEqual(exactCapacityEvidence.floors.count, 16)
 
@@ -395,7 +476,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         )
         XCTAssertEqual(
             try unwrapIssue(
-                triangleOverflow.adapt(context.snapshot, currentIdentity: context.identity)
+                triangleOverflow.adaptStaticGeometry(context.snapshot, currentIdentity: context.identity)
             ),
             .coverageAttestationUnavailable
         )
@@ -406,7 +487,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         )
         XCTAssertEqual(
             try unwrapIssue(
-                cellOverflow.adapt(context.snapshot, currentIdentity: context.identity)
+                cellOverflow.adaptStaticGeometry(context.snapshot, currentIdentity: context.identity)
             ),
             .coverageAttestationUnavailable
         )
@@ -420,7 +501,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         )
 
         let evidence = try unwrapReady(
-            builder.adapt(context.snapshot, currentIdentity: context.identity)
+            builder.adaptStaticGeometry(context.snapshot, currentIdentity: context.identity)
         )
 
         XCTAssertEqual(builder.cellSize, 0.5)
@@ -452,7 +533,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
 
         XCTAssertEqual(
             try unwrapIssue(
-                ARVerifiedNavigationEvidenceBuilder(maximumWallCount: 1).adapt(
+                ARVerifiedNavigationEvidenceBuilder(maximumWallCount: 1).adaptStaticGeometry(
                     snapshot,
                     currentIdentity: context.identity
                 )
@@ -491,7 +572,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
                 meshes: [malformed]
             )
             XCTAssertEqual(
-                try unwrapIssue(builder.adapt(snapshot, currentIdentity: context.identity)),
+                try unwrapIssue(builder.adaptStaticGeometry(snapshot, currentIdentity: context.identity)),
                 .coverageAttestationUnavailable
             )
         }
@@ -519,7 +600,7 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
 
         XCTAssertEqual(
             try unwrapIssue(
-                ARVerifiedNavigationEvidenceBuilder().adapt(
+                ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
                     snapshot,
                     currentIdentity: context.identity
                 )
@@ -563,8 +644,51 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
             planes: Dictionary(uniqueKeysWithValues: resolvedPlanes.map { ($0.anchorID, $0) }),
             meshes: Dictionary(uniqueKeysWithValues: resolvedMeshes.map { ($0.anchorID, $0) }),
             unresolvedFailures: failures,
-            isCurrentSessionData: isCurrentSessionData
+            isCurrentSessionData: isCurrentSessionData,
+            anchorObservedAt: Dictionary(uniqueKeysWithValues:
+                (resolvedPlanes.map(\.anchorID) + resolvedMeshes.map(\.anchorID)).map { ($0, 10) })
         )
+    }
+
+    private func depthFrame(identity: ARCaptureIdentity, timestamp: TimeInterval,
+                            cameraZ: Float, meters: Float) throws -> ARFrameSnapshot {
+        var pixelBuffer: CVPixelBuffer?
+        XCTAssertEqual(CVPixelBufferCreate(kCFAllocatorDefault, 1, 1,
+            kCVPixelFormatType_32BGRA, nil, &pixelBuffer), kCVReturnSuccess)
+        var camera = matrix_identity_float4x4
+        camera.columns.3 = SIMD4<Float>(0.25, 1, cameraZ, 1)
+        let pose = ARPoseSnapshot(id: ARFrameID(),
+            sessionToken: ARSessionFrameToken(sessionRunGeneration: 1, attachmentEpoch: 1),
+            coordinateFrameID: identity.coordinateFrameID, segmentID: identity.segmentID,
+            mapID: identity.mapID, coordinateFrameStatus: .confirmed, capturedAt: 100,
+            timestamp: timestamp, cameraTransform: Matrix4x4Snapshot(camera),
+            trackingState: .normal, worldMappingStatus: .mapped)
+        return ARFrameSnapshot(pose: pose, imageOrientation: .up,
+            capturedImage: ImmutablePixelBuffer(pixelBuffer: try XCTUnwrap(pixelBuffer)),
+            cameraIntrinsics: Matrix3x3Snapshot(simd_float3x3(columns: (
+                SIMD3<Float>(50, 0, 0), SIMD3<Float>(0, 50, 0), SIMD3<Float>(50, 50, 1)))),
+            cameraImageDimensions: ImageDimensions(width: 100, height: 100), displayTransform: nil,
+            sceneDepth: ARDepthSnapshot(dimensions: ImageDimensions(width: 100, height: 100),
+                depthMeters: Array(repeating: meters, count: 10_000),
+                confidence: Array(repeating: 2, count: 10_000)), smoothedSceneDepth: nil)
+    }
+
+    private func routeFromCurrentFootprint(evidence: IndoorNavigationEvidence,
+                                          identity: ARCaptureIdentity) throws -> IndoorNavigationResult {
+        let destinationPosition = vec(-0.25, 0, -0.25)
+        let confidence = ConfidenceScore(clamping: 0.9)
+        let destination = try SpatialObjectMetadata(mapID: XCTUnwrap(identity.mapID),
+            object: SpatialObject(semanticLabel: "chair", position: destinationPosition,
+                certainty: .confirmed, confidence: ConfidenceVector(semantic: confidence,
+                    geometry: confidence, tracking: confidence, place: confidence,
+                    identity: confidence, objectState: confidence), firstSeenAt: 1, lastSeenAt: 10),
+            position: FramedPosition(coordinateFrameID: identity.coordinateFrameID,
+                value: destinationPosition, observedAt: 10, trackingQuality: .normal,
+                uncertainty: .highConfidenceDepth))
+        return IndoorARNavigationEngine().route(from: try FramedPosition(
+            coordinateFrameID: identity.coordinateFrameID, value: vec(0.25, 0, 0.25),
+            observedAt: 10, trackingQuality: .normal, uncertainty: .raycastEstimate),
+            to: destination, using: evidence, evaluatedAt: 10)
     }
 
     private func floorPlane() -> ARPlaneObservationSnapshot {

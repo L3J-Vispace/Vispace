@@ -6,10 +6,59 @@ import simd
 
 @MainActor
 final class ARGuidanceControllerTests: XCTestCase {
+    func testTargetExpiresWithoutAnotherPose() async throws {
+        let (stream, continuation) = AsyncStream<ARPoseSnapshot>.makeStream()
+        let context = ContextFixture()
+        let controller = ARGuidanceController(poses: stream, maximumTargetAge: 0.05, nowProvider: { 10 })
+        var invalidations = 0
+        controller.onTargetInvalidated = { invalidations += 1 }
+        controller.activate()
+        controller.show(try context.target())
+        continuation.yield(context.pose())
+        await settle()
+        XCTAssertNotNil(controller.renderableWorldPosition)
+        try await Task.sleep(for: .milliseconds(90))
+        XCTAssertNil(controller.target)
+        XCTAssertNil(controller.latestProjection)
+        XCTAssertEqual(invalidations, 1)
+        await controller.deactivateAndWaitForPendingWork()
+    }
+
+    func testRemovedMovedOrDegradedRecordRevokesMarkerWithoutPose() async throws {
+        let context = ContextFixture()
+        let source = try context.metadata()
+        for change in 0..<3 {
+            let (stream, continuation) = AsyncStream<ARPoseSnapshot>.makeStream()
+            let records = GuidanceRecordStore(source)
+            let controller = ARGuidanceController(poses: stream,
+                sourceMetadataProvider: { _, _ in await records.current }, nowProvider: { 10 })
+            controller.activate()
+            controller.show(try context.target(sourceMetadata: source))
+            continuation.yield(context.pose())
+            for _ in 0..<50 {
+                if controller.renderableWorldPosition != nil { break }
+                try await Task.sleep(for: .milliseconds(2))
+            }
+            XCTAssertNotNil(controller.renderableWorldPosition)
+            if change == 0 {
+                await records.set(nil)
+            } else {
+                await records.set(try context.metadata(
+                    position: change == 1 ? Vec3(x: 1, y: 0, z: -2) : nil,
+                    confidence: change == 2 ? 0.2 : 0.9
+                ))
+            }
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertNil(controller.target)
+            XCTAssertNil(controller.renderableWorldPosition)
+            await controller.deactivateAndWaitForPendingWork()
+        }
+    }
+
     func testGuidesOnlyAfterConfirmedNormalPoseInExactContext() async throws {
         let (stream, continuation) = AsyncStream<ARPoseSnapshot>.makeStream()
         let context = ContextFixture()
-        let controller = ARGuidanceController(poses: stream)
+        let controller = ARGuidanceController(poses: stream, nowProvider: { 11 })
         controller.activate()
         controller.show(try context.target())
 
@@ -33,7 +82,7 @@ final class ARGuidanceControllerTests: XCTestCase {
         for mismatch in Mismatch.allCases {
             let (stream, continuation) = AsyncStream<ARPoseSnapshot>.makeStream()
             let context = ContextFixture()
-            let controller = ARGuidanceController(poses: stream)
+            let controller = ARGuidanceController(poses: stream, nowProvider: { 11 })
             controller.activate()
             controller.show(try context.target())
             continuation.yield(context.pose(mismatch: mismatch))
@@ -53,7 +102,7 @@ final class ARGuidanceControllerTests: XCTestCase {
     func testLimitedTrackingClearsPriorRenderablePosition() async throws {
         let (stream, continuation) = AsyncStream<ARPoseSnapshot>.makeStream()
         let context = ContextFixture()
-        let controller = ARGuidanceController(poses: stream)
+        let controller = ARGuidanceController(poses: stream, nowProvider: { 11 })
         controller.activate()
         controller.show(try context.target())
         continuation.yield(context.pose(status: .confirmed, tracking: .normal))
@@ -75,7 +124,7 @@ final class ARGuidanceControllerTests: XCTestCase {
     func testClearAndDeactivateCannotPublishBufferedPose() async throws {
         let (stream, continuation) = AsyncStream<ARPoseSnapshot>.makeStream()
         let context = ContextFixture()
-        let controller = ARGuidanceController(poses: stream)
+        let controller = ARGuidanceController(poses: stream, nowProvider: { 11 })
         controller.activate()
         controller.show(try context.target())
         controller.clear()
@@ -95,7 +144,7 @@ final class ARGuidanceControllerTests: XCTestCase {
     func testArrivalIsPublishedAtTarget() async throws {
         let (stream, continuation) = AsyncStream<ARPoseSnapshot>.makeStream()
         let context = ContextFixture(targetPosition: try Vec3(x: 0, y: 0, z: -0.2))
-        let controller = ARGuidanceController(poses: stream)
+        let controller = ARGuidanceController(poses: stream, nowProvider: { 11 })
         controller.activate()
         controller.show(try context.target())
         continuation.yield(context.pose())
@@ -139,6 +188,7 @@ private enum Mismatch: CaseIterable {
 }
 
 private struct ContextFixture {
+    let objectID = ObjectID()
     let frameID = CoordinateFrameID()
     let segmentID = CaptureSegmentID()
     let mapID = MapID()
@@ -150,10 +200,11 @@ private struct ContextFixture {
 
     func target(
         label: String = "sofa",
-        resolvedAt: TimeInterval = 10
+        resolvedAt: TimeInterval = 10,
+        sourceMetadata: SpatialObjectMetadata? = nil
     ) throws -> ARGuidanceTarget {
         try ARGuidanceTarget(
-            objectID: ObjectID(),
+            objectID: objectID,
             semanticLabel: label,
             activeMapID: mapID,
             activeSegmentID: segmentID,
@@ -166,7 +217,21 @@ private struct ContextFixture {
             ),
             confidenceGrade: .high,
             representsLastSeenLocation: false,
-            resolvedAt: resolvedAt
+            resolvedAt: resolvedAt,
+            sourceMetadata: sourceMetadata
+        )
+    }
+
+    func metadata(position: Vec3? = nil, confidence: Double = 0.9) throws -> SpatialObjectMetadata {
+        let position = position ?? targetPosition
+        return try SpatialObjectMetadata(
+            mapID: mapID,
+            object: SpatialObject(id: objectID, semanticLabel: "sofa", position: position,
+                certainty: .confirmed, confidence: ConfidenceVector(
+                    semantic: ConfidenceScore(clamping: confidence), geometry: ConfidenceScore(clamping: confidence)),
+                firstSeenAt: 1, lastSeenAt: 9),
+            position: FramedPosition(coordinateFrameID: frameID, value: position, observedAt: 9,
+                trackingQuality: .normal, uncertainty: .highConfidenceDepth)
         )
     }
 
@@ -192,4 +257,10 @@ private struct ContextFixture {
             worldMappingStatus: .mapped
         )
     }
+}
+
+private actor GuidanceRecordStore {
+    private(set) var current: SpatialObjectMetadata?
+    init(_ current: SpatialObjectMetadata?) { self.current = current }
+    func set(_ current: SpatialObjectMetadata?) { self.current = current }
 }

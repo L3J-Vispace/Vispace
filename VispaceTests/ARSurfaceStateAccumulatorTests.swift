@@ -4,6 +4,37 @@ import simd
 @testable import Vispace
 
 final class ARSurfaceStateAccumulatorTests: XCTestCase {
+    func testUnrelatedDeltaAndAuthoritativeReplayDoNotRefreshOldSurface() throws {
+        let accumulator = ARSurfaceStateAccumulator()
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let firstID = UUID()
+        let secondID = UUID()
+        func observation(_ id: UUID, at timestamp: TimeInterval) -> ARSurfaceObservation {
+            ARSurfaceObservation(
+                coordinateFrameID: identity.coordinateFrameID, segmentID: identity.segmentID,
+                mapID: identity.mapID, coordinateFrameStatus: identity.status,
+                timestamp: timestamp, change: .updated,
+                payload: .plane(ARPlaneObservationSnapshot(
+                    anchorID: id, transform: Matrix4x4Snapshot(matrix_identity_float4x4), center: .zero,
+                    extent: SIMD3<Float>(2, 0, 2), extentRotationOnYAxis: 0, boundaryVertices: [],
+                    alignment: .horizontal, classification: .floor
+                ))
+            )
+        }
+        _ = accumulator.applying([observation(firstID, at: 1)])
+        let updated = try XCTUnwrap(accumulator.applying([observation(secondID, at: 10)]))
+        XCTAssertEqual(updated.anchorObservedAt[firstID], 1)
+        XCTAssertFalse(updated.hasFreshSurfaces(at: 10, maximumAge: 5))
+        let replay = try XCTUnwrap(accumulator.applying(ARSurfaceObservationBatch(
+            captureIdentity: identity, timestamp: 11,
+            observations: [observation(firstID, at: 11), observation(secondID, at: 11)],
+            failures: [], isAuthoritative: true
+        )))
+        XCTAssertEqual(replay.anchorObservedAt[firstID], 1)
+        XCTAssertEqual(replay.anchorObservedAt[secondID], 10)
+        XCTAssertNil(accumulator.applying([observation(firstID, at: 9)]))
+    }
+
     func testAuthoritativeStatePreservesRemovalAcrossDroppedRevisions() throws {
         let accumulator = ARSurfaceStateAccumulator()
         let identity = ARCaptureIdentity(status: .confirmed)
