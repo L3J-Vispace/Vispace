@@ -6,6 +6,43 @@ import XCTest
 
 @MainActor
 final class SpatialRelationQueryControllerTests: XCTestCase {
+    func testReferenceFirstNegativeQuestionPublishesExplicitRecordedDirection() async throws {
+        let map = mapID(611), frame = frameID(611)
+        let table = try record(
+            id: objectID(611), mapID: map, frameID: frame, label: "table", aliases: ["테이블"])
+        let cup = try record(id: objectID(612), mapID: map, frameID: frame, label: "cup", aliases: ["컵"])
+        var graph = SceneGraph()
+        try graph.upsert(relation(subject: cup, predicate: .on, object: table))
+        let queryController = controller(
+            identityBox: RelationIdentityBox(identity(mapID: map, frameID: frame)),
+            snapshot: snapshot(mapID: map, frameID: frame, records: [table, cup], graph: graph))
+        queryController.submit("테이블 위에 컵이 없지?", now: 20)
+        try await waitForIdle(queryController)
+        let result = try XCTUnwrap(queryController.latestPresentation)
+        XCTAssertEqual(result.result.matches.first?.subject.objectID, cup.metadata.object.id)
+        XCTAssertEqual(result.result.referenceObject?.objectID, table.metadata.object.id)
+        XCTAssertEqual(result.message, "확정된 기록상 ‘cup’은(는) ‘table’ 위에 있어요.")
+    }
+
+    func testUnresolvedRolesExplainSupportedQuestionForm() async throws {
+        let map = mapID(621), frame = frameID(621)
+        let table = try record(
+            id: objectID(621), mapID: map, frameID: frame, label: "table", aliases: ["테이블"])
+        let cup = try record(id: objectID(622), mapID: map, frameID: frame, label: "cup", aliases: ["컵"])
+        var graph = SceneGraph()
+        try graph.upsert(relation(subject: cup, predicate: .on, object: table))
+        let queryController = controller(
+            identityBox: RelationIdentityBox(identity(mapID: map, frameID: frame)),
+            snapshot: snapshot(mapID: map, frameID: frame, records: [table, cup], graph: graph))
+        queryController.submit("컵 테이블 그리고 위에 있어?", now: 20)
+        try await waitForIdle(queryController)
+        let result = try XCTUnwrap(queryController.latestPresentation)
+        XCTAssertEqual(result.result.status, .unsupported)
+        XCTAssertEqual(result.result.issues, [.unresolvedRelationRoles])
+        XCTAssertTrue(result.message.contains("컵이 테이블 위에 있어?"))
+        XCTAssertTrue(result.result.matches.isEmpty)
+    }
+
     func testSourceSnapshotFenceRejectsAdditionsRemovalsAndChanges() throws {
         let map = mapID(571), frame = frameID(571)
         let first = try record(id: objectID(571), mapID: map, frameID: frame, label: "table")

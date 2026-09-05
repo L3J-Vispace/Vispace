@@ -492,6 +492,9 @@ public final class SpatialRelationQueryController: ObservableObject {
         case .notGrounded:
             return "관계를 확인할 물체 이름을 찾지 못했어요. 물체 두 개와 관계를 함께 말해 주세요."
         case .unsupported:
+            if result.issues.contains(.unresolvedRelationRoles) {
+                return "어느 물체를 기준으로 한 관계인지 분명하지 않아요. ‘컵이 테이블 위에 있어?’처럼 물체와 관계를 말해 주세요."
+            }
             return "현재는 위·아래·안·근처·막힘·교차·연결·접근 관계를 확인할 수 있어요."
         }
     }

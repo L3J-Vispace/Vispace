@@ -24,6 +24,7 @@ public enum SpatialRelationQueryIssue: String, Codable, Hashable, Sendable {
     case multipleTargetInstances
     case multipleSemanticTargets
     case noConfirmedRelation
+    case unresolvedRelationRoles
 }
 
 public struct SpatialRelationQueryEntity: Codable, Hashable, Sendable {
@@ -178,11 +179,16 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
     public func targetScope(
         for utterance: String, records: [StoredSpatialObjectRecord], selections: [String: ObjectID] = [:]
     ) -> SpatialRelationQueryGeometryScope? {
-        guard let predicate = detectedPredicate(in: utterance) else { return nil }
         let eligible = eligibleRecords(records)
         let targets = groundedTargets(in: utterance, records: eligible, selections: selections)
+        guard let predicate = detectedPredicate(in: utterance, excluding: targets) else { return nil }
         let labels = targets.map(\.mention)
         guard (1...2).contains(labels.count) else { return nil }
+        if labels.count == 2,
+            resolvedRoles(in: utterance, predicate: predicate, targets: targets) == nil
+        {
+            return nil
+        }
         let byLabel = Dictionary(uniqueKeysWithValues: targets.map { ($0.mention, $0.records) })
         var objectIDs: Set<ObjectID> = []
         for label in labels {
@@ -202,15 +208,15 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
         guard currentTime.isFinite, currentTime >= 0 else {
             throw SpatialRelationQueryError.invalidCurrentTime
         }
-        guard let predicate = detectedPredicate(in: utterance) else {
+        let eligible = eligibleRecords(records)
+        let targets = groundedTargets(in: utterance, records: eligible, selections: selections)
+        guard let predicate = detectedPredicate(in: utterance, excluding: targets) else {
             return emptyResult(
                 status: .unsupported,
                 issue: .noSupportedRelation
             )
         }
 
-        let eligible = eligibleRecords(records)
-        let targets = groundedTargets(in: utterance, records: eligible, selections: selections)
         let orderedLabels = targets.map(\.mention)
         guard !orderedLabels.isEmpty else {
             return SpatialRelationQueryResult(
@@ -247,10 +253,15 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
             )
         }
         if orderedLabels.count == 2 {
+            guard let roles = resolvedRoles(in: utterance, predicate: predicate, targets: targets) else {
+                return emptyResult(
+                    mode: .verifyRelation, predicate: predicate, status: .unsupported,
+                    issue: .unresolvedRelationRoles)
+            }
             return verifyRelation(
                 predicate: predicate,
-                subjectLabel: orderedLabels[0],
-                objectLabel: orderedLabels[1],
+                subjectLabel: roles.subject,
+                objectLabel: roles.object,
                 entitiesByLabel: entitiesByLabel,
                 graph: graph,
                 at: currentTime
@@ -475,7 +486,7 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
         in utterance: String,
         records: [StoredSpatialObjectRecord],
         selections: [String: ObjectID]
-    ) -> [(mention: String, records: [StoredSpatialObjectRecord])] {
+    ) -> [GroundedRelationTarget] {
         let mentions = semanticMentions(in: utterance, records: records)
         let retained = mentions.filter { mention in
             !mentions.contains { other in
@@ -484,7 +495,7 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
                     && other.range.upperBound >= mention.range.upperBound
             }
         }
-        var result: [(mention: String, records: [StoredSpatialObjectRecord])] = []
+        var result: [GroundedRelationTarget] = []
         for mention in retained {
             if result.contains(where: { $0.mention == mention.canonicalLabel }) { continue }
             let ids = Set(
@@ -496,15 +507,25 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
                 // A stale choice must not silently select a replacement.
                 candidates = candidates.filter { $0.metadata.object.id == selected }
             }
-            result.append((mention.canonicalLabel, candidates))
+            result.append(
+                GroundedRelationTarget(
+                    mention: mention.canonicalLabel, records: candidates,
+                    ranges: Set(retained.filter { $0.canonicalLabel == mention.canonicalLabel }.map(\.range)))
+            )
         }
         return result
     }
 
     private func detectedPredicate(
-        in utterance: String
+        in utterance: String, excluding targets: [GroundedRelationTarget]
     ) -> SpatialRelationPredicate? {
-        let normalized = " \(normalize(utterance)) "
+        relationSignals(in: utterance, excluding: targets).first?.predicate
+    }
+
+    private func relationSignals(
+        in utterance: String, excluding targets: [GroundedRelationTarget]
+    ) -> [RelationLanguageSignal] {
+        let tokens = lexicalTokens(utterance)
         let lexemes: [(SpatialRelationPredicate, [String])] = [
             (.accessibleFrom, ["갈 수", "접근 가능", "accessible from", "reachable from"]),
             (.connectedTo, ["연결", "연결돼", "연결되어", "connected to"]),
@@ -515,15 +536,92 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
             (.on, ["위에", "위의", "on top of", " on "]),
             (.near, ["근처", "가까이", "주변", "near", "next to"]),
         ]
+        var found: [RelationLanguageSignal] = []
         for (predicate, signals) in lexemes {
-            if signals.contains(where: { signal in
-                let normalizedSignal = normalize(signal)
-                return normalized.contains(" \(normalizedSignal) ")
-            }) {
-                return predicate
+            for signal in signals {
+                let phrase = lexicalTokens(signal)
+                guard !phrase.isEmpty, phrase.count <= tokens.count else { continue }
+                for start in 0...(tokens.count - phrase.count) {
+                    let range = start..<(start + phrase.count)
+                    if Array(tokens[range]) == phrase {
+                        found.append(
+                            RelationLanguageSignal(
+                                predicate: predicate, range: range,
+                                isEnglish: signal.unicodeScalars.allSatisfy { $0.isASCII }))
+                    }
+                }
             }
         }
-        return nil
+        // Prefer the complete phrase "on top of" over its embedded "on".
+        return found.filter { signal in
+            !targets.contains { target in target.ranges.contains { $0.overlaps(signal.range) } }
+                && !found.contains { other in
+                    other.predicate == signal.predicate && other.range.count > signal.range.count
+                        && other.range.lowerBound <= signal.range.lowerBound
+                        && other.range.upperBound >= signal.range.upperBound
+                }
+        }
+    }
+
+    /// Resolve a bounded set of grammar forms from grounded name spans. Missing
+    /// grammar never falls back to the order in which object names appeared.
+    private func resolvedRoles(
+        in utterance: String, predicate: SpatialRelationPredicate, targets: [GroundedRelationTarget]
+    ) -> (subject: String, object: String)? {
+        guard targets.count == 2, targets.allSatisfy({ $0.ranges.count == 1 }) else { return nil }
+        let signals = relationSignals(in: utterance, excluding: targets)
+        guard signals.count == 1, let signal = signals.first, signal.predicate == predicate else {
+            return nil
+        }
+        if isSymmetric(predicate) { return (targets[0].mention, targets[1].mention) }
+        let tokens = lexicalTokens(utterance)
+        func particle(_ target: GroundedRelationTarget) -> String? {
+            guard let range = target.ranges.first, let last = lexicalTokens(target.mention).last else {
+                return nil
+            }
+            let token = tokens[range.upperBound - 1]
+            guard token.hasPrefix(last) else { return nil }
+            return String(token.dropFirst(last.count))
+        }
+        let allNamesBeforeRelation = targets.allSatisfy {
+            guard let range = $0.ranges.first else { return false }
+            return range.upperBound <= signal.range.lowerBound
+        }
+        let references: [GroundedRelationTarget]
+        if signal.isEnglish {
+            // English prepositions identify the following reference, including
+            // fronted forms such as "on the table is the cup?".
+            references = targets.filter { target in
+                guard let range = target.ranges.first, range.lowerBound >= signal.range.upperBound else {
+                    return false
+                }
+                return tokens[signal.range.upperBound..<range.lowerBound].allSatisfy {
+                    ["the", "a", "an"].contains($0)
+                }
+            }
+        } else {
+            switch predicate {
+            case .on, .under, .inside:
+                references = targets.filter { target in
+                    target.ranges.first?.upperBound == signal.range.lowerBound
+                        && ["", "의"].contains(particle(target) ?? "?")
+                }
+            case .blocking:
+                references = targets.filter { ["을", "를"].contains(particle($0) ?? "") }
+                guard allNamesBeforeRelation,
+                    targets.contains(where: { ["이", "가", "은", "는"].contains(particle($0) ?? "") })
+                else { return nil }
+            case .accessibleFrom:
+                references = targets.filter { ["에서", "에서는"].contains(particle($0) ?? "") }
+                guard allNamesBeforeRelation else { return nil }
+            default:
+                return nil
+            }
+        }
+        guard references.count == 1, let reference = references.first,
+            let subject = targets.first(where: { $0.mention != reference.mention })
+        else { return nil }
+        return (subject.mention, reference.mention)
     }
 
     private func groundedMatch(
@@ -647,4 +745,16 @@ private struct RelationSemanticMention: Hashable, Sendable {
     let objectID: ObjectID
     let range: Range<Int>
     let specificity: Int
+}
+
+private struct GroundedRelationTarget {
+    let mention: String
+    let records: [StoredSpatialObjectRecord]
+    let ranges: Set<Range<Int>>
+}
+
+private struct RelationLanguageSignal {
+    let predicate: SpatialRelationPredicate
+    let range: Range<Int>
+    let isEnglish: Bool
 }

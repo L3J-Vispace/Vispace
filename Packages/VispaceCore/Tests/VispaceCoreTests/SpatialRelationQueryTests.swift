@@ -3,6 +3,121 @@ import XCTest
 @testable import VispaceCore
 
 final class SpatialRelationQueryTests: XCTestCase {
+    func testEquivalentKoreanOrdersKeepRolesIncludingNegativeQuestions() throws {
+        let cup = try makeRecord(label: "cup", aliases: ["컵"])
+        let table = try makeRecord(label: "table", aliases: ["테이블"])
+        for (predicate, phrase) in [(SpatialRelationPredicate.on, "위에"), (.under, "아래"), (.inside, "안에")] {
+            var graph = SceneGraph()
+            try graph.upsert(relation(subject: cup, predicate: predicate, object: table))
+            for question in [
+                "컵이 테이블 \(phrase) 있어?", "테이블 \(phrase) 컵이 있어?",
+                "컵은 테이블 \(phrase) 없지?", "테이블 \(phrase) 컵이 있지 않아?",
+            ] {
+                let result = try engine.query(question, records: [cup, table], graph: graph, at: 20)
+                XCTAssertEqual(result.status, .answered, question)
+                XCTAssertEqual(result.referenceObject?.objectID, table.metadata.object.id, question)
+                XCTAssertEqual(result.matches.first?.subject.objectID, cup.metadata.object.id, question)
+            }
+            let reversed = try engine.query(
+                "컵 \(phrase) 테이블이 있어?", records: [cup, table], graph: graph, at: 20)
+            XCTAssertEqual(reversed.status, .noConfirmedRelation)
+            XCTAssertNil(reversed.isAffirmative)
+        }
+    }
+
+    func testRoleResolutionPreservesSameClassAliasesAndExplicitSelection() throws {
+        let upper = try makeRecord(label: "box", aliases: ["작은 상자"])
+        let lower = try makeRecord(label: "box", aliases: ["큰 상자"])
+        let otherLower = try makeRecord(label: "box", aliases: ["큰 상자"], x: 2)
+        var graph = SceneGraph()
+        try graph.upsert(relation(subject: upper, predicate: .on, object: lower))
+        let records = [upper, lower, otherLower]
+        for question in ["작은 상자가 큰 상자 위에 있어?", "큰 상자 위에 작은 상자가 없어?"] {
+            let ambiguous = try engine.query(question, records: records, graph: graph, at: 20)
+            XCTAssertEqual(ambiguous.status, .ambiguous)
+            let selected = try engine.query(
+                question, records: records, graph: graph, at: 20,
+                selections: ["큰 상자": lower.metadata.object.id])
+            XCTAssertEqual(selected.matches.first?.subject.objectID, upper.metadata.object.id)
+            XCTAssertEqual(selected.referenceObject?.objectID, lower.metadata.object.id)
+            let stale = try engine.query(
+                question, records: [upper, otherLower], graph: graph, at: 20,
+                selections: ["큰 상자": lower.metadata.object.id])
+            XCTAssertEqual(stale.status, .ambiguous)
+            XCTAssertTrue(stale.matches.isEmpty)
+        }
+    }
+
+    func testKoreanBlockingParticlesDetermineRolesInEitherOrder() throws {
+        let sofa = try makeRecord(label: "sofa", aliases: ["소파"])
+        let door = try makeRecord(label: "door", aliases: ["문"])
+        var graph = SceneGraph()
+        try graph.upsert(relation(subject: sofa, predicate: .blocking, object: door))
+        for question in ["소파가 문을 막고 있어?", "문을 소파가 막고 있어?", "문을 소파가 막고 있지 않아?"] {
+            let result = try engine.query(question, records: [sofa, door], graph: graph, at: 20)
+            XCTAssertEqual(result.status, .answered, question)
+            XCTAssertEqual(result.referenceObject?.objectID, door.metadata.object.id, question)
+        }
+    }
+
+    func testEnglishPreposedReferenceKeepsRelationDirection() throws {
+        let cup = try makeRecord(label: "cup")
+        let table = try makeRecord(label: "table")
+        var graph = SceneGraph()
+        try graph.upsert(relation(subject: cup, predicate: .on, object: table))
+        for question in [
+            "is the cup on the table?", "on the table is the cup?", "isn't the cup on top of the table?",
+        ] {
+            let result = try engine.query(question, records: [cup, table], graph: graph, at: 20)
+            XCTAssertEqual(result.status, .answered, question)
+            XCTAssertEqual(result.referenceObject?.objectID, table.metadata.object.id, question)
+        }
+    }
+
+    func testAccessibleFromUsesOriginParticleAndEnglishPreposition() throws {
+        let chair = try makeRecord(label: "chair", aliases: ["의자"])
+        let table = try makeRecord(label: "table", aliases: ["테이블"])
+        var graph = SceneGraph()
+        try graph.upsert(relation(subject: table, predicate: .accessibleFrom, object: chair))
+        for question in ["의자에서 테이블로 갈 수 있어?", "테이블로 의자에서 갈 수 있어?", "table accessible from chair"] {
+            let result = try engine.query(question, records: [chair, table], graph: graph, at: 20)
+            XCTAssertEqual(result.status, .answered, question)
+            XCTAssertEqual(result.referenceObject?.objectID, chair.metadata.object.id, question)
+            XCTAssertEqual(result.matches.first?.subject.objectID, table.metadata.object.id, question)
+        }
+    }
+
+    func testRelationWordsInsideNamesCannotOverrideActualPredicate() throws {
+        let cup = try makeRecord(label: "cup", aliases: ["inside cup", "아래 컵"])
+        let table = try makeRecord(label: "table", aliases: ["테이블"])
+        var graph = SceneGraph()
+        try graph.upsert(relation(subject: cup, predicate: .on, object: table))
+        for question in ["is the inside cup on the table?", "테이블 위에 아래 컵이 있어?"] {
+            let result = try engine.query(question, records: [cup, table], graph: graph, at: 20)
+            XCTAssertEqual(result.status, .answered, question)
+            XCTAssertEqual(result.predicate, .on, question)
+            XCTAssertEqual(result.matches.first?.subject.objectID, cup.metadata.object.id, question)
+            XCTAssertEqual(engine.targetScope(for: question, records: [cup, table])?.predicate, .on)
+        }
+        let nameOnly = try engine.query("inside cup table?", records: [cup, table], graph: graph, at: 20)
+        XCTAssertEqual(nameOnly.status, .unsupported)
+        XCTAssertTrue(nameOnly.matches.isEmpty)
+    }
+
+    func testUnresolvedOrConflictingDirectionalGrammarDoesNotGuessByMentionOrder() throws {
+        let cup = try makeRecord(label: "cup", aliases: ["컵"])
+        let table = try makeRecord(label: "table", aliases: ["테이블"])
+        var graph = SceneGraph()
+        try graph.upsert(relation(subject: cup, predicate: .on, object: table))
+        for question in ["컵 테이블 그리고 위에 있어?", "컵 위에 테이블 아래 있어?", "cup table on?"] {
+            let result = try engine.query(question, records: [cup, table], graph: graph, at: 20)
+            XCTAssertEqual(result.status, .unsupported, question)
+            XCTAssertTrue(result.matches.isEmpty, question)
+            XCTAssertNil(result.isAffirmative, question)
+            XCTAssertNil(engine.targetScope(for: question, records: [cup, table]), question)
+        }
+    }
+
     func testCompoundRelationDoesNotSilentlyDiscardThirdGroundedEntity() throws {
         let table = try makeRecord(label: "table", aliases: ["테이블"])
         let cup = try makeRecord(label: "cup", aliases: ["컵"])
