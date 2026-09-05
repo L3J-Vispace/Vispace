@@ -1,6 +1,326 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+  "data.transfer.title": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Move a saved place"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "저장한 장소 옮기기"
+        }
+      }
+    }
+  },
+  "data.transfer.export": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Export encrypted place"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "장소 암호화 내보내기"
+        }
+      }
+    }
+  },
+  "data.transfer.import": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Import encrypted place"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "암호화된 장소 가져오기"
+        }
+      }
+    }
+  },
+  "data.transfer.progress": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Checking and protecting place data…"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "장소 데이터를 확인하고 보호하고 있어요…"
+        }
+      }
+    }
+  },
+  "data.transfer.import.success": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Place imported. Point the camera around the original space to restore it."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "장소를 가져왔어요. 원래 공간을 카메라로 비추면 복원할 수 있어요."
+        }
+      }
+    }
+  },
+  "data.transfer.file.failed": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "The file could not be selected or saved. Check the Files location and try again."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "파일을 선택하거나 저장하지 못했어요. 파일 앱의 위치를 확인하고 다시 시도해 주세요."
+        }
+      }
+    }
+  },
+  "data.transfer.scope": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Includes one latest saved map and current objects, including user names. Older checkpoints and change history are excluded; fingerprints and relations are rebuilt. No original camera frames are included. Limits: 32 MiB map, 36 MiB file, 2,048 objects."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "최신 지도 한 개와 현재 물체 기록·사용자 이름만 옮깁니다. 과거 체크포인트와 변경 이력은 포함하지 않으며, 장소 지문·관계는 다시 생성합니다. 원본 카메라 영상은 포함하지 않습니다. 지도 32 MiB, 파일 36 MiB, 물체 2,048개로 제한됩니다."
+        }
+      }
+    }
+  },
+  "data.transfer.key.title": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Save your recovery key first"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "복구 키를 먼저 보관하세요"
+        }
+      }
+    }
+  },
+  "data.transfer.key.detail": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Save this key separately in a safe place, such as a password manager. It is required to import the file and cannot be recovered by Vispace. Do not store or send the key together with the encrypted file. The key is cleared when this sheet closes."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "이 키를 비밀번호 관리자 등 별도의 안전한 곳에 보관하세요. 파일을 가져올 때 꼭 필요하며 Vispace에서 복구할 수 없습니다. 암호화 파일과 키를 함께 보관하거나 전송하지 마세요. 이 창을 닫으면 키가 지워집니다."
+        }
+      }
+    }
+  },
+  "data.transfer.key.saved": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "I have saved the recovery key separately"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "복구 키를 별도로 보관했어요"
+        }
+      }
+    }
+  },
+  "data.transfer.save": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Choose where to save the encrypted file"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "암호화 파일을 저장할 위치 선택"
+        }
+      }
+    }
+  },
+  "data.transfer.key.input": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Recovery key"
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "복구 키"
+        }
+      }
+    }
+  },
+  "data.transfer.duplicate": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "This place, coordinate frame or object is already stored. Import does not replace existing data."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "같은 장소·좌표계·물체가 이미 저장되어 있어요. 가져오기는 기존 데이터를 덮어쓰지 않습니다."
+        }
+      }
+    }
+  },
+  "data.transfer.key.failed": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "The recovery key is incorrect, or the encrypted file has changed. Check the key and original file."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "복구 키가 맞지 않거나 암호화 파일이 변경됐어요. 키와 원본 파일을 확인해 주세요."
+        }
+      }
+    }
+  },
+  "data.transfer.size.failed": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "This place exceeds the transfer limits: 32 MiB map, 36 MiB file, or 2,048 objects."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "장소가 전송 한도를 초과해요. 지도 32 MiB, 파일 36 MiB, 물체 2,048개까지 지원합니다."
+        }
+      }
+    }
+  },
+  "data.transfer.version.failed": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "This file uses a newer or unsupported format. Update Vispace before importing. The file is unchanged."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "지원하지 않는 버전의 파일이에요. Vispace를 업데이트한 뒤 가져와 주세요. 원본 파일은 변경하지 않았어요."
+        }
+      }
+    }
+  },
+  "data.transfer.invalid": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "This file is not a valid Vispace place, or the selected place is unavailable. Existing data is preserved."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "유효한 Vispace 장소 파일이 아니거나 선택한 장소를 불러올 수 없어요. 기존 데이터는 보존됩니다."
+        }
+      }
+    }
+  },
+  "data.transfer.storage.failed": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Storage is unavailable or too full. Check free space and retry; existing places are preserved."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "저장공간에 접근할 수 없거나 공간이 부족해요. 여유 공간을 확인하고 다시 시도해 주세요. 기존 장소는 보존됩니다."
+        }
+      }
+    }
+  },
+  "data.transfer.failed": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Place transfer could not be completed. Check the file, recovery key and storage, then retry."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "장소를 옮기지 못했어요. 파일·복구 키·저장공간을 확인한 뒤 다시 시도해 주세요."
+        }
+      }
+    }
+  },
+  "data.transfer.recovery.required": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "An existing recovery copy was found. Reopen Vispace to restore the saved catalog before importing."
+        }
+      },
+      "ko": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "기존 복구본이 남아 있어요. Vispace를 다시 열어 저장 목록을 복구한 뒤 가져와 주세요."
+        }
+      }
+    }
+  },
     "storage.restore.failed": {
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Saved space could not be restored. Existing files are preserved. Check storage and the app version, then reopen the app to retry." } },

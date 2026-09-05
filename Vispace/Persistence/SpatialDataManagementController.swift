@@ -18,6 +18,9 @@ public enum SpatialDataManagementState: Equatable, Sendable {
     case idle
     case deleting
     case switching
+    case exporting
+    case importing
+    case imported
     case deleted
     case failed(message: String)
 }
@@ -28,10 +31,13 @@ public enum SpatialDataManagementState: Equatable, Sendable {
 @MainActor
 public final class SpatialDataManagementController: ObservableObject {
     public typealias DeleteAction = @MainActor @Sendable () async throws -> Void
+    public typealias ExportPlaceAction = @MainActor @Sendable (MapID) async throws -> SpatialPlaceEncryptedExport
+    public typealias ImportPlaceAction = @MainActor @Sendable (URL, String) async throws -> MapID
 
     @Published public private(set) var state: SpatialDataManagementState = .idle
     @Published public private(set) var overview: SpatialStorageOverview?
     @Published public private(set) var overviewFailed = false
+    @Published public private(set) var preparedExport: SpatialPlaceEncryptedExport?
 
     private let deleteAction: DeleteAction
     private var deletionTask: Task<Void, Never>?
@@ -39,19 +45,28 @@ public final class SpatialDataManagementController: ObservableObject {
     private let overviewProvider: (@Sendable () async throws -> SpatialStorageOverview)?
     private let deletePlaceAction: (@MainActor @Sendable (MapID) async throws -> Void)?
     private let selectPlaceAction: (@MainActor @Sendable (MapID) async throws -> Void)?
+    private let exportPlaceAction: ExportPlaceAction?
+    private let importPlaceAction: ImportPlaceAction?
 
-    public var isBusy: Bool { state == .deleting || state == .switching }
+    public var isBusy: Bool {
+        state == .deleting || state == .switching || state == .exporting || state == .importing || preparedExport != nil
+    }
+    public var supportsPlaceTransfer: Bool { exportPlaceAction != nil && importPlaceAction != nil }
 
     public init(
         overviewProvider: (@Sendable () async throws -> SpatialStorageOverview)? = nil,
         deletePlaceAction: (@MainActor @Sendable (MapID) async throws -> Void)? = nil,
         selectPlaceAction: (@MainActor @Sendable (MapID) async throws -> Void)? = nil,
+        exportPlaceAction: ExportPlaceAction? = nil,
+        importPlaceAction: ImportPlaceAction? = nil,
         deleteAction: @escaping DeleteAction
     ) {
         self.deleteAction = deleteAction
         self.overviewProvider = overviewProvider
         self.deletePlaceAction = deletePlaceAction
         self.selectPlaceAction = selectPlaceAction
+        self.exportPlaceAction = exportPlaceAction
+        self.importPlaceAction = importPlaceAction
     }
 
     deinit {
@@ -70,6 +85,68 @@ public final class SpatialDataManagementController: ObservableObject {
     public func selectPlace(_ mapID: MapID) {
         guard let selectPlaceAction else { return }
         performDeletion({ try await selectPlaceAction(mapID) }, switching: true)
+    }
+
+    public func preparePlaceExport(_ mapID: MapID) {
+        guard deletionTask == nil, preparedExport == nil, let exportPlaceAction else { return }
+        state = .exporting
+        deletionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { deletionTask = nil }
+            do {
+                let export = try await exportPlaceAction(mapID)
+                try Task.checkCancellation()
+                preparedExport = export
+                state = .idle
+            } catch is CancellationError { state = .idle }
+            catch { state = .failed(message: Self.transferErrorMessage(error)) }
+        }
+    }
+
+    public func discardPreparedExport() {
+        preparedExport = nil
+    }
+
+    public func importPlace(from selectedFile: URL, recoveryKey: String) {
+        guard deletionTask == nil, preparedExport == nil, let importPlaceAction else { return }
+        overviewGeneration &+= 1
+        overview = nil
+        overviewFailed = false
+        state = .importing
+        deletionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { deletionTask = nil }
+            do {
+                _ = try await importPlaceAction(selectedFile, recoveryKey)
+                await refreshOverview(duringMaintenance: true)
+                state = .imported
+            } catch is CancellationError { state = .idle }
+            catch {
+                await refreshOverview(duringMaintenance: true)
+                state = .failed(message: Self.transferErrorMessage(error))
+            }
+        }
+    }
+
+    private static func transferErrorMessage(_ error: any Error) -> String {
+        if let repositoryError = error as? WorldMapCheckpointRepositoryError {
+            switch repositoryError {
+            case .importedMapAlreadyExists, .importedCoordinateFrameAlreadyExists, .importedObjectAlreadyExists:
+                return String(localized: "data.transfer.duplicate")
+            case .metadataFileUnavailable: return String(localized: "data.transfer.recovery.required")
+            default: break
+            }
+        }
+        if let archiveError = error as? SpatialPlaceArchiveError {
+            switch archiveError {
+            case .invalidRecoveryKey, .authenticationFailed: return String(localized: "data.transfer.key.failed")
+            case .fileTooLarge: return String(localized: "data.transfer.size.failed")
+            case .unsupportedVersion: return String(localized: "data.transfer.version.failed")
+            case .invalidDocument, .checksumMismatch, .placeUnavailable: return String(localized: "data.transfer.invalid")
+            }
+        }
+        if error is SpatialStorageError { return String(localized: "data.transfer.storage.failed") }
+        return String(localized: "data.transfer.failed")
     }
 
     public func refreshOverview() async {
@@ -95,7 +172,7 @@ public final class SpatialDataManagementController: ObservableObject {
     }
 
     private func performDeletion(_ action: @escaping DeleteAction, switching: Bool = false) {
-        guard deletionTask == nil else {
+        guard deletionTask == nil, preparedExport == nil else {
             return
         }
         overviewGeneration &+= 1

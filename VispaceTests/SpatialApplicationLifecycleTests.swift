@@ -14,7 +14,11 @@ final class SpatialApplicationLifecycleTests: XCTestCase {
             deleteStore: { calls.append("deleteAll") }
         )
         lifecycle.setActive(true)
-        try await lifecycle.performStorageMaintenance { calls.append("selectedPlace") }
+        let result = try await lifecycle.performStorageMaintenance {
+            calls.append("selectedPlace")
+            return "selected"
+        }
+        XCTAssertEqual(result, "selected")
         XCTAssertEqual(calls, ["prepare", "start", "stop:false", "joined", "selectedPlace", "prepare", "start"])
     }
 

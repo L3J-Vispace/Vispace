@@ -23,6 +23,7 @@ final class VispaceServices: ObservableObject {
         let repository = WorldMapCheckpointRepository(
             directoryURL: spatialCaptureDirectory
         )
+        let placeArchiveService = SpatialPlaceArchiveService(repository: repository)
         let mapSelection = SpatialMapSelection()
         let sessionController = ARSessionController.live(
             repository: repository, preferredMapProvider: { await mapSelection.mapID }
@@ -341,6 +342,23 @@ final class VispaceServices: ObservableObject {
                 try await lifecycle.performStorageMaintenance {
                     await temporalMemoryService.reset()
                     await mapSelection.select(mapID)
+                }
+            },
+            exportPlaceAction: { mapID in
+                try await lifecycle.performStorageMaintenance {
+                    try await placeArchiveService.exportPlace(mapID: mapID)
+                }
+            },
+            importPlaceAction: { selectedFile, recoveryKey in
+                try await lifecycle.performStorageMaintenance {
+                    let mapID = try await placeArchiveService.importPlace(
+                        from: selectedFile, recoveryKey: recoveryKey
+                    )
+                    await temporalMemoryService.reset()
+                    await mapSelection.select(mapID)
+                    perceptionController.resetPersistenceStatus()
+                    sessionController.resetPersistenceStatus()
+                    return mapID
                 }
             }
         ) {

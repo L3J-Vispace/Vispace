@@ -17,6 +17,9 @@ public enum WorldMapCheckpointRepositoryError: Error, Equatable, Sendable {
     case staleObjectUpdate(ObjectID)
     case objectAnnotationConflict(ObjectID)
     case logicalMapCapacityReached(maximum: Int)
+    case importedMapAlreadyExists(MapID)
+    case importedCoordinateFrameAlreadyExists(CoordinateFrameID)
+    case importedObjectAlreadyExists(ObjectID)
 }
 
 /// Transaction boundary joining protected ARWorldMap blobs with versioned map
@@ -553,6 +556,10 @@ public actor WorldMapCheckpointRepository {
         )
         try SpatialStorageDirectory.validatePath(at: metadataURL, fileManager: fileManager)
         guard fileManager.fileExists(atPath: metadataURL.path) else {
+            try SpatialStorageDirectory.validatePath(at: backupURL, fileManager: fileManager)
+            if fileManager.fileExists(atPath: backupURL.path) {
+                return try recoverMetadataAfterCorruption(reason: "Primary catalog is missing; restoring its verified recovery copy.")
+            }
             return SpatialMetadataDocument()
         }
 
@@ -593,6 +600,86 @@ public actor WorldMapCheckpointRepository {
             document.objects.removeAll { $0.mapID == mapID }
             try commit(document, preservePrevious: false)
             await operationGate.release()
+        } catch {
+            await operationGate.release()
+            throw error
+        }
+    }
+
+    /// Imports one validated place as a new logical map. Existing map IDs are
+    /// never overwritten. Only the new blob is eligible for rollback; the
+    /// metadata catalog publishes the map and its objects in one atomic write.
+    @discardableResult
+    public func importPortableCheckpoint(_ candidate: WorldMapRestoreCandidate) async throws -> MapID {
+        try Task.checkCancellation()
+        guard !candidate.archive.isEmpty,
+            candidate.archive.count <= SpatialPlaceArchiveCodec.maximumWorldMapBytes,
+            candidate.objects.count <= SpatialPlaceArchiveCodec.maximumObjectCount
+        else { throw SpatialPlaceArchiveError.fileTooLarge }
+        await operationGate.acquire()
+        do {
+            try Task.checkCancellation()
+            try SpatialStorageDirectory.prepare(at: directoryURL, fileManager: fileManager, createIfMissing: false)
+            try SpatialStorageDirectory.validatePath(at: metadataURL, fileManager: fileManager)
+            try SpatialStorageDirectory.validatePath(at: backupURL, fileManager: fileManager)
+            var document = SpatialMetadataDocument()
+            if fileManager.fileExists(atPath: metadataURL.path) {
+                // Import is not a recovery operation. Invalid existing bytes
+                // remain in place and require recovery before importing.
+                let data = try readBoundedMetadata()
+                try SpatialStorageDirectory.validateJSONSchemas(data, allowsLegacyRoot: true, maximumSchemaVersion: 2)
+                document = try SpatialMetadataMigrator.decodeAndMigrate(data)
+            } else if fileManager.fileExists(atPath: backupURL.path) {
+                // A surviving recovery copy is evidence of an existing store,
+                // not permission to overwrite it with a newly imported map.
+                throw WorldMapCheckpointRepositoryError.metadataFileUnavailable
+            }
+            let mapID = candidate.metadata.mapID
+            guard !document.maps.contains(where: { $0.mapID == mapID }) else {
+                throw WorldMapCheckpointRepositoryError.importedMapAlreadyExists(mapID)
+            }
+            guard !document.maps.contains(where: { $0.coordinateFrameID == candidate.metadata.coordinateFrameID }) else {
+                throw WorldMapCheckpointRepositoryError.importedCoordinateFrameAlreadyExists(candidate.metadata.coordinateFrameID)
+            }
+            let existingObjectIDs = Set(document.objects.map { $0.object.id })
+            if let collision = candidate.objects.first(where: { existingObjectIDs.contains($0.object.id) }) {
+                throw WorldMapCheckpointRepositoryError.importedObjectAlreadyExists(collision.object.id)
+            }
+            let existingMapIDs = Set(document.maps.filter { $0.availability == .active }.map(\.mapID))
+            guard existingMapIDs.count < maximumLogicalMaps else {
+                throw WorldMapCheckpointRepositoryError.logicalMapCapacityReached(maximum: maximumLogicalMaps)
+            }
+            guard candidate.metadata.availability == .active,
+                candidate.metadata.quarantineReason == nil,
+                candidate.objects.allSatisfy({ $0.mapID == mapID && $0.position.coordinateFrameID == candidate.metadata.coordinateFrameID })
+            else { throw WorldMapCheckpointRepositoryError.coordinateFrameMismatch }
+            let blobID = WorldMapBlobID()
+            let metadata = try SpatialMapMetadata(
+                mapID: mapID, coordinateFrameID: candidate.metadata.coordinateFrameID,
+                latestSegmentID: candidate.metadata.latestSegmentID, worldMapBlobID: blobID.rawValue,
+                createdAt: candidate.metadata.createdAt, updatedAt: candidate.metadata.updatedAt
+            )
+            document.maps.append(metadata)
+            document.objects.append(contentsOf: candidate.objects)
+            try document.validate()
+            let encodedCount = try JSONEncoder().encode(document).count
+            guard encodedCount <= Self.maximumMetadataBytes else {
+                throw WorldMapCheckpointRepositoryError.metadataTooLarge(actual: encodedCount, maximum: Self.maximumMetadataBytes)
+            }
+            _ = try await blobStore.saveArchive(candidate.archive, id: blobID,
+                createdAt: Date(timeIntervalSince1970: metadata.updatedAt))
+            do {
+                try Task.checkCancellation()
+                try commit(document)
+            } catch {
+                // On process termination before rollback, normal repository
+                // reconciliation preserves this unpublished typed blob in
+                // quarantine. It can never become a restore candidate alone.
+                try? await blobStore.deleteArchive(id: blobID)
+                throw error
+            }
+            await operationGate.release()
+            return mapID
         } catch {
             await operationGate.release()
             throw error
