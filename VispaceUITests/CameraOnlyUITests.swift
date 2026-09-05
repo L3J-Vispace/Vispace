@@ -170,6 +170,7 @@ final class CameraOnlyUITests: XCTestCase {
             .matching(identifier: "vispace.data.delete.success")
             .firstMatch
         XCTAssertTrue(success.waitForExistence(timeout: 5))
+        XCTAssertTrue(success.isHittable, "Deletion feedback must remain visible after the storage list changes.")
         XCTAssertTrue(app.otherElements["vispace.camera.surface"].exists)
     }
 

@@ -39,6 +39,9 @@ struct SpatialDataSettingsScreen: View {
 
     private var settingsWithDeletionDialogs: some View {
         settingsList
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                statusFeedback
+            }
             .navigationTitle("data.title")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -81,7 +84,6 @@ struct SpatialDataSettingsScreen: View {
             transferSection
             supportSection
             deletionSection
-            statusSection
         }
     }
 
@@ -169,33 +171,52 @@ struct SpatialDataSettingsScreen: View {
             }
             .disabled(controller.isBusy)
             .accessibilityIdentifier("vispace.data.delete")
-
-            if controller.state == .deleting {
-                HStack {
-                    ProgressView()
-                    Text("data.delete.progress")
-                }
-                .accessibilityElement(children: .combine)
-            }
         } footer: {
             Text("data.delete.detail")
         }
     }
 
+    private var showsStatusFeedback: Bool {
+        switch controller.state {
+        case .deleting, .deleted, .failed: true
+        default: false
+        }
+    }
+
+    /// Maintenance changes the list's row count and scroll offset. Keep its
+    /// outcome outside lazy rows so users can see it without another scroll.
     @ViewBuilder
-    private var statusSection: some View {
-        if controller.state == .deleted {
-            Section {
-                Label("data.delete.success", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                    .accessibilityIdentifier("vispace.data.delete.success")
+    private var statusFeedback: some View {
+        if showsStatusFeedback {
+            statusContent
+                .font(.callout)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+                .background(.regularMaterial)
+        }
+    }
+
+    @ViewBuilder
+    private var statusContent: some View {
+        switch controller.state {
+        case .deleting:
+            HStack {
+                ProgressView()
+                Text("data.delete.progress")
             }
-        } else if case .failed(let message) = controller.state {
-            Section {
-                Label(message, systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.red)
-                    .accessibilityIdentifier("vispace.data.delete.failure")
-            }
+            .accessibilityElement(children: .combine)
+        case .deleted:
+            Label("data.delete.success", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("vispace.data.delete.success")
+        case .failed(let message):
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("vispace.data.delete.failure")
+        default:
+            EmptyView()
         }
     }
 
