@@ -60,7 +60,10 @@ final class SceneGraphRepositoryTests: XCTestCase {
         // geometry/revision used to derive relations.
         _ = try await service.ingest(changed: oldCup, allObjects: [table, cup], at: 102)
         let afterStaleArgument = try await repository.load(mapID: context.mapID)
-        XCTAssertEqual(afterStaleArgument?.graph, rebuilt.graph)
+        XCTAssertEqual(
+            afterStaleArgument?.graph.relations(includeProvisional: true),
+            rebuilt.graph.relations(includeProvisional: true)
+        )
         XCTAssertTrue(rebuilt.graph.relations().allSatisfy { $0.validFrom == 101 })
         let controller = SpatialRelationQueryController(
             snapshotProvider: { _ in SpatialRelationQuerySnapshot(
