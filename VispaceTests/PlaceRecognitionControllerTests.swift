@@ -823,6 +823,14 @@ final class PlaceRecognitionControllerTests: XCTestCase {
                 receivedSnapshots.map {
                     controller.metrics.snapshotsReceived >= $0
                 } ?? true
+            if !controller.isProcessingForTesting, snapshotReady,
+                case .failed(let message) = controller.state {
+                throw PlaceControllerWaitError.failed(
+                    message: message,
+                    metrics: controller.metrics,
+                    expectedAssociations: persistedAssociations
+                )
+            }
             if !controller.isProcessingForTesting && fingerprintReady && associationReady
                 && snapshotReady
             {
@@ -830,7 +838,13 @@ final class PlaceRecognitionControllerTests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(10))
         }
-        XCTFail("Place recognition did not become idle before timeout.")
+        throw PlaceControllerWaitError.timedOut(
+            state: controller.state,
+            metrics: controller.metrics,
+            expectedAssociations: persistedAssociations,
+            expectedSnapshots: receivedSnapshots,
+            pendingTasks: controller.pendingProcessingTaskCountForTesting
+        )
     }
 
     private func makeSnapshot(
@@ -955,6 +969,14 @@ final class PlaceRecognitionControllerTests: XCTestCase {
             )
         )
     }
+}
+
+private enum PlaceControllerWaitError: Error {
+    case failed(message: String, metrics: PlaceRecognitionMetrics, expectedAssociations: UInt64?)
+    case timedOut(
+        state: PlaceRecognitionControllerState, metrics: PlaceRecognitionMetrics,
+        expectedAssociations: UInt64?, expectedSnapshots: UInt64?, pendingTasks: Int
+    )
 }
 
 private actor RecordingPlaceStore {
