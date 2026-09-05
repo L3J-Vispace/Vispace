@@ -13,6 +13,7 @@ public enum SpatialReducerError: Error, Equatable, Sendable {
     case snapshotCertaintyMismatch(ObjectID)
     case duplicateSnapshotObject(ObjectID)
     case invalidConfirmedSnapshotConfidence(ObjectID)
+    case revisionExhausted
 }
 
 public enum DeltaApplicationResult: Equatable, Sendable {
@@ -156,6 +157,9 @@ public struct SpatialDeltaReducer: Sendable {
             )
         }
 
+        guard snapshot.revision < UInt64.max else {
+            throw SpatialReducerError.revisionExhausted
+        }
         var working = snapshot
         for event in delta.events {
             try apply(event, to: &working)
@@ -228,6 +232,27 @@ public struct SpatialDeltaReducer: Sendable {
             }
             guard object.position.distance(to: from) <= movementOriginTolerance else {
                 throw SpatialReducerError.movementOriginMismatch(objectID)
+            }
+            if let bounds = object.bounds {
+                // Translate from the actual saved position, not the tolerated
+                // event origin; checked arithmetic keeps failures atomic.
+                let offset = try Vec3(
+                    x: to.x - object.position.x,
+                    y: to.y - object.position.y,
+                    z: to.z - object.position.z
+                )
+                object.bounds = try AABB(
+                    min: Vec3(
+                        x: bounds.min.x + offset.x,
+                        y: bounds.min.y + offset.y,
+                        z: bounds.min.z + offset.z
+                    ),
+                    max: Vec3(
+                        x: bounds.max.x + offset.x,
+                        y: bounds.max.y + offset.y,
+                        z: bounds.max.z + offset.z
+                    )
+                )
             }
             object.position = to
             object.presence = .visible

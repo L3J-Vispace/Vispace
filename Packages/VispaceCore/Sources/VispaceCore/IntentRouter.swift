@@ -51,7 +51,11 @@ public struct DeterministicIntentRouter: Sendable {
         Rule(
             kind: .relationQuery,
             priority: 300,
-            signals: ["아래", "위에", "옆에", "안에", "막고", "가까이", "under", "above", "inside", "blocking", "near"]
+            signals: [
+                "아래", "위에", "옆에", "안에", "막고", "가까이", "왼쪽", "오른쪽",
+                "연결", "접근", "under", "above", "inside", "blocking", "near",
+                "left of", "right of", "connected", "accessible", "on",
+            ]
         ),
         Rule(
             kind: .searchObject,
@@ -69,7 +73,9 @@ public struct DeterministicIntentRouter: Sendable {
             .lowercased()
 
         let matches = rules.compactMap { rule -> (Rule, [String])? in
-            let matched = rule.signals.filter { normalized.contains($0) }
+            let matched = rule.signals.filter {
+                Self.containsSignal($0, in: normalized)
+            }
             return matched.isEmpty ? nil : (rule, matched)
         }
         let selected = matches.sorted { lhs, rhs in
@@ -93,5 +99,17 @@ public struct DeterministicIntentRouter: Sendable {
             matchedSignals: selected.1.sorted(),
             requiresLLM: false
         )
+    }
+
+    private static func containsSignal(_ signal: String, in utterance: String) -> Bool {
+        guard signal.unicodeScalars.allSatisfy({ $0.isASCII }),
+            !signal.contains(" ")
+        else {
+            return utterance.contains(signal)
+        }
+        let tokens = utterance.split { character in
+            !character.isLetter && !character.isNumber
+        }
+        return tokens.contains { $0 == signal }
     }
 }

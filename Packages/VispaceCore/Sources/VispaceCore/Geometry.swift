@@ -50,7 +50,10 @@ public struct Vec3: Codable, Hashable, Sendable {
     }
 
     public func distance(to other: Self) -> Double {
-        (self - other).length
+        // Subtraction can legitimately overflow for opposite, extreme finite
+        // inputs decoded from an older or corrupt store. `hypot` converts that
+        // into an infinite (therefore unusable) distance without trapping.
+        hypot(hypot(x - other.x, y - other.y), z - other.z)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -145,7 +148,7 @@ public struct Transform3D: Hashable, Sendable {
         return try Vec3(x: x / w, y: y / w, z: z / w)
     }
 
-    public static func * (lhs: Self, rhs: Self) -> Self {
+    public static func * (lhs: Self, rhs: Self) throws -> Self {
         var values = Array(repeating: 0.0, count: Self.elementCount)
         for row in 0..<4 {
             for column in 0..<4 {
@@ -154,7 +157,7 @@ public struct Transform3D: Hashable, Sendable {
                 }
             }
         }
-        return try! Self(rowMajorElements: values)
+        return try Self(rowMajorElements: values)
     }
 }
 
@@ -191,16 +194,33 @@ public struct AABB: Codable, Hashable, Sendable {
         guard min.x <= max.x, min.y <= max.y, min.z <= max.z else {
             throw GeometryError.invalidBounds
         }
+        let width = max.x - min.x
+        let height = max.y - min.y
+        let depth = max.z - min.z
+        let volume = width * height * depth
+        guard width.isFinite, height.isFinite, depth.isFinite, volume.isFinite else {
+            // Persisted geometry is later consumed through nonthrowing spatial
+            // operations. Reject representable endpoints whose span or volume
+            // would overflow instead of allowing a delayed `try!` trap.
+            throw GeometryError.invalidBounds
+        }
         self.min = min
         self.max = max
     }
 
     public var center: Vec3 {
-        (min + max) * 0.5
+        // Halving before addition avoids overflowing for valid boxes located
+        // near Double.greatestFiniteMagnitude.
+        try! Vec3(
+            x: (min.x * 0.5) + (max.x * 0.5),
+            y: (min.y * 0.5) + (max.y * 0.5),
+            z: (min.z * 0.5) + (max.z * 0.5)
+        )
     }
 
     public var size: Vec3 {
-        max - min
+        // The initializer proves these differences are finite.
+        try! Vec3(x: max.x - min.x, y: max.y - min.y, z: max.z - min.z)
     }
 
     public var volume: Double {

@@ -162,6 +162,9 @@ final class SceneGraphMemoryIntentTests: XCTestCase {
 
         XCTAssertEqual(router.route("프린터까지 어떻게 가?").kind, .navigate)
         XCTAssertEqual(router.route("가방이 책상 아래 있어?").kind, .relationQuery)
+        XCTAssertEqual(router.route("what is on the desk?").kind, .relationQuery)
+        XCTAssertEqual(router.route("chair connected to table").kind, .relationQuery)
+        XCTAssertEqual(router.route("where is my phone?").kind, .searchObject)
         XCTAssertEqual(router.route("내 노트북 어디 있어?").kind, .searchObject)
 
         let unknown = router.route("이 의자를 여기 둬도 괜찮을까?")

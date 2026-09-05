@@ -61,6 +61,45 @@ final class GeometryAndConfidenceTests: XCTestCase {
         }
     }
 
+    func testAABBRejectsFiniteEndpointsWhoseSpanOverflows() throws {
+        let lower = try Vec3(x: -.greatestFiniteMagnitude, y: 0, z: 0)
+        let upper = try Vec3(x: .greatestFiniteMagnitude, y: 1, z: 1)
+
+        XCTAssertThrowsError(try AABB(min: lower, max: upper)) { error in
+            XCTAssertEqual(error as? GeometryError, .invalidBounds)
+        }
+    }
+
+    func testAABBUsesOverflowSafeCenterAtExtremeCoordinate() throws {
+        let point = try Vec3(
+            x: .greatestFiniteMagnitude,
+            y: .greatestFiniteMagnitude,
+            z: .greatestFiniteMagnitude
+        )
+        let bounds = try AABB(min: point, max: point)
+
+        XCTAssertEqual(bounds.center, point)
+        XCTAssertEqual(bounds.size, .zero)
+        XCTAssertEqual(bounds.volume, 0)
+    }
+
+    func testDistanceFailsClosedWithoutTrappingForExtremeFinitePoints() throws {
+        let positive = try Vec3(x: .greatestFiniteMagnitude, y: 0, z: 0)
+        let negative = try Vec3(x: -.greatestFiniteMagnitude, y: 0, z: 0)
+
+        XCTAssertEqual(positive.distance(to: negative), .infinity)
+    }
+
+    func testTransformCompositionThrowsWhenFiniteInputsOverflow() throws {
+        let hugeTranslation = Transform3D.translation(
+            try Vec3(x: 9e307, y: 0, z: 0)
+        )
+
+        XCTAssertThrowsError(try hugeTranslation * hugeTranslation) { error in
+            XCTAssertEqual(error as? GeometryError, .nonFiniteValue)
+        }
+    }
+
     func testConfidenceThresholdsAreInclusive() {
         let policy = ConfidencePolicy.default
         XCTAssertEqual(policy.grade(for: score(0.499)), .low)

@@ -31,6 +31,14 @@ public struct WorldMapBlobRecord: Equatable, Sendable {
     }
 }
 
+public struct WorldMapQuarantineRecord: Equatable, Sendable {
+    public let id: WorldMapBlobID
+    public let quarantinedAt: Date
+    public let reason: String
+    public let blobURL: URL
+    public let reasonURL: URL
+}
+
 public enum WorldMapBlobStoreError: Error, Equatable, Sendable {
     case emptyArchive
     case archiveTooLarge(actual: Int, maximum: Int)
@@ -40,6 +48,7 @@ public enum WorldMapBlobStoreError: Error, Equatable, Sendable {
     case blobAlreadyExists
     case checksumMismatch(expected: String, actual: String)
     case postWriteVerificationFailed
+    case blobNotFound
 }
 
 /// Stores only secure-coded ARWorldMap archives. Camera/depth pixel buffers have
@@ -169,7 +178,11 @@ public actor ARWorldMapBlobStore {
     }
 
     public func loadArchive(id: WorldMapBlobID) throws -> Data {
-        let archive = try loadEnvelope(at: fileURL(for: id), expectedID: id).archive
+        let source = fileURL(for: id)
+        guard fileManager.fileExists(atPath: source.path) else {
+            throw WorldMapBlobStoreError.blobNotFound
+        }
+        let archive = try loadEnvelope(at: source, expectedID: id).archive
         try archiveValidator(archive)
         return archive
     }
@@ -178,12 +191,114 @@ public actor ARWorldMapBlobStore {
         fileManager.fileExists(atPath: fileURL(for: id).path)
     }
 
-    private func prepareDirectory() throws {
-        try fileManager.createDirectory(
+    /// Enumerates only typed checkpoint files in the dedicated world-map
+    /// directory. Staging files, quarantine artifacts, and unrelated files are
+    /// deliberately excluded so repository recovery cannot act on them.
+    public func activeBlobIDs() throws -> [WorldMapBlobID] {
+        try SpatialStorageDirectory.prepare(
             at: directoryURL,
-            withIntermediateDirectories: true,
-            attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
+            fileManager: fileManager,
+            createIfMissing: false
         )
+        guard fileManager.fileExists(atPath: directoryURL.path) else {
+            return []
+        }
+        return
+            try fileManager
+            .contentsOfDirectory(
+                at: directoryURL,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
+            )
+            .compactMap { url in
+                guard
+                    url.pathExtension == Self.fileExtension,
+                    let rawValue = UUID(uuidString: url.deletingPathExtension().lastPathComponent)
+                else {
+                    return nil
+                }
+                return WorldMapBlobID(rawValue: rawValue)
+            }
+    }
+
+    /// Removes only a valid checkpoint that the metadata repository has
+    /// already superseded and unpublished. Corrupt or incompatible blobs use
+    /// `quarantine` instead and are never deleted through this path.
+    public func removeSupersededArchive(id: WorldMapBlobID) throws {
+        let source = fileURL(for: id)
+        guard fileManager.fileExists(atPath: source.path) else {
+            return
+        }
+        let envelope = try loadEnvelope(at: source, expectedID: id)
+        try archiveValidator(envelope.archive)
+        try fileManager.removeItem(at: source)
+    }
+
+    /// Moves one exact invalid blob into a protected quarantine directory and
+    /// writes a bounded reason sidecar. The bytes are preserved for inspection;
+    /// no corruption path silently deletes user spatial data.
+    @discardableResult
+    public func quarantine(
+        id: WorldMapBlobID,
+        reason: String,
+        quarantinedAt: Date = Date()
+    ) throws -> WorldMapQuarantineRecord {
+        let source = fileURL(for: id)
+        guard fileManager.fileExists(atPath: source.path) else {
+            throw WorldMapBlobStoreError.blobNotFound
+        }
+        try prepareDirectory()
+
+        let quarantineDirectory = directoryURL.appendingPathComponent(
+            "Quarantine",
+            isDirectory: true
+        )
+        try SpatialStorageDirectory.prepare(
+            at: quarantineDirectory,
+            fileManager: fileManager
+        )
+        let nonce = UUID().uuidString.lowercased()
+        let stem = "\(id.rawValue.uuidString.lowercased()).\(nonce)"
+        let destination = quarantineDirectory.appendingPathComponent(
+            "\(stem).\(Self.fileExtension).quarantined",
+            isDirectory: false
+        )
+        let reasonURL = quarantineDirectory.appendingPathComponent(
+            "\(stem).reason.plist",
+            isDirectory: false
+        )
+        let boundedReason = String(reason.prefix(2_048))
+        let sidecar = QuarantineSidecar(
+            blobID: id,
+            quarantinedAt: quarantinedAt,
+            reason: boundedReason
+        )
+        let encoder = PropertyListEncoder()
+        encoder.outputFormat = .binary
+        let encodedSidecar = try encoder.encode(sidecar)
+        try encodedSidecar.write(
+            to: reasonURL,
+            options: [.atomic, .completeFileProtectionUnlessOpen]
+        )
+
+        do {
+            try fileManager.moveItem(at: source, to: destination)
+        } catch {
+            try? fileManager.removeItem(at: reasonURL)
+            throw error
+        }
+
+        return WorldMapQuarantineRecord(
+            id: id,
+            quarantinedAt: quarantinedAt,
+            reason: boundedReason,
+            blobURL: destination,
+            reasonURL: reasonURL
+        )
+    }
+
+    private func prepareDirectory() throws {
+        try SpatialStorageDirectory.prepare(at: directoryURL, fileManager: fileManager)
     }
 
     private func fileURL(for id: WorldMapBlobID) -> URL {
@@ -268,6 +383,11 @@ public actor ARWorldMapBlobStore {
     }
 
     private func readEncodedBlob(at fileURL: URL) throws -> Data {
+        try SpatialStorageDirectory.prepare(
+            at: directoryURL,
+            fileManager: fileManager,
+            createIfMissing: false
+        )
         let handle = try FileHandle(forReadingFrom: fileURL)
         defer { try? handle.close() }
 
@@ -303,5 +423,11 @@ public actor ARWorldMapBlobStore {
 
     private static func sha256(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private struct QuarantineSidecar: Codable {
+        let blobID: WorldMapBlobID
+        let quarantinedAt: Date
+        let reason: String
     }
 }

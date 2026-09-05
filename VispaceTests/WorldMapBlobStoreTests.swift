@@ -13,6 +13,7 @@ final class WorldMapBlobStoreTests: XCTestCase {
         let archive = Data("secure-world-map-fixture".utf8)
 
         let record = try await store.saveArchive(archive, id: id)
+        try assertSpatialDirectoryPolicy(at: directory)
         XCTAssertEqual(record.byteCount, archive.count)
         XCTAssertEqual(record.sha256.count, 64)
         let containsBlob = await store.contains(id: id)
@@ -53,6 +54,35 @@ final class WorldMapBlobStoreTests: XCTestCase {
                 .archiveTooLarge(actual: 5, maximum: 4)
             )
         }
+    }
+
+    func testExistingBlobReadRepairsDirectoryPolicyWithoutChangingArchive() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = envelopeTestStore(directoryURL: directory)
+        let archive = Data("existing-world-map".utf8)
+        let record = try await store.saveArchive(archive)
+        let encoded = try Data(contentsOf: record.fileURL)
+        try resetSpatialDirectoryPolicy(at: directory)
+
+        let loaded = try await store.loadArchive(id: record.id)
+
+        XCTAssertEqual(loaded, archive)
+        XCTAssertEqual(try Data(contentsOf: record.fileURL), encoded)
+        try assertSpatialDirectoryPolicy(at: directory)
+    }
+
+    func testBlobEnumerationRepairsExistingDirectoryPolicy() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = envelopeTestStore(directoryURL: directory)
+        let record = try await store.saveArchive(Data("existing-world-map".utf8))
+        try resetSpatialDirectoryPolicy(at: directory)
+
+        let ids = try await store.activeBlobIDs()
+
+        XCTAssertEqual(ids, [record.id])
+        try assertSpatialDirectoryPolicy(at: directory)
     }
 
     func testDanglingDestinationIsNeverReplaced() async throws {
@@ -98,6 +128,42 @@ final class WorldMapBlobStoreTests: XCTestCase {
         } verify: { error in
             XCTAssertEqual(error as? WorldMapBlobStoreError, .invalidEnvelope)
         }
+    }
+
+    func testSupersededRemovalValidatesBeforeDeleting() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = envelopeTestStore(directoryURL: directory)
+        let record = try await store.saveArchive(Data("valid".utf8))
+        try Data("corrupted".utf8).write(to: record.fileURL, options: .atomic)
+
+        await assertThrowsErrorAsync {
+            try await store.removeSupersededArchive(id: record.id)
+        } verify: { error in
+            XCTAssertEqual(error as? WorldMapBlobStoreError, .invalidEnvelope)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.fileURL.path))
+    }
+
+    func testQuarantinePreservesEncodedBlobAndReasonSidecar() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = envelopeTestStore(directoryURL: directory)
+        let record = try await store.saveArchive(Data("valid".utf8))
+        let encodedBefore = try Data(contentsOf: record.fileURL)
+
+        let quarantine = try await store.quarantine(
+            id: record.id,
+            reason: "checksum mismatch",
+            quarantinedAt: Date(timeIntervalSince1970: 50)
+        )
+
+        let remainsInActiveStore = await store.contains(id: record.id)
+        XCTAssertFalse(remainsInActiveStore)
+        XCTAssertEqual(try Data(contentsOf: quarantine.blobURL), encodedBefore)
+        XCTAssertEqual(quarantine.reason, "checksum mismatch")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: quarantine.reasonURL.path))
+        try assertSpatialDirectoryPolicy(at: quarantine.blobURL.deletingLastPathComponent())
     }
 
     func testArchiveTamperingTriggersChecksumMismatch() async throws {

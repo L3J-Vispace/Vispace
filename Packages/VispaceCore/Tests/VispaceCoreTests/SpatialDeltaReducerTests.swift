@@ -3,6 +3,53 @@ import XCTest
 @testable import VispaceCore
 
 final class SpatialDeltaReducerTests: XCTestCase {
+    func testMovementTranslatesBoundsFromSavedPosition() throws {
+        var object = makeObject(id: objectID(1), position: vec(0))
+        object.bounds = try AABB(min: vec(-0.5), max: vec(0.5))
+        var reducer = SpatialDeltaReducer()
+        try reducer.apply(SpatialDelta(baseRevision: 0, events: [.upsert(object)]))
+        try reducer.apply(
+            SpatialDelta(
+                baseRevision: 1,
+                events: [
+                    .moved(objectID: object.id, from: vec(0.01), to: vec(2), at: 3, confidence: score(1))
+                ]))
+        let moved = try XCTUnwrap(reducer.snapshot.confirmedObjects[object.id])
+        XCTAssertEqual(moved.position, vec(2))
+        XCTAssertEqual(moved.bounds, try AABB(min: vec(1.5), max: vec(2.5)))
+    }
+
+    func testMovementOverflowDoesNotPartiallyChangeSnapshot() throws {
+        var object = makeObject(id: objectID(1), position: vec(0))
+        object.bounds = try AABB(
+            min: vec(Double.greatestFiniteMagnitude), max: vec(Double.greatestFiniteMagnitude))
+        var reducer = SpatialDeltaReducer()
+        try reducer.apply(SpatialDelta(baseRevision: 0, events: [.upsert(object)]))
+        let before = reducer.snapshot
+        XCTAssertThrowsError(
+            try reducer.apply(
+                SpatialDelta(
+                    baseRevision: 1,
+                    events: [
+                        .moved(
+                            objectID: object.id, from: vec(0), to: vec(Double.greatestFiniteMagnitude), at: 3,
+                            confidence: score(1))
+                    ])))
+        XCTAssertEqual(reducer.snapshot, before)
+    }
+
+    func testExhaustedRevisionThrowsWithoutOverflow() throws {
+        let snapshot = try SpatialSnapshot(
+            validatingRevision: .max, confirmedObjects: [:], provisionalObjects: [:],
+            eventHistory: [], appliedDeltaIDs: []
+        )
+        var reducer = try SpatialDeltaReducer(validating: snapshot)
+        XCTAssertThrowsError(try reducer.apply(SpatialDelta(baseRevision: .max, events: []))) {
+            XCTAssertEqual($0 as? SpatialReducerError, .revisionExhausted)
+        }
+        XCTAssertEqual(reducer.snapshot, snapshot)
+    }
+
     func testProvisionalObjectIsIsolatedFromConfirmedView() throws {
         let candidate = makeObject(
             id: objectID(1),

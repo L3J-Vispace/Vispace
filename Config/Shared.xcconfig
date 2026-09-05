@@ -6,11 +6,13 @@ SWIFT_STRICT_CONCURRENCY = complete
 SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated
 
 // Keep signing intentionally unbound in source control. A release operator sets
-// DEVELOPMENT_TEAM and provisioning in an approved local or CI environment.
+// the development team and provisioning in an approved local or CI environment.
+// Do not assign empty signing values here: an empty CODE_SIGN_IDENTITY overrides
+// Xcode's automatic selection and produces an executable that cannot run on device.
 CODE_SIGN_STYLE = Automatic
-DEVELOPMENT_TEAM =
-CODE_SIGN_IDENTITY =
-PROVISIONING_PROFILE_SPECIFIER =
+
+// Optional developer-machine signing values live outside source control.
+#include? "Signing.xcconfig"
 
 // Treat diagnostics as release gates.
 SWIFT_TREAT_WARNINGS_AS_ERRORS = YES

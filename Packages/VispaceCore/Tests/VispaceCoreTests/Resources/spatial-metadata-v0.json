@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 0,
+  "mapID": {
+    "rawValue": "00000000-0000-0000-0000-000000000201"
+  },
+  "coordinateFrameID": {
+    "rawValue": "00000000-0000-0000-0000-000000000202"
+  },
+  "segmentID": {
+    "rawValue": "00000000-0000-0000-0000-000000000203"
+  },
+  "worldMapBlobID": "00000000-0000-0000-0000-000000000204",
+  "createdAt": 10,
+  "updatedAt": 20,
+  "objects": []
+}

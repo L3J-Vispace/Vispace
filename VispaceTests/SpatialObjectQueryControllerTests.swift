@@ -1,0 +1,965 @@
+import Foundation
+import VispaceCore
+import XCTest
+
+@testable import Vispace
+
+@MainActor
+final class SpatialObjectQueryControllerTests: XCTestCase {
+    func testAliasCatalogIsSymmetricSanitizedAndBounded() {
+        let defaults = SpatialObjectAliasCatalog.koreanEnglishDefaults
+        XCTAssertTrue(defaults.aliases(for: " laptop ").contains("노트북"))
+        XCTAssertTrue(defaults.aliases(for: "노트북").contains("laptop"))
+
+        var entries: [String: [String]] = [:]
+        for index in 0..<(SpatialObjectAliasCatalog.maximumCanonicalLabelCount + 20) {
+            entries[String(format: "label-%03d", index)] =
+                (0..<20).map {
+                    "alias-\(index)-\($0)"
+                } + ["", String(repeating: "x", count: 100)]
+        }
+        let bounded = SpatialObjectAliasCatalog(entries: entries)
+
+        XCTAssertEqual(
+            bounded.canonicalLabelCount,
+            SpatialObjectAliasCatalog.maximumCanonicalLabelCount
+        )
+        XCTAssertEqual(
+            bounded.aliases(for: "label-000").count,
+            SpatialObjectAliasCatalog.maximumAliasesPerLabel
+        )
+        XCTAssertTrue(bounded.aliases(for: "label-999").isEmpty)
+    }
+
+    func testRepositoryMapsCurrentVisibleLocalAndHistoricalObjectsToMemoryTiers() async throws {
+        let currentMap = mapID(1)
+        let currentFrame = frameID(1)
+        let otherMap = mapID(2)
+        let otherFrame = frameID(2)
+        let visible = try metadata(
+            id: objectID(1),
+            mapID: currentMap,
+            frameID: currentFrame,
+            label: "laptop",
+            presence: .visible,
+            lastSeenAt: 30
+        )
+        let hidden = try metadata(
+            id: objectID(2),
+            mapID: currentMap,
+            frameID: currentFrame,
+            label: "chair",
+            presence: .lastSeen,
+            lastSeenAt: 20
+        )
+        let historical = try metadata(
+            id: objectID(3),
+            mapID: otherMap,
+            frameID: otherFrame,
+            label: "wallet",
+            presence: .lastSeen,
+            lastSeenAt: 10
+        )
+        let repository = SpatialObjectQueryRepository(
+            metadataProvider: {
+                SpatialMetadataDocument(objects: [historical, hidden, visible])
+            },
+            alignmentCatalogProvider: {
+                try CoordinateAlignmentCatalogSnapshot()
+            }
+        )
+
+        let snapshot = try await repository.loadSnapshot(currentMapID: currentMap)
+
+        XCTAssertEqual(
+            snapshot.records.map(\.metadata.object.id),
+            [
+                visible.object.id, hidden.object.id, historical.object.id,
+            ])
+        XCTAssertEqual(
+            snapshot.records.map(\.memoryTier),
+            [
+                .realtime, .localMap, .longTerm,
+            ])
+        XCTAssertTrue(snapshot.records[0].semanticAliases.contains("노트북"))
+    }
+
+    func testRepositoryRecordLimitUsesDeterministicCurrentFirstOrdering() async throws {
+        let currentMap = mapID(10)
+        let currentFrame = frameID(10)
+        let other = try metadata(
+            id: objectID(10),
+            mapID: mapID(11),
+            frameID: frameID(11),
+            label: "other",
+            lastSeenAt: 100
+        )
+        let current = try metadata(
+            id: objectID(11),
+            mapID: currentMap,
+            frameID: currentFrame,
+            label: "current",
+            lastSeenAt: 1
+        )
+        let repository = SpatialObjectQueryRepository(
+            metadataProvider: {
+                SpatialMetadataDocument(objects: [other, current])
+            },
+            alignmentCatalogProvider: {
+                try CoordinateAlignmentCatalogSnapshot()
+            },
+            maximumRecordCount: 1
+        )
+
+        let snapshot = try await repository.loadSnapshot(currentMapID: currentMap)
+
+        XCTAssertEqual(snapshot.records.map(\.metadata.object.id), [current.object.id])
+    }
+
+    func testExactCurrentFrameReturnsPersistedPositionWithoutAlignment() throws {
+        let map = mapID(20)
+        let frame = frameID(20)
+        let stored = try metadata(
+            id: objectID(20),
+            mapID: map,
+            frameID: frame,
+            label: "chair",
+            position: vec(1.5, 0.4, -2)
+        )
+        let identity = identity(mapID: map, frameID: frame)
+
+        let resolved = ValidatedCurrentFramePositionResolver().resolve(
+            stored,
+            into: identity,
+            using: try CoordinateAlignmentCatalogSnapshot()
+        )
+
+        XCTAssertEqual(resolved?.source, stored.position)
+        XCTAssertEqual(resolved?.currentFramePosition, stored.position)
+        XCTAssertNil(resolved?.alignmentConfidence)
+        XCTAssertEqual(resolved?.mapPath, [map])
+    }
+
+    func testUnconfirmedCaptureNeverReturnsARGuidanceCoordinate() throws {
+        let stored = try metadata(
+            id: objectID(21),
+            mapID: mapID(21),
+            frameID: frameID(21),
+            label: "chair"
+        )
+        let current = ARCaptureIdentity(
+            coordinateFrameID: stored.position.coordinateFrameID,
+            segmentID: CaptureSegmentID(),
+            mapID: stored.mapID,
+            status: .relocalizing
+        )
+
+        XCTAssertNil(
+            ValidatedCurrentFramePositionResolver().resolve(
+                stored,
+                into: current,
+                using: try CoordinateAlignmentCatalogSnapshot()
+            )
+        )
+    }
+
+    func testDirectValidatedAlignmentTransformsStoredCoordinateIntoCurrentFrame() throws {
+        let sourceMap = mapID(30)
+        let targetMap = mapID(31)
+        let sourceFrame = frameID(30)
+        let targetFrame = frameID(31)
+        let translation = vec(3, 0.5, -2)
+        let stored = try metadata(
+            id: objectID(30),
+            mapID: sourceMap,
+            frameID: sourceFrame,
+            label: "laptop",
+            position: vec(1, 1, 1)
+        )
+        let record = try alignmentRecord(
+            sourceMapID: sourceMap,
+            sourceFrameID: sourceFrame,
+            targetMapID: targetMap,
+            targetFrameID: targetFrame,
+            transform: .translation(translation)
+        )
+
+        let resolved = ValidatedCurrentFramePositionResolver().resolve(
+            stored,
+            into: identity(mapID: targetMap, frameID: targetFrame),
+            using: try CoordinateAlignmentCatalogSnapshot(alignments: [record])
+        )
+
+        XCTAssertEqual(resolved?.mapPath, [sourceMap, targetMap])
+        XCTAssertLessThan(
+            try XCTUnwrap(resolved).currentFramePosition.value.distance(
+                to: vec(4, 1.5, -1)
+            ),
+            1e-9
+        )
+        XCTAssertEqual(resolved?.currentFramePosition.coordinateFrameID, targetFrame)
+        XCTAssertGreaterThan(
+            try XCTUnwrap(resolved?.alignmentConfidence).value,
+            0.999_999
+        )
+    }
+
+    func testReverseValidatedAlignmentUsesRigidInverse() throws {
+        let lowMap = mapID(40)
+        let highMap = mapID(41)
+        let lowFrame = frameID(40)
+        let highFrame = frameID(41)
+        let transform = rigidTransform(
+            yaw: .pi / 2,
+            translation: vec(5, 1, -3)
+        )
+        let record = try alignmentRecord(
+            sourceMapID: lowMap,
+            sourceFrameID: lowFrame,
+            targetMapID: highMap,
+            targetFrameID: highFrame,
+            transform: transform
+        )
+        let originalLowPosition = vec(2, 0.5, -1)
+        let storedHighPosition = try transform.transformed(originalLowPosition)
+        let stored = try metadata(
+            id: objectID(40),
+            mapID: highMap,
+            frameID: highFrame,
+            label: "chair",
+            position: storedHighPosition
+        )
+
+        let resolved = ValidatedCurrentFramePositionResolver().resolve(
+            stored,
+            into: identity(mapID: lowMap, frameID: lowFrame),
+            using: try CoordinateAlignmentCatalogSnapshot(alignments: [record])
+        )
+
+        XCTAssertLessThan(
+            try XCTUnwrap(resolved).position.distance(to: originalLowPosition),
+            1e-9
+        )
+    }
+
+    func testValidatedMultiHopPathComposesTransformsInCorrectOrder() throws {
+        let mapA = mapID(50)
+        let mapB = mapID(51)
+        let mapC = mapID(52)
+        let frameA = frameID(50)
+        let frameB = frameID(51)
+        let frameC = frameID(52)
+        let aToB = Transform3D.translation(vec(2, 0, 0))
+        let bToC = rigidTransform(yaw: .pi / 2, translation: vec(0, 1, -4))
+        let stored = try metadata(
+            id: objectID(50),
+            mapID: mapA,
+            frameID: frameA,
+            label: "wallet",
+            position: vec(1, 2, 3)
+        )
+        let records = [
+            try alignmentRecord(
+                sourceMapID: mapA,
+                sourceFrameID: frameA,
+                targetMapID: mapB,
+                targetFrameID: frameB,
+                transform: aToB
+            ),
+            try alignmentRecord(
+                sourceMapID: mapB,
+                sourceFrameID: frameB,
+                targetMapID: mapC,
+                targetFrameID: frameC,
+                transform: bToC
+            ),
+        ]
+        let expected = try (bToC * aToB).transformed(stored.position.value)
+
+        let resolved = ValidatedCurrentFramePositionResolver().resolve(
+            stored,
+            into: identity(mapID: mapC, frameID: frameC),
+            using: try CoordinateAlignmentCatalogSnapshot(alignments: records)
+        )
+
+        XCTAssertEqual(resolved?.mapPath, [mapA, mapB, mapC])
+        XCTAssertLessThan(try XCTUnwrap(resolved).position.distance(to: expected), 1e-9)
+    }
+
+    func testMissingOrFrameMismatchedAlignmentReturnsNoCoordinate() throws {
+        let sourceMap = mapID(60)
+        let targetMap = mapID(61)
+        let sourceFrame = frameID(60)
+        let targetFrame = frameID(61)
+        let stored = try metadata(
+            id: objectID(60),
+            mapID: sourceMap,
+            frameID: sourceFrame,
+            label: "laptop"
+        )
+        let record = try alignmentRecord(
+            sourceMapID: sourceMap,
+            sourceFrameID: sourceFrame,
+            targetMapID: targetMap,
+            targetFrameID: targetFrame,
+            transform: .translation(vec(1, 0, 0))
+        )
+        let resolver = ValidatedCurrentFramePositionResolver()
+
+        XCTAssertNil(
+            resolver.resolve(
+                stored,
+                into: identity(mapID: targetMap, frameID: targetFrame),
+                using: try CoordinateAlignmentCatalogSnapshot()
+            )
+        )
+        XCTAssertNil(
+            resolver.resolve(
+                stored,
+                into: identity(mapID: targetMap, frameID: frameID(999)),
+                using: try CoordinateAlignmentCatalogSnapshot(alignments: [record])
+            )
+        )
+    }
+
+    func testControllerPublishesGroundedTargetForKoreanFindIntent() async throws {
+        let currentMap = mapID(70)
+        let currentFrame = frameID(70)
+        let laptop = try metadata(
+            id: objectID(70),
+            mapID: currentMap,
+            frameID: currentFrame,
+            label: "laptop",
+            position: vec(1.2, 0.7, -2)
+        )
+        let identityBox = QueryIdentityBox(
+            identity(mapID: currentMap, frameID: currentFrame)
+        )
+        let controller = controller(
+            identityBox: identityBox,
+            records: [record(laptop, aliases: ["노트북"])]
+        )
+
+        controller.submit("내 노트북을 찾아줘", now: 100)
+        try await waitForIdle(controller)
+
+        let presentation = try XCTUnwrap(controller.latestPresentation)
+        let target = try XCTUnwrap(controller.latestGroundedTarget)
+        XCTAssertEqual(presentation.result.status, .found)
+        XCTAssertEqual(presentation.result.route.kind, .searchObject)
+        XCTAssertEqual(presentation.guidanceAvailability, .ready)
+        XCTAssertTrue(presentation.canStartARGuidance)
+        XCTAssertTrue(presentation.message.contains("AR 안내"))
+        XCTAssertEqual(target.semanticLabel, "laptop")
+        XCTAssertEqual(target.objectID, laptop.object.id)
+        XCTAssertEqual(target.sourceMapID, currentMap)
+        XCTAssertEqual(target.currentMapID, currentMap)
+        XCTAssertEqual(target.position, laptop.position.value)
+        XCTAssertEqual(target.currentCoordinateFrameID, currentFrame)
+    }
+
+    func testControllerFindsHistoricalRecordButWithholdsUnalignedCoordinate() async throws {
+        let historical = try metadata(
+            id: objectID(80),
+            mapID: mapID(80),
+            frameID: frameID(80),
+            label: "wallet",
+            presence: .lastSeen
+        )
+        let identityBox = QueryIdentityBox(
+            identity(mapID: mapID(81), frameID: frameID(81))
+        )
+        let controller = controller(
+            identityBox: identityBox,
+            records: [record(historical, aliases: ["지갑"])]
+        )
+
+        controller.submit("지갑이 어디 있어?", now: 100)
+        try await waitForIdle(controller)
+
+        let presentation = try XCTUnwrap(controller.latestPresentation)
+        XCTAssertEqual(presentation.result.status, .found)
+        XCTAssertEqual(
+            presentation.guidanceAvailability,
+            .coordinateAlignmentUnavailable
+        )
+        XCTAssertNil(presentation.currentFramePosition)
+        XCTAssertNil(controller.latestGroundedTarget)
+        XCTAssertTrue(presentation.message.contains("좌표 연결"))
+    }
+
+    func testControllerPublishesTransformedTargetForValidatedOtherMap() async throws {
+        let sourceMap = mapID(90)
+        let currentMap = mapID(91)
+        let sourceFrame = frameID(90)
+        let currentFrame = frameID(91)
+        let stored = try metadata(
+            id: objectID(90),
+            mapID: sourceMap,
+            frameID: sourceFrame,
+            label: "chair",
+            position: vec(1, 0, 2)
+        )
+        let alignment = try alignmentRecord(
+            sourceMapID: sourceMap,
+            sourceFrameID: sourceFrame,
+            targetMapID: currentMap,
+            targetFrameID: currentFrame,
+            transform: .translation(vec(4, 0.5, -1))
+        )
+        let identityBox = QueryIdentityBox(
+            identity(mapID: currentMap, frameID: currentFrame)
+        )
+        let controller = controller(
+            identityBox: identityBox,
+            records: [record(stored, aliases: ["의자"])],
+            alignments: [alignment]
+        )
+
+        controller.submit("의자까지 안내해줘", now: 100)
+        try await waitForIdle(controller)
+
+        let target = try XCTUnwrap(controller.latestGroundedTarget)
+        XCTAssertEqual(target.intent, .navigate)
+        XCTAssertEqual(target.sourceCoordinateFrameID, sourceFrame)
+        XCTAssertEqual(target.currentCoordinateFrameID, currentFrame)
+        XCTAssertLessThan(target.position.distance(to: vec(5, 0.5, 1)), 1e-9)
+        XCTAssertGreaterThan(
+            try XCTUnwrap(target.alignmentConfidence).value,
+            0.999_999
+        )
+    }
+
+    func testLastSeenIntentIncludesRemovedObjectButNeverInventsCoordinate() async throws {
+        let stored = try metadata(
+            id: objectID(100),
+            mapID: mapID(100),
+            frameID: frameID(100),
+            label: "wallet",
+            presence: .removed
+        )
+        let identityBox = QueryIdentityBox(
+            identity(mapID: mapID(101), frameID: frameID(101))
+        )
+        let controller = controller(
+            identityBox: identityBox,
+            records: [record(stored, aliases: ["지갑"])]
+        )
+
+        controller.submit("지갑을 마지막으로 어디에서 봤어?", now: 100)
+        try await waitForIdle(controller)
+
+        let presentation = try XCTUnwrap(controller.latestPresentation)
+        XCTAssertEqual(presentation.result.route.kind, .lastSeen)
+        XCTAssertEqual(presentation.result.status, .found)
+        XCTAssertEqual(presentation.result.candidates.first?.record.metadata, stored)
+        XCTAssertNil(controller.latestGroundedTarget)
+    }
+
+    func testLowConfidenceAmbiguousAndUnsupportedResultsNeverExposeTarget() async throws {
+        let map = mapID(110)
+        let frame = frameID(110)
+        let weak = try metadata(
+            id: objectID(110),
+            mapID: map,
+            frameID: frame,
+            label: "remote",
+            confidence: confidence(0.3)
+        )
+        let identityBox = QueryIdentityBox(identity(mapID: map, frameID: frame))
+        let lowController = controller(
+            identityBox: identityBox,
+            records: [record(weak, aliases: ["리모컨"])]
+        )
+
+        lowController.submit("리모컨 찾아줘", now: 100)
+        try await waitForIdle(lowController)
+        XCTAssertEqual(lowController.latestPresentation?.result.status, .lowConfidence)
+        XCTAssertNil(lowController.latestGroundedTarget)
+
+        let first = try metadata(
+            id: objectID(111),
+            mapID: map,
+            frameID: frame,
+            label: "chair",
+            position: vec(1, 0, 0)
+        )
+        let second = try metadata(
+            id: objectID(112),
+            mapID: map,
+            frameID: frame,
+            label: "chair",
+            position: vec(2, 0, 0)
+        )
+        let ambiguousController = controller(
+            identityBox: identityBox,
+            records: [record(first, aliases: ["의자"]), record(second, aliases: ["의자"])]
+        )
+        ambiguousController.submit("의자 어디 있어?", now: 100)
+        try await waitForIdle(ambiguousController)
+        XCTAssertEqual(
+            ambiguousController.latestPresentation?.result.status,
+            .ambiguous
+        )
+        XCTAssertNil(ambiguousController.latestGroundedTarget)
+
+        let unsupportedController = controller(
+            identityBox: identityBox,
+            records: [record(first, aliases: ["의자"])]
+        )
+        unsupportedController.submit("의자를 여기에 놓으면 어때?", now: 100)
+        try await waitForIdle(unsupportedController)
+        XCTAssertEqual(
+            unsupportedController.latestPresentation?.result.status,
+            .unsupportedIntent
+        )
+        XCTAssertNil(unsupportedController.latestGroundedTarget)
+    }
+
+    func testConfiguredSearchResultLimitIsRespected() async throws {
+        let map = mapID(120)
+        let frame = frameID(120)
+        let records = try (0..<5).map { index in
+            record(
+                try metadata(
+                    id: objectID(120 + index),
+                    mapID: map,
+                    frameID: frame,
+                    label: "bottle",
+                    position: vec(Double(index), 0, 0)
+                ),
+                aliases: ["물병"]
+            )
+        }
+        let policy = try SpatialObjectSearchPolicy(maximumResultCount: 2)
+        let identityBox = QueryIdentityBox(identity(mapID: map, frameID: frame))
+        let controller = controller(
+            identityBox: identityBox,
+            records: records,
+            searchEngine: DeterministicSpatialObjectSearchEngine(policy: policy)
+        )
+
+        controller.submit("물병 찾아줘", now: 100)
+        try await waitForIdle(controller)
+
+        XCTAssertEqual(controller.latestPresentation?.result.candidates.count, 2)
+        XCTAssertEqual(controller.latestPresentation?.result.status, .ambiguous)
+        XCTAssertNil(controller.latestGroundedTarget)
+    }
+
+    func testNewerRequestWinsWhenProvidersCompleteOutOfOrder() async throws {
+        let map = mapID(130)
+        let frame = frameID(130)
+        let chair = try metadata(
+            id: objectID(130),
+            mapID: map,
+            frameID: frame,
+            label: "chair"
+        )
+        let laptop = try metadata(
+            id: objectID(131),
+            mapID: map,
+            frameID: frame,
+            label: "laptop"
+        )
+        let provider = SuspendedQuerySnapshotProvider()
+        let identityBox = QueryIdentityBox(identity(mapID: map, frameID: frame))
+        let controller = SpatialObjectQueryController(
+            snapshotProvider: { mapID in
+                try await provider.load(currentMapID: mapID)
+            },
+            currentIdentityProvider: { identityBox.value }
+        )
+
+        controller.submit("의자 찾아줘", now: 100)
+        try await waitForRequestCount(provider, 1)
+        controller.submit("노트북 찾아줘", now: 101)
+        try await waitForRequestCount(provider, 2)
+
+        await provider.resume(
+            requestIndex: 1,
+            with: snapshot(records: [
+                record(chair, aliases: ["의자"]),
+                record(laptop, aliases: ["노트북"]),
+            ])
+        )
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.latestGroundedTarget?.objectID, laptop.object.id)
+
+        await provider.resume(
+            requestIndex: 0,
+            with: snapshot(records: [record(chair, aliases: ["의자"])])
+        )
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertEqual(controller.latestGroundedTarget?.objectID, laptop.object.id)
+        XCTAssertEqual(controller.metrics.requestsCancelled, 1)
+        XCTAssertGreaterThanOrEqual(controller.metrics.staleResultsRejected, 1)
+    }
+
+    func testCancellationAndCaptureIdentityChangeRejectLateResults() async throws {
+        let map = mapID(140)
+        let frame = frameID(140)
+        let laptop = try metadata(
+            id: objectID(140),
+            mapID: map,
+            frameID: frame,
+            label: "laptop"
+        )
+        let provider = SuspendedQuerySnapshotProvider()
+        let identityBox = QueryIdentityBox(identity(mapID: map, frameID: frame))
+        let controller = SpatialObjectQueryController(
+            snapshotProvider: { mapID in
+                try await provider.load(currentMapID: mapID)
+            },
+            currentIdentityProvider: { identityBox.value }
+        )
+
+        controller.submit("노트북 찾아줘", now: 100)
+        try await waitForRequestCount(provider, 1)
+        controller.cancelCurrentQuery()
+        await provider.resume(
+            requestIndex: 0,
+            with: snapshot(records: [record(laptop, aliases: ["노트북"])])
+        )
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(controller.state, .idle)
+        XCTAssertNil(controller.latestGroundedTarget)
+
+        controller.submit("노트북 찾아줘", now: 101)
+        try await waitForRequestCount(provider, 2)
+        identityBox.value = identity(mapID: mapID(141), frameID: frameID(141))
+        await provider.resume(
+            requestIndex: 1,
+            with: snapshot(records: [record(laptop, aliases: ["노트북"])])
+        )
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.state, .idle)
+        XCTAssertNil(controller.latestPresentation)
+        XCTAssertNil(controller.latestGroundedTarget)
+    }
+
+    func testInvalidateAndWaitAlsoWaitsForReplacedSnapshotRead() async throws {
+        let map = mapID(145)
+        let frame = frameID(145)
+        let laptop = try metadata(
+            id: objectID(145),
+            mapID: map,
+            frameID: frame,
+            label: "laptop"
+        )
+        let provider = SuspendedQuerySnapshotProvider()
+        let completion = QueryDeletionBarrierCompletion()
+        let identityBox = QueryIdentityBox(identity(mapID: map, frameID: frame))
+        let controller = SpatialObjectQueryController(
+            snapshotProvider: { mapID in
+                try await provider.load(currentMapID: mapID)
+            },
+            currentIdentityProvider: { identityBox.value }
+        )
+
+        controller.submit("노트북 찾아줘", now: 100)
+        try await waitForRequestCount(provider, 1)
+        controller.submit("노트북 찾아줘", now: 101)
+        try await waitForRequestCount(provider, 2)
+        let barrierTask = Task { @MainActor in
+            await controller.invalidateAndWaitForPendingWork()
+            await completion.markFinished()
+        }
+        try await waitForIdle(controller)
+
+        let finishedWhileProviderWasBlocked = await completion.isFinished
+        XCTAssertFalse(finishedWhileProviderWasBlocked)
+        XCTAssertEqual(controller.state, .idle)
+        XCTAssertNil(controller.latestPresentation)
+        XCTAssertNil(controller.latestGroundedTarget)
+
+        // Finishing the visible request must not hide the cancelled, older read.
+        await provider.resume(
+            requestIndex: 1,
+            with: snapshot(records: [record(laptop, aliases: ["노트북"])])
+        )
+        for _ in 0..<200 {
+            if controller.metrics.staleResultsRejected == 1 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(controller.metrics.staleResultsRejected, 1)
+        try await Task.sleep(for: .milliseconds(30))
+        let finishedWhileReplacedReadWasBlocked = await completion.isFinished
+        XCTAssertFalse(finishedWhileReplacedReadWasBlocked)
+
+        await provider.resume(
+            requestIndex: 0,
+            with: snapshot(records: [record(laptop, aliases: ["노트북"])])
+        )
+        await barrierTask.value
+
+        let finishedAfterProviderReleased = await completion.isFinished
+        XCTAssertTrue(finishedAfterProviderReleased)
+        XCTAssertEqual(controller.state, .idle)
+        XCTAssertNil(controller.latestPresentation)
+        XCTAssertNil(controller.latestGroundedTarget)
+        XCTAssertEqual(controller.metrics.resultsPublished, 0)
+        XCTAssertEqual(controller.metrics.requestsCancelled, 2)
+        XCTAssertEqual(controller.metrics.staleResultsRejected, 2)
+    }
+
+    func testRepositoryFailurePublishesSafeKoreanError() async throws {
+        enum TestError: Error { case unavailable }
+        let identityBox = QueryIdentityBox(identity(mapID: mapID(150), frameID: frameID(150)))
+        let controller = SpatialObjectQueryController(
+            snapshotProvider: { _ in throw TestError.unavailable },
+            currentIdentityProvider: { identityBox.value }
+        )
+
+        controller.submit("노트북 찾아줘", now: 100)
+        try await waitForIdle(controller)
+
+        guard case .failed(let message) = controller.state else {
+            return XCTFail("Expected a safe failure state.")
+        }
+        XCTAssertTrue(message.contains("공간 정보"))
+        XCTAssertFalse(message.contains("unavailable"))
+        XCTAssertNil(controller.latestGroundedTarget)
+        XCTAssertEqual(controller.metrics.failuresPublished, 1)
+    }
+
+    private func controller(
+        identityBox: QueryIdentityBox,
+        records: [StoredSpatialObjectRecord],
+        alignments: [CoordinateAlignmentRecord] = [],
+        searchEngine: DeterministicSpatialObjectSearchEngine =
+            DeterministicSpatialObjectSearchEngine()
+    ) -> SpatialObjectQueryController {
+        let value = snapshot(records: records, alignments: alignments)
+        return SpatialObjectQueryController(
+            snapshotProvider: { _ in value },
+            currentIdentityProvider: { identityBox.value },
+            searchEngine: searchEngine
+        )
+    }
+
+    private func snapshot(
+        records: [StoredSpatialObjectRecord],
+        alignments: [CoordinateAlignmentRecord] = []
+    ) -> SpatialObjectQueryRepositorySnapshot {
+        SpatialObjectQueryRepositorySnapshot(
+            records: records,
+            alignmentCatalog: try! CoordinateAlignmentCatalogSnapshot(
+                alignments: alignments
+            )
+        )
+    }
+
+    private func record(
+        _ metadata: SpatialObjectMetadata,
+        tier: MemoryTier = .longTerm,
+        aliases: [String] = []
+    ) -> StoredSpatialObjectRecord {
+        StoredSpatialObjectRecord(
+            metadata: metadata,
+            memoryTier: tier,
+            semanticAliases: aliases
+        )
+    }
+
+    private func metadata(
+        id: ObjectID,
+        mapID: MapID,
+        frameID: CoordinateFrameID,
+        label: String,
+        position: Vec3 = .zero,
+        certainty: ObjectCertainty = .confirmed,
+        presence: ObjectPresence = .visible,
+        confidence: ConfidenceVector = ConfidenceVector(
+            semantic: .one,
+            geometry: .one,
+            tracking: .one,
+            identity: .one,
+            objectState: .one
+        ),
+        lastSeenAt: TimeInterval = 10
+    ) throws -> SpatialObjectMetadata {
+        let object = try SpatialObject(
+            id: id,
+            semanticLabel: label,
+            position: position,
+            certainty: certainty,
+            presence: presence,
+            confidence: confidence,
+            firstSeenAt: min(1, lastSeenAt),
+            lastSeenAt: lastSeenAt
+        )
+        return try SpatialObjectMetadata(
+            mapID: mapID,
+            object: object,
+            position: FramedPosition(
+                coordinateFrameID: frameID,
+                value: position,
+                observedAt: lastSeenAt,
+                trackingQuality: .normal,
+                uncertainty: .highConfidenceDepth
+            )
+        )
+    }
+
+    private func alignmentRecord(
+        sourceMapID: MapID,
+        sourceFrameID: CoordinateFrameID,
+        targetMapID: MapID,
+        targetFrameID: CoordinateFrameID,
+        transform: Transform3D
+    ) throws -> CoordinateAlignmentRecord {
+        let sourcePoints = [
+            vec(0, 0, 0),
+            vec(2, 0.2, 0.1),
+            vec(0.2, 0.9, 1.7),
+            vec(-1.1, 0.5, -0.8),
+        ]
+        let correspondences = try sourcePoints.enumerated().map { index, source in
+            try CoordinateFrameAlignmentCorrespondence(
+                source: CoordinateFrameAlignmentSourcePoint(
+                    objectID: objectID(10_000 + index),
+                    coordinateFrameID: sourceFrameID,
+                    semanticLabel: "landmark-\(index)",
+                    position: source
+                ),
+                target: CoordinateFrameAlignmentTargetPoint(
+                    objectID: objectID(20_000 + index),
+                    coordinateFrameID: targetFrameID,
+                    semanticLabel: "landmark-\(index)",
+                    position: try transform.transformed(source)
+                ),
+                identityConfidence: .one
+            )
+        }
+        let result = try CoordinateFrameAlignmentEstimator().estimate(
+            correspondences: correspondences
+        )
+        return try CoordinateAlignmentRecord(
+            sourceMapID: sourceMapID,
+            sourceCoordinateFrameID: sourceFrameID,
+            targetMapID: targetMapID,
+            targetCoordinateFrameID: targetFrameID,
+            result: result,
+            createdAt: 1,
+            updatedAt: 1
+        )
+    }
+
+    private func identity(
+        mapID: MapID?,
+        frameID: CoordinateFrameID,
+        status: ARCaptureIdentity.Status = .confirmed
+    ) -> ARCaptureIdentity {
+        ARCaptureIdentity(
+            coordinateFrameID: frameID,
+            segmentID: CaptureSegmentID(rawValue: testUUID(900_000)),
+            mapID: mapID,
+            status: status
+        )
+    }
+
+    private func rigidTransform(yaw: Double, translation: Vec3) -> Transform3D {
+        let cosine = cos(yaw)
+        let sine = sin(yaw)
+        return try! Transform3D(rowMajorElements: [
+            cosine, 0, sine, translation.x,
+            0, 1, 0, translation.y,
+            -sine, 0, cosine, translation.z,
+            0, 0, 0, 1,
+        ])
+    }
+
+    private func confidence(_ value: Double) -> ConfidenceVector {
+        let score = ConfidenceScore(clamping: value)
+        return ConfidenceVector(
+            semantic: score,
+            geometry: score,
+            tracking: score,
+            identity: score,
+            objectState: score
+        )
+    }
+
+    private func waitForIdle(
+        _ controller: SpatialObjectQueryController
+    ) async throws {
+        for _ in 0..<200 where controller.isProcessingForTesting {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(controller.isProcessingForTesting)
+    }
+
+    private func waitForRequestCount(
+        _ provider: SuspendedQuerySnapshotProvider,
+        _ expectedCount: Int
+    ) async throws {
+        for _ in 0..<200 {
+            if await provider.requestCount == expectedCount {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Provider did not receive \(expectedCount) requests before timeout.")
+    }
+
+    private func mapID(_ value: Int) -> MapID {
+        MapID(rawValue: testUUID(value))
+    }
+
+    private func frameID(_ value: Int) -> CoordinateFrameID {
+        CoordinateFrameID(rawValue: testUUID(100_000 + value))
+    }
+
+    private func objectID(_ value: Int) -> ObjectID {
+        ObjectID(rawValue: testUUID(200_000 + value))
+    }
+
+    private func vec(_ x: Double, _ y: Double, _ z: Double) -> Vec3 {
+        try! Vec3(x: x, y: y, z: z)
+    }
+
+    private func testUUID(_ value: Int) -> UUID {
+        UUID(uuidString: String(format: "00000000-0000-0000-0000-%012x", value))!
+    }
+}
+
+@MainActor
+private final class QueryIdentityBox {
+    var value: ARCaptureIdentity
+
+    init(_ value: ARCaptureIdentity) {
+        self.value = value
+    }
+}
+
+private actor SuspendedQuerySnapshotProvider {
+    private var continuations: [CheckedContinuation<SpatialObjectQueryRepositorySnapshot, Error>] = []
+
+    var requestCount: Int {
+        continuations.count
+    }
+
+    func load(currentMapID: MapID?) async throws -> SpatialObjectQueryRepositorySnapshot {
+        _ = currentMapID
+        return try await withCheckedThrowingContinuation { continuation in
+            continuations.append(continuation)
+        }
+    }
+
+    func resume(
+        requestIndex: Int,
+        with snapshot: SpatialObjectQueryRepositorySnapshot
+    ) {
+        continuations[requestIndex].resume(returning: snapshot)
+    }
+}
+
+private actor QueryDeletionBarrierCompletion {
+    private(set) var isFinished = false
+
+    func markFinished() {
+        isFinished = true
+    }
+}

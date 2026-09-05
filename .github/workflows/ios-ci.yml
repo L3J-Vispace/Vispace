@@ -30,6 +30,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify bundled detector model
+        run: bash Scripts/verify-model.sh
+
       - name: Verify Xcode baseline
         run: |
           set -euo pipefail
@@ -154,6 +157,14 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \
             build
+
+      - name: Verify optimized resources
+        run: |
+          set -euo pipefail
+          app="${RUNNER_TEMP}/VispaceReleaseDerivedData/Build/Products/Release-iphonesimulator/Vispace.app"
+          test -d "${app}/YOLOv3TinyInt8LUT.mlmodelc"
+          test -f "${app}/ko.lproj/Localizable.strings"
+          test -f "${app}/ko.lproj/InfoPlist.strings"
 
       - name: Archive device configuration without signing
         run: |

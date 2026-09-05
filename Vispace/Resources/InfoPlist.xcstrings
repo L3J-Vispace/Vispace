@@ -1,0 +1,24 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "NSCameraUsageDescription" : {
+      "comment" : "Explains why Vispace needs camera access.",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vispace needs camera access to show the space around you in real time."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vispace가 주변 공간을 실시간으로 보여 주려면 카메라 접근이 필요합니다."
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}

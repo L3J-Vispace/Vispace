@@ -3,6 +3,24 @@ import XCTest
 @testable import VispaceCore
 
 final class FrameAdmissionSchedulerTests: XCTestCase {
+    func testNewArrivalSupersedesCadenceDelayedPendingFrame() throws {
+        var scheduler = FrameAdmissionScheduler(
+            policy: try FrameAdmissionPolicy(minimumStartInterval: 0.5, maximumFrameAge: 2)
+        )
+        let first = try FrameDescriptor(sequenceNumber: 1, timestamp: 1)
+        let pending = try FrameDescriptor(sequenceNumber: 2, timestamp: 1.1)
+        let newest = try FrameDescriptor(sequenceNumber: 3, timestamp: 1.5)
+        _ = scheduler.offer(first, now: 1)
+        _ = try scheduler.complete(first.id, now: 1.05)
+        _ = scheduler.offer(pending, now: 1.1)
+        XCTAssertEqual(scheduler.offer(newest, now: 1.5), .started(newest))
+        XCTAssertNil(scheduler.pendingLatest)
+        XCTAssertNil(try scheduler.complete(newest.id, now: 2))
+        XCTAssertNil(scheduler.poll(now: 2.1))
+        XCTAssertEqual(scheduler.statistics.startedCount, 2)
+        XCTAssertEqual(scheduler.statistics.supersededDropCount, 1)
+    }
+
     func testSingleFlightKeepsOnlyLatestPendingFrame() throws {
         var scheduler = FrameAdmissionScheduler()
         let first = try FrameDescriptor(id: frameID(1), sequenceNumber: 1, timestamp: 1.00)

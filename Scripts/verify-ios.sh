@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
 clean_recheck=0
-if [[ "${1:-}" == "--clean-recheck" ]]; then
+if [[ $# -eq 1 && "$1" == "--clean-recheck" ]]; then
   clean_recheck=1
 elif [[ $# -gt 0 ]]; then
   echo "Usage: $0 [--clean-recheck]" >&2
@@ -58,6 +58,10 @@ print(latest[0][2])
 simulator_udid="$(select_simulator_udid)"
 
 run_preflight() {
+  local derived="$1"
+  local core_build="$2"
+  bash "$repo_root/Scripts/verify-model.sh"
+
   if ! command -v xcodegen >/dev/null 2>&1; then
     echo "XcodeGen $xcodegen_version is required for deterministic verification." >&2
     exit 1
@@ -79,20 +83,24 @@ run_preflight() {
     exit 1
   fi
   plutil -lint Vispace/Resources/PrivacyInfo.xcprivacy
-  swift test --package-path Packages/VispaceCore --parallel
+  swift test --package-path Packages/VispaceCore --scratch-path "$core_build" --parallel
   xcodebuild \
     -resolvePackageDependencies \
     -project "$project" \
-    -scheme "$scheme"
+    -scheme "$scheme" \
+    -derivedDataPath "$derived"
 }
 
 run_verification() {
   local suffix="$1"
-  local derived="$result_root/DerivedData-$suffix"
-  local archive="$result_root/Vispace-$suffix.xcarchive"
-  local tests="$result_root/Tests-$suffix.xcresult"
+  local run_root
+  run_root="$(mktemp -d "$result_root/verification-$suffix.XXXXXX")"
+  local derived="$run_root/DerivedData"
+  local archive="$run_root/Vispace.xcarchive"
+  local tests="$run_root/Tests.xcresult"
 
-  rm -rf "$derived" "$archive" "$tests"
+  printf 'Verification pass %s. Build output and logs: %s\n' "$suffix" "$run_root"
+  run_preflight "$derived" "$run_root/CoreBuild" 2>&1 | tee "$run_root/preflight.log"
 
   xcodebuild \
     -project "$project" \
@@ -101,7 +109,7 @@ run_verification() {
     -destination 'generic/platform=iOS Simulator' \
     -derivedDataPath "$derived" \
     CODE_SIGNING_ALLOWED=NO \
-    clean build
+    clean build 2>&1 | tee "$run_root/debug-build.log"
 
   xcodebuild \
     -project "$project" \
@@ -110,17 +118,35 @@ run_verification() {
     -destination 'generic/platform=iOS Simulator' \
     -derivedDataPath "$derived" \
     CODE_SIGNING_ALLOWED=NO \
-    build
+    build 2>&1 | tee "$run_root/release-build.log"
 
   local release_binary="$derived/Build/Products/Release-iphonesimulator/Vispace.app/Vispace"
   if [[ ! -f "$release_binary" ]]; then
     echo "Release app binary was not produced at $release_binary." >&2
     exit 1
   fi
-  if grep -aFq 'VispaceDisableARSession' "$release_binary"; then
-    echo 'Release app binary contains the simulator-only AR session bypass.' >&2
+  local compiled_detector="$derived/Build/Products/Release-iphonesimulator/Vispace.app/YOLOv3TinyInt8LUT.mlmodelc"
+  if [[ ! -d "$compiled_detector" ]]; then
+    echo "Compiled detector model was not embedded at $compiled_detector." >&2
     exit 1
   fi
+  local release_app="$(dirname "$release_binary")"
+  test -f "$release_app/ko.lproj/Localizable.strings"
+  test -f "$release_app/ko.lproj/InfoPlist.strings"
+  local debug_token
+  for debug_token in \
+    'VispaceDisableARSession' \
+    'VispaceResetOnboarding' \
+    'VispaceSkipOnboarding' \
+    'VispaceSimulateCameraDenied' \
+    'VispaceSimulateCameraUnavailable' \
+    'VispaceSimulateCameraFailed' \
+    'VispaceSimulateDetectorUnavailable'; do
+    if grep -aFq "$debug_token" "$release_binary"; then
+      echo "Release app binary contains debug-only token: $debug_token" >&2
+      exit 1
+    fi
+  done
 
   xcodebuild \
     -project "$project" \
@@ -131,7 +157,7 @@ run_verification() {
     -archivePath "$archive" \
     CODE_SIGNING_ALLOWED=NO \
     CODE_SIGNING_REQUIRED=NO \
-    archive
+    archive 2>&1 | tee "$run_root/archive.log"
 
   xcodebuild \
     -project "$project" \
@@ -141,7 +167,7 @@ run_verification() {
     -derivedDataPath "$derived" \
     -resultBundlePath "$tests" \
     CODE_SIGNING_ALLOWED=NO \
-    test
+    test 2>&1 | tee "$run_root/test.log"
 
   xcodebuild \
     -project "$project" \
@@ -150,15 +176,15 @@ run_verification() {
     -destination 'generic/platform=iOS Simulator' \
     -derivedDataPath "$derived" \
     CODE_SIGNING_ALLOWED=NO \
-    analyze
+    analyze 2>&1 | tee "$run_root/analyze.log"
+
+  printf 'Verification pass %s completed. Results: %s\n' "$suffix" "$run_root"
 }
 
 mkdir -p "$result_root"
-run_preflight
 run_verification primary
 
 if [[ "$clean_recheck" -eq 1 ]]; then
-  run_preflight
   run_verification recheck
 fi
 

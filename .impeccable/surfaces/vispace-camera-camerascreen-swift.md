@@ -7,12 +7,12 @@ related_targets: ["Vispace/Camera/CameraSurfaceView.swift","Vispace/VispaceApp.s
 
 Scope: `Vispace/Camera/CameraScreen.swift` and its iPhone camera surface. Visitor mode: Experience.
 
-Audience: an iPhone owner moving through an indoor space. Job: enter a spatial capture session immediately. Primary action: move through and point the phone at the real space; there is no on-screen action.
+Audience: an iPhone owner moving through an indoor space. Job: scan after first-run guidance, then search remembered objects, inspect spatial relations, evaluate furniture placement, or request verified route guidance. Primary action: move slowly to collect evidence and use the compact query controls when needed.
 
-Proof/content: the unmodified rear-camera feed fills the window. Black is reserved for capture that is not yet available. The system-owned camera permission prompt is the only permitted interruption.
+Proof/content: the rear-camera feed fills the window behind compact controls. AR target markers, placement previews, and route paths require current compatible spatial evidence. Unavailable or denied capture has an explicit recovery explanation; missing evidence never becomes an invented result.
 
-Constraints: render no app-owned text, buttons, cards, chrome, HUD, coaching overlay, debug geometry, or AR markers. Target iPhone portrait, cover the full safe-area extent, pause capture whenever the scene is inactive, and retain only nonvisual accessibility metadata for the live camera surface.
+Constraints: keep live camera pixels dominant. Query, placement, navigation, and data-settings controls and grounded AR overlays are authorized by the implemented feature scope; debug geometry is not. Target iPhone portrait, cover the safe-area extent, pause capture when inactive, and provide accessible recovery and insufficient-evidence states.
 
-Direction: Unmediated Lens. The memorable moment is the absence of interface chrome: after launch, the observed world itself occupies every pixel.
+Direction: Camera-first spatial guidance. After the one-time first-run gateway, the observed world remains the primary surface; controls and evidence-backed guidance support the current request without obscuring the room.
 
-Unresolved: whether future Search/Ask input or AR guidance may ever change this visible contract; final App Store icon and brand assets; and whether a denied-permission recovery surface will be allowed later.
+Unresolved: final App Store icon and brand assets; physical-device accuracy, accessibility, and release acceptance. Search/Ask and AR guidance are implemented, not future authorization questions.

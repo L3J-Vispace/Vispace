@@ -39,6 +39,8 @@ public enum ObjectIDTag: Sendable {}
 public enum TrackIDTag: Sendable {}
 public enum ObservationIDTag: Sendable {}
 public enum SpatialDeltaIDTag: Sendable {}
+public enum CoordinateFrameIDTag: Sendable {}
+public enum CaptureSegmentIDTag: Sendable {}
 
 public typealias FrameID = TypedID<FrameIDTag>
 public typealias SessionID = TypedID<SessionIDTag>
@@ -48,3 +50,8 @@ public typealias ObjectID = TypedID<ObjectIDTag>
 public typealias TrackID = TypedID<TrackIDTag>
 public typealias ObservationID = TypedID<ObservationIDTag>
 public typealias SpatialDeltaID = TypedID<SpatialDeltaIDTag>
+/// Identifies one world-coordinate system. Coordinates from different frames
+/// must never be compared or merged without an explicit map-alignment result.
+public typealias CoordinateFrameID = TypedID<CoordinateFrameIDTag>
+/// Identifies one uninterrupted AR capture segment inside a coordinate frame.
+public typealias CaptureSegmentID = TypedID<CaptureSegmentIDTag>

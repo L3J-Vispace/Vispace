@@ -34,6 +34,23 @@ final class RecognitionAndIdentityTests: XCTestCase {
         XCTAssertEqual(result.mutationPlan, .updateExisting)
     }
 
+    func testBalancedExactHighBoundaryIsNotLostToFloatingPointRounding() {
+        let result = PlaceRecognizer().classify(
+            PlaceEvidence(
+                visual: .zero,
+                geometry: .one,
+                structure: .one,
+                poseConsistency: .one,
+                objectLayout: .one,
+                spatialOverlap: .one
+            )
+        )
+
+        XCTAssertEqual(result.aggregateScore, ConfidenceScore(clamping: 0.8))
+        XCTAssertEqual(result.grade, .high)
+        XCTAssertEqual(result.classification, .known)
+    }
+
     func testHighAppearanceWithoutSpatialOverlapIsNew() throws {
         let policy = try PlaceRecognitionPolicy(
             overlappingScoreThreshold: score(0.5),
@@ -95,6 +112,42 @@ final class RecognitionAndIdentityTests: XCTestCase {
                 overlappingScoreThreshold: score(0.8),
                 knownScoreThreshold: score(0.8)
             )
+        )
+    }
+
+    func testRecognitionWeightsRejectFiniteComponentsWhoseTotalOverflows() throws {
+        let huge = Double.greatestFiniteMagnitude
+        XCTAssertThrowsError(
+            try PlaceEvidenceWeights(
+                visual: huge, geometry: huge, structure: 0, poseConsistency: 0, objectLayout: 0
+            )
+        ) { error in
+            XCTAssertEqual(error as? PlaceRecognitionError, .invalidWeights)
+        }
+        XCTAssertThrowsError(
+            try IdentityWeights(visual: huge, geometry: huge, spatialContext: 0, temporalContinuity: 0)
+        ) { error in
+            XCTAssertEqual(error as? ObjectIdentityError, .invalidWeights)
+        }
+
+        let placeJSON = try JSONSerialization.data(withJSONObject: [
+            "visual": huge, "geometry": huge, "structure": 0,
+            "poseConsistency": 0, "objectLayout": 0,
+        ])
+        XCTAssertThrowsError(try JSONDecoder().decode(PlaceEvidenceWeights.self, from: placeJSON))
+        let identityJSON = try JSONSerialization.data(withJSONObject: [
+            "visual": huge, "geometry": huge, "spatialContext": 0, "temporalContinuity": 0,
+        ])
+        XCTAssertThrowsError(try JSONDecoder().decode(IdentityWeights.self, from: identityJSON))
+
+        // Large but representable totals remain valid custom policies.
+        XCTAssertNoThrow(
+            try PlaceEvidenceWeights(
+                visual: huge, geometry: 0, structure: 0, poseConsistency: 0, objectLayout: 0
+            )
+        )
+        XCTAssertNoThrow(
+            try IdentityWeights(visual: huge, geometry: 0, spatialContext: 0, temporalContinuity: 0)
         )
     }
 

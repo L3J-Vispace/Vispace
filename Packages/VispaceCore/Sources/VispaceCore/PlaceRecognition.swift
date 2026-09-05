@@ -57,7 +57,8 @@ public struct PlaceEvidenceWeights: Codable, Hashable, Sendable {
         objectLayout: Double
     ) throws {
         let values = [visual, geometry, structure, poseConsistency, objectLayout]
-        guard values.allSatisfy({ $0.isFinite && $0 >= 0 }), values.reduce(0, +) > 0 else {
+        let total = values.reduce(0, +)
+        guard values.allSatisfy({ $0.isFinite && $0 >= 0 }), total.isFinite, total > 0 else {
             throw PlaceRecognitionError.invalidWeights
         }
         self.visual = visual
@@ -240,7 +241,10 @@ public struct PlaceRecognizer: Sendable {
             + evidence.structure.value * weights.structure
             + evidence.poseConsistency.value * weights.poseConsistency
             + evidence.objectLayout.value * weights.objectLayout
-        let aggregate = ConfidenceScore(clamping: weightedSum / weights.total)
+        let rawAggregate = weightedSum / weights.total
+        let aggregate = ConfidenceScore(
+            clamping: thresholdStableValue(rawAggregate)
+        )
         let classification: PlaceClassification
         let mutationPlan: PlaceMutationPlan
 
@@ -266,5 +270,19 @@ public struct PlaceRecognizer: Sendable {
             aggregateScore: aggregate,
             grade: confidencePolicy.grade(for: aggregate)
         )
+    }
+
+    /// Decimal policy weights are not exactly representable in binary. Snap
+    /// only machine-close values to declared decision boundaries so an exact
+    /// mathematical threshold (for example 0.8) remains inclusive.
+    private func thresholdStableValue(_ value: Double) -> Double {
+        let tolerance = 1e-12
+        let boundaries = [
+            policy.overlappingScoreThreshold.value,
+            policy.knownScoreThreshold.value,
+            confidencePolicy.mediumThreshold.value,
+            confidencePolicy.highThreshold.value,
+        ]
+        return boundaries.first(where: { abs(value - $0) <= tolerance }) ?? value
     }
 }

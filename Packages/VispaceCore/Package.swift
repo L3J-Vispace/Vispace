@@ -15,7 +15,8 @@ let package = Package(
         .target(name: "VispaceCore"),
         .testTarget(
             name: "VispaceCoreTests",
-            dependencies: ["VispaceCore"]
+            dependencies: ["VispaceCore"],
+            resources: [.process("Resources")]
         ),
     ],
     swiftLanguageModes: [.v6]

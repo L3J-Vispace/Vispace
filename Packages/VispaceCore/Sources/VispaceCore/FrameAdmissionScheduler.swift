@@ -162,6 +162,12 @@ public struct FrameAdmissionScheduler: Sendable {
         }
 
         if inFlight == nil, cadenceAllowsStart(at: now) {
+            // A newer arrival can win the cadence race before poll drains the
+            // queue. Never run the older pending frame after this one.
+            if pendingLatest != nil {
+                pendingLatest = nil
+                statistics.supersededDropCount += 1
+            }
             start(frame, at: now)
             return .started(frame)
         }
