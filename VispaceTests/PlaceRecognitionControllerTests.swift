@@ -517,6 +517,116 @@ final class PlaceRecognitionControllerTests: XCTestCase {
         controller.deactivate()
     }
 
+    func testSupersededDurableAssociationWriteResumesFromStoredRevision() async throws {
+        try await assertSupersededDurableAssociationWriteResumes(seedHistoryCount: 0)
+    }
+
+    func testSupersededDurableAttemptRotationResumesFromReplacementHistory() async throws {
+        try await assertSupersededDurableAssociationWriteResumes(seedHistoryCount: 63)
+    }
+
+    private func assertSupersededDurableAssociationWriteResumes(seedHistoryCount: Int) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = PlaceMemoryRepository(directoryURL: directory, maximumAssociationStates: 1)
+        let sourceFrameID = CoordinateFrameID()
+        let targetFrameID = CoordinateFrameID()
+        let targetMapID = MapID()
+        let segmentID = CaptureSegmentID()
+        let targetObject = try makeObject(frameID: targetFrameID, mapID: targetMapID)
+        let fingerprint = try ARPlaceFingerprintBuilder().makeFingerprint(
+            from: makeSnapshot(frameID: targetFrameID, mapID: targetMapID, revision: 1),
+            objects: [targetObject]
+        )
+        try await repository.upsertFingerprint(PlaceFingerprintRecord(
+            mapID: targetMapID, coordinateFrameID: targetFrameID,
+            fingerprint: fingerprint, createdAt: 1, updatedAt: 1
+        ))
+        if seedHistoryCount > 0 {
+            let candidate = PlaceMapCandidateEvidence(
+                mapID: targetMapID, coordinateFrameID: targetFrameID,
+                placeEvidence: PlaceEvidence(visual: .one, geometry: .one, structure: .one,
+                    poseConsistency: .one, objectLayout: .one, spatialOverlap: .one),
+                coordinateCompatibility: .unresolved
+            )
+            try await repository.upsertAssociationState(PlaceAssociationStateRecord(
+                context: PlaceAssociationContext(sourceMapID: nil, sourceCoordinateFrameID: sourceFrameID),
+                observations: (0..<seedHistoryCount).map {
+                    PlaceAssociationObservation(id: ObservationID(), baseRevision: UInt64($0),
+                        sequence: UInt64($0 + 1), candidates: [candidate])
+                }, createdAt: 1, updatedAt: 2
+            ))
+        }
+        let sourceObject = try makeObject(frameID: sourceFrameID, mapID: MapID())
+        let channel = LatestValueChannel<ARSurfaceStateSnapshot>()
+        let gate = PlaceAssociationWriteReturnGate()
+        let controller = PlaceRecognitionController(
+            surfaces: channel.stream,
+            objectMetadataProvider: { [sourceObject] },
+            catalogProvider: { try await repository.catalogSnapshot() },
+            fingerprintWriter: { try await repository.upsertFingerprint($0) },
+            associationWriter: {
+                try await repository.upsertAssociationState($0, retention: .retireOlderDeferredAttempts)
+                await gate.waitAfterDurableWrite()
+            },
+            minimumAssociationObservationInterval: 0,
+            checkpointRequester: { XCTFail("Unresolved coordinates must not request a checkpoint") }
+        )
+        controller.activate()
+        do {
+            channel.send(makeSnapshot(frameID: sourceFrameID, segmentID: segmentID, mapID: nil, revision: 1))
+            try await waitForIdle(controller, persistedAssociations: 1, receivedSnapshots: 1)
+            await gate.pauseNextReturn()
+            channel.send(makeSnapshot(frameID: sourceFrameID, segmentID: segmentID, mapID: nil, revision: 2))
+            for _ in 0..<200 {
+                if await gate.isPaused { break }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            guard await gate.isPaused else { throw PlaceControllerWaitError.writeDidNotPause }
+            let before = try await repository.catalogSnapshot()
+            let storedWhileBlocked = try XCTUnwrap(before.associationStates.first)
+
+            // The newer surface must be offered while the completed disk write
+            // has not returned. This deterministically supersedes its UI result.
+            channel.send(makeSnapshot(frameID: sourceFrameID, segmentID: segmentID, mapID: nil, revision: 3))
+            for _ in 0..<200 {
+                if controller.metrics.snapshotsReceived >= 3 { break }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            guard controller.metrics.snapshotsReceived == 3 else {
+                throw PlaceControllerWaitError.newerSnapshotNotReceived
+            }
+            await gate.release()
+            try await waitForIdle(controller, persistedAssociations: 2, receivedSnapshots: 3)
+            let after = try await repository.catalogSnapshot()
+            let resumed = try XCTUnwrap(after.associationStates.first)
+            XCTAssertEqual(resumed.id, storedWhileBlocked.id)
+            XCTAssertEqual(resumed.revision, storedWhileBlocked.revision + 1)
+            XCTAssertEqual(resumed.latestSequence, (storedWhileBlocked.latestSequence ?? 0) + 1)
+            XCTAssertTrue(resumed.observations.starts(with: storedWhileBlocked.observations))
+            XCTAssertEqual(resumed.observations.count, seedHistoryCount == 0 ? 3 : 2)
+            XCTAssertGreaterThanOrEqual(controller.metrics.staleResultsRejected, 1)
+
+            channel.send(makeSnapshot(frameID: sourceFrameID, segmentID: segmentID, mapID: nil, revision: 4))
+            try await waitForIdle(controller, persistedAssociations: 3, receivedSnapshots: 4)
+            let continuedCatalog = try await repository.catalogSnapshot()
+            let continued = try XCTUnwrap(continuedCatalog.associationStates.first)
+            XCTAssertEqual(continued.revision, resumed.revision + 1)
+            XCTAssertTrue(continued.observations.starts(with: resumed.observations))
+            XCTAssertEqual(continuedCatalog.associationStates.count, 1)
+            if case .ambiguous = controller.state {
+                // Continued evidence remains deferred without an alignment.
+            } else {
+                XCTFail("Superseded durable writes must leave recognition operational")
+            }
+        } catch {
+            await gate.release()
+            await controller.deactivateAndWaitForPendingWork()
+            throw error
+        }
+        await controller.deactivateAndWaitForPendingWork()
+    }
+
     func testDeferredAttemptRotationWithRealRepositorySurvivesHistoryLimitAndBackwardClock() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -972,11 +1082,34 @@ final class PlaceRecognitionControllerTests: XCTestCase {
 }
 
 private enum PlaceControllerWaitError: Error {
+    case writeDidNotPause
+    case newerSnapshotNotReceived
     case failed(message: String, metrics: PlaceRecognitionMetrics, expectedAssociations: UInt64?)
     case timedOut(
         state: PlaceRecognitionControllerState, metrics: PlaceRecognitionMetrics,
         expectedAssociations: UInt64?, expectedSnapshots: UInt64?, pendingTasks: Int
     )
+}
+
+private actor PlaceAssociationWriteReturnGate {
+    private var pausesNextReturn = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    var isPaused: Bool { continuation != nil }
+
+    func pauseNextReturn() { pausesNextReturn = true }
+
+    func waitAfterDurableWrite() async {
+        guard pausesNextReturn else { return }
+        pausesNextReturn = false
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        let pending = continuation
+        continuation = nil
+        pending?.resume()
+    }
 }
 
 private actor RecordingPlaceStore {

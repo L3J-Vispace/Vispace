@@ -852,10 +852,7 @@ public final class PlaceRecognitionController: ObservableObject {
         for context: PlaceAssociationContext,
         catalog: PlaceMemoryCatalogSnapshot
     ) throws -> AssociationAttempt {
-        if let activeAttempt, activeAttempt.context == context {
-            return activeAttempt
-        }
-        if let saved = catalog.associationStates
+        let saved = catalog.associationStates
             .filter({ $0.context == context })
             .max(by: { lhs, rhs in
                 if lhs.updatedAt != rhs.updatedAt {
@@ -863,7 +860,29 @@ public final class PlaceRecognitionController: ObservableObject {
                 }
                 return lhs.id < rhs.id
             })
-        {
+        if let activeAttempt, activeAttempt.context == context {
+            let isRetired = !catalog.associationStates.contains(where: { $0.id == activeAttempt.id })
+                && catalog.retiredAssociationCreatedAtThrough.map { activeAttempt.createdAt <= $0 } == true
+            if !isRetired {
+                // A superseded surface can finish its durable write without
+                // publishing UI state or advancing this cache. Replay a newer
+                // durable revision/attempt before appending more observations.
+                // Keep matching (or newer) live state so an older catalog read
+                // cannot regress its revision or surface/time throttle.
+                if let saved {
+                    if saved.id == activeAttempt.id,
+                        saved.revision <= activeAttempt.reducer.snapshot.revision {
+                        return activeAttempt
+                    }
+                    if saved.id != activeAttempt.id, saved.createdAt <= activeAttempt.createdAt {
+                        return activeAttempt
+                    }
+                } else {
+                    return activeAttempt
+                }
+            }
+        }
+        if let saved {
             return AssociationAttempt(
                 id: saved.id,
                 context: saved.context,
