@@ -2,11 +2,13 @@ import SwiftUI
 import VispaceCore
 
 struct SpatialQueryPanel: View {
+    @ObservedObject var perceptionController: SpatialPerceptionController
     @ObservedObject var queryController: SpatialObjectQueryController
     @ObservedObject var relationQueryController: SpatialRelationQueryController
     @ObservedObject var placementController: FurniturePlacementController
     @ObservedObject var navigationController: IndoorNavigationController
     let onManageData: () -> Void
+    let distanceDescription: (Vec3) -> String
     @FocusState private var queryIsFocused: Bool
     @State private var query = ""
     @State private var rejection: SpatialCommandRejection?
@@ -14,6 +16,10 @@ struct SpatialQueryPanel: View {
     @State private var selectedFurniture: FurnitureKind = .sofa
     @State private var editsObjectName = false
     @State private var objectNameDraft = ""
+    @State private var editsClassification = false
+    @State private var classificationDraft = ""
+    @State private var classificationTarget: SpatialObjectMetadata?
+    @State private var reviewsIdentity = false
 
     var body: some View {
         VStack(spacing: 10) {
@@ -82,6 +88,16 @@ struct SpatialQueryPanel: View {
                 .accessibilityLabel(Text("data.title"))
                 .accessibilityIdentifier("vispace.data.settings")
 
+                if !perceptionController.identityConfirmationCandidates.isEmpty {
+                    Button {
+                        queryIsFocused = false; reviewsIdentity = true
+                    } label: {
+                        Image(systemName: "link.badge.plus")
+                    }
+                    .accessibilityLabel("관측한 물체의 이전 기록 연결")
+                    .accessibilityIdentifier("vispace.identity.review")
+                }
+
                 Menu {
                     placementButton(title: "소파", kind: .sofa)
                     placementButton(title: "침대", kind: .bed)
@@ -131,6 +147,17 @@ struct SpatialQueryPanel: View {
                 navigationController.clearRoute()
                 queryController.renameSelectedObject(name)
             }
+        }
+        .sheet(isPresented: $editsClassification) {
+            ObjectClassificationEditor(label: classificationDraft) { label in
+                guard let classificationTarget else { return }
+                navigationController.clearRoute()
+                queryController.correctSelectedClassification(label, expected: classificationTarget)
+            }
+        }
+        .sheet(isPresented: $reviewsIdentity) {
+            ObjectIdentityReviewScreen(
+                controller: perceptionController, distanceDescription: distanceDescription)
         }
     }
 
@@ -255,6 +282,16 @@ struct SpatialQueryPanel: View {
                             editsObjectName = true
                         }
                         .accessibilityIdentifier("vispace.query.rename")
+                    }
+                    if queryController.canCorrectClassification && selected.matchesCurrentMap == true
+                        && selected.record.metadata.object.presence != .removed
+                    {
+                        Button("종류 정정") {
+                            classificationDraft = selected.record.metadata.object.semanticLabel
+                            classificationTarget = selected.record.metadata
+                            editsClassification = true
+                        }
+                        .accessibilityIdentifier("vispace.query.classification")
                     }
                     Spacer()
                     Button("다른 후보 다시 보기") {

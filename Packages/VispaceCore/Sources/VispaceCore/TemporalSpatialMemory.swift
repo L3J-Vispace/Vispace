@@ -28,6 +28,7 @@ public enum TemporalSpatialMemoryError: Error, Equatable, Sendable {
     case identityNotConfirmed(ObjectID)
     case identityDecisionMismatch(ObjectID)
     case semanticLabelMismatch(ObjectID)
+    case staleClassificationCorrection(ObjectID)
     case removedObjectCannotReappear(ObjectID)
     case objectCapacityExceeded(maximum: Int)
     case revisionOverflow
@@ -265,11 +266,13 @@ public struct TemporalSpatialObservation: Codable, Hashable, Sendable {
     public let metadata: SpatialObjectMetadata
     public let promotionEvidence: ObjectReidentificationPromotionEvidence
     public let identityDecision: PersistentObjectReidentificationDecision
+    public let identitySupport: PersistentObjectIdentitySupport?
 
     public init(
         metadata: SpatialObjectMetadata,
         promotionEvidence: ObjectReidentificationPromotionEvidence,
-        identityDecision: PersistentObjectReidentificationDecision
+        identityDecision: PersistentObjectReidentificationDecision,
+        identitySupport: PersistentObjectIdentitySupport? = nil
     ) throws {
         guard metadata.object.certainty == .confirmed else {
             throw TemporalSpatialMemoryError.observationIsNotConfirmed(metadata.object.id)
@@ -277,7 +280,15 @@ public struct TemporalSpatialObservation: Codable, Hashable, Sendable {
         guard metadata.object.presence == .visible else {
             throw TemporalSpatialMemoryError.observationIsNotVisible(metadata.object.id)
         }
-        guard promotionEvidence.semanticLabel == metadata.object.semanticLabel,
+        let supportedCorrection: Bool
+        if case .confirmedExisting = identityDecision {
+            supportedCorrection =
+                metadata.object.detectorSemanticLabel == promotionEvidence.semanticLabel
+                && identitySupport?.objectID == metadata.object.id
+        } else {
+            supportedCorrection = false
+        }
+        guard (promotionEvidence.semanticLabel == metadata.object.semanticLabel || supportedCorrection),
             promotionEvidence.mapID == metadata.mapID,
             promotionEvidence.coordinateFrameID == metadata.position.coordinateFrameID,
             promotionEvidence.lastObservedAt == metadata.position.observedAt
@@ -287,12 +298,14 @@ public struct TemporalSpatialObservation: Codable, Hashable, Sendable {
         self.metadata = metadata
         self.promotionEvidence = promotionEvidence
         self.identityDecision = identityDecision
+        self.identitySupport = identitySupport
     }
 
     private enum CodingKeys: String, CodingKey {
         case metadata
         case promotionEvidence
         case identityDecision
+        case identitySupport
     }
 
     public init(from decoder: Decoder) throws {
@@ -307,7 +320,9 @@ public struct TemporalSpatialObservation: Codable, Hashable, Sendable {
                 identityDecision: container.decode(
                     PersistentObjectReidentificationDecision.self,
                     forKey: .identityDecision
-                )
+                ),
+                identitySupport: container.decodeIfPresent(
+                    PersistentObjectIdentitySupport.self, forKey: .identitySupport)
             )
         } catch let error as DecodingError {
             throw error
@@ -376,6 +391,7 @@ public struct TemporalSpatialUpdate: Codable, Hashable, Sendable {
     public let coordinateFrameID: CoordinateFrameID
     public let observations: [TemporalSpatialObservation]
     public let expectedVisibleObjectIDs: [ObjectID]
+    public let classificationCorrections: [ObjectClassificationCorrection]
 
     public init(
         id: SpatialDeltaID = SpatialDeltaID(),
@@ -386,7 +402,8 @@ public struct TemporalSpatialUpdate: Codable, Hashable, Sendable {
         coordinateFrameID: CoordinateFrameID,
         observations: [TemporalSpatialObservation],
         expectedVisibleObjectIDs: [ObjectID],
-        clock: TemporalSpatialClock? = nil
+        clock: TemporalSpatialClock? = nil,
+        classificationCorrections: [ObjectClassificationCorrection] = []
     ) throws {
         guard timestamp.isFinite, timestamp >= 0 else {
             throw TemporalSpatialMemoryError.invalidTimestamp
@@ -449,6 +466,12 @@ public struct TemporalSpatialUpdate: Codable, Hashable, Sendable {
         self.observations = observations.sorted {
             $0.metadata.object.id < $1.metadata.object.id
         }
+        guard classificationCorrections.count <= 32,
+            Set(classificationCorrections.map(\.objectID)).count == classificationCorrections.count,
+            Set(classificationCorrections.map(\.objectID)).isDisjoint(with: observedIDs),
+            Set(classificationCorrections.map(\.objectID)).isDisjoint(with: expectedVisibleObjectIDs)
+        else { throw TemporalSpatialMemoryError.invalidSnapshot }
+        self.classificationCorrections = classificationCorrections
         self.expectedVisibleObjectIDs = expectedVisibleObjectIDs.sorted()
     }
 
@@ -462,6 +485,7 @@ public struct TemporalSpatialUpdate: Codable, Hashable, Sendable {
         case coordinateFrameID
         case observations
         case expectedVisibleObjectIDs
+        case classificationCorrections
     }
 
     public init(from decoder: Decoder) throws {
@@ -485,7 +509,9 @@ public struct TemporalSpatialUpdate: Codable, Hashable, Sendable {
                     [ObjectID].self,
                     forKey: .expectedVisibleObjectIDs
                 ),
-                clock: container.decodeIfPresent(TemporalSpatialClock.self, forKey: .clock)
+                clock: container.decodeIfPresent(TemporalSpatialClock.self, forKey: .clock),
+                classificationCorrections: container.decodeIfPresent(
+                    [ObjectClassificationCorrection].self, forKey: .classificationCorrections) ?? []
             )
         } catch let error as DecodingError {
             throw error
@@ -502,6 +528,7 @@ public struct TemporalSpatialUpdate: Codable, Hashable, Sendable {
 public enum TemporalSpatialChange: Codable, Hashable, Sendable {
     case clockEpochStarted(epoch: UInt64, at: TimeInterval)
     case calendarClockMovedBackward(at: TimeInterval)
+    case reclassified(objectID: ObjectID, from: String, to: String, at: TimeInterval)
     /// The durable object limit prevents only this new identity's admission;
     /// existing identities and visibility evidence in the batch still advance.
     case deferredDueToCapacity(objectID: ObjectID, at: TimeInterval)
@@ -942,6 +969,31 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
                 changes.append(.calendarClockMovedBackward(at: update.timestamp))
             }
         }
+        for correction in update.classificationCorrections {
+            guard var state = working.objectStates[correction.objectID],
+                state.metadata.object.presence != .removed,
+                state.metadata.object.semanticLabel == correction.expectedSemanticLabel,
+                state.metadata.object.temporalRevision == correction.expectedTemporalRevision
+            else { throw TemporalSpatialMemoryError.staleClassificationCorrection(correction.objectID) }
+            let previousLabel = state.metadata.object.semanticLabel
+            guard previousLabel != correction.semanticLabel else { continue }
+            var object = state.metadata.object
+            object.detectorSemanticLabel = object.detectorSemanticLabel ?? previousLabel
+            object.semanticLabel = correction.semanticLabel
+            object.temporalRevision = observationRevision ?? object.temporalRevision
+            object.stateUpdatedAt = update.timestamp
+            try object.setDisplayName(correction.displayName)
+            state.metadata = try SpatialObjectMetadata(
+                mapID: state.metadata.mapID,
+                object: object, position: state.metadata.position)
+            state.pendingMovementSamples.removeAll()
+            working.objectStates[correction.objectID] = state
+            spatialEvents.append(.upsert(object))
+            changes.append(
+                .reclassified(
+                    objectID: object.id, from: previousLabel,
+                    to: object.semanticLabel, at: update.timestamp))
+        }
         let observedIDs = Set(update.observations.map { $0.metadata.object.id })
 
         for observation in update.observations
@@ -1041,7 +1093,11 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
             guard clock.captureSegmentID == previous.captureSegmentID else {
                 throw TemporalSpatialMemoryError.clockEpochConflict
             }
-            guard clock.monotonicTimestamp > previous.monotonicTimestamp else {
+            let isCorrectionAtCurrentPose =
+                !update.classificationCorrections.isEmpty
+                && update.observations.isEmpty && update.expectedVisibleObjectIDs.isEmpty
+                && clock.monotonicTimestamp == previous.monotonicTimestamp
+            guard clock.monotonicTimestamp > previous.monotonicTimestamp || isCorrectionAtCurrentPose else {
                 throw TemporalSpatialMemoryError.outOfOrderTimestamp(
                     previous: previous.monotonicTimestamp, incoming: clock.monotonicTimestamp
                 )
@@ -1102,10 +1158,16 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
                 guard candidate.objectID == object.id else {
                     throw TemporalSpatialMemoryError.identityDecisionMismatch(object.id)
                 }
+                let supported =
+                    observation.identitySupport?.validates(
+                        existing: existing.metadata,
+                        incoming: metadata, promotionEvidence: observation.promotionEvidence) == true
+                let contextSupported =
+                    candidate.geometryScore >= policy.minimumReidentificationGeometryScore
+                    && candidate.spatialContextScore.map { $0 >= policy.minimumReidentificationContextScore }
+                        == true
                 guard candidate.score >= policy.minimumReidentificationScore,
-                    candidate.geometryScore >= policy.minimumReidentificationGeometryScore,
-                    let contextScore = candidate.spatialContextScore,
-                    contextScore >= policy.minimumReidentificationContextScore
+                    supported || contextSupported
                 else {
                     throw TemporalSpatialMemoryError.identityNotConfirmed(object.id)
                 }
@@ -1153,6 +1215,29 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
                 spatialEvents: &spatialEvents,
                 changes: &changes
             )
+            if let support = observation.identitySupport, case .continuousTracking = support,
+                objectState.metadata.position != incoming.position
+            {
+                // Verified live tracking maintains the measured position even
+                // while movement-event hysteresis waits for a settled cluster.
+                // This durable rolling anchor prevents long motion from losing
+                // its identity when the bounded tracking window advances.
+                let previousPresence = objectState.metadata.object.presence
+                objectState.metadata = try refreshedMetadata(
+                    existing: objectState.metadata,
+                    from: incoming, temporalRevision: temporalRevision)
+                spatialEvents.append(
+                    .observed(
+                        objectID: objectID, at: incoming.position.observedAt,
+                        position: incoming.position.value, bounds: objectState.metadata.object.bounds,
+                        confidence: incoming.object.confidence))
+                if previousPresence != .visible {
+                    changes.append(
+                        .stateChanged(
+                            objectID: objectID, from: previousPresence,
+                            to: .visible, at: incoming.position.observedAt))
+                }
+            }
             resetMissEvidence(in: &objectState)
             state.objectStates[objectID] = objectState
             return
@@ -1208,9 +1293,10 @@ public struct TemporalSpatialMemoryCoordinator: Sendable {
             monotonicTimestamp: monotonicTimestamp
         )
 
-        if let latest = state.pendingMovementSamples.last,
-            latest.position.value.distance(to: sample.position.value)
-                <= policy.movementClusterRadius
+        if !state.pendingMovementSamples.isEmpty,
+            state.pendingMovementSamples.allSatisfy({
+                $0.position.value.distance(to: sample.position.value) <= policy.movementClusterRadius
+            })
         {
             state.pendingMovementSamples.append(sample)
         } else {

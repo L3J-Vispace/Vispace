@@ -8,6 +8,35 @@ final class ObjectObservationPromotionTests: XCTestCase {
     private let captureSegmentID = CaptureSegmentID(rawValue: testUUID(8_002))
     private let mapID = MapID(rawValue: testUUID(8_003))
 
+    func testPromotedTransientCandidateFollowsSustainedMotionBeyondRollingWindow() throws {
+        var promoter = ObjectObservationPromoter()
+        var original: SpatialObjectMetadata?
+        for index in 0..<48 {
+            let outcome = try promoter.ingest(
+                observation(
+                    index + 1, frame: index + 1,
+                    at: Double(index) * 0.2, x: Double(max(index - 2, 0)) * 0.10, mapID: mapID))
+            if index == 2 {
+                guard case .promoted(let metadata) = outcome else {
+                    return XCTFail("Initial stable evidence must promote")
+                }
+                original = metadata
+            } else if index > 2 {
+                guard case .alreadyPromoted(let metadata) = outcome else {
+                    return XCTFail("Sustained motion split the transient candidate at frame \(index + 1)")
+                }
+                XCTAssertEqual(
+                    metadata, original,
+                    "Transient association must not update durable metadata or confer identity authority")
+                XCTAssertEqual(promoter.candidateCount, 1)
+            }
+        }
+        let evidence = try XCTUnwrap(promoter.promotionEvidence(for: XCTUnwrap(original).object.id))
+        XCTAssertEqual(evidence.count, 32)
+        XCTAssertEqual(evidence.last?.position.value.x, 4.5)
+        XCTAssertGreaterThan(try XCTUnwrap(evidence.first).position.observedAt, 0.4)
+    }
+
     func testSingleObservationRemainsIDFreePendingEvidence() throws {
         var promoter = ObjectObservationPromoter()
 

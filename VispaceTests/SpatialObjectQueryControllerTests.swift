@@ -6,6 +6,69 @@ import XCTest
 
 @MainActor
 final class SpatialObjectQueryControllerTests: XCTestCase {
+    func testClassificationCorrectionKeepsSelectedIDAndNameAndRefreshesSearch() async throws {
+        let map = mapID(993), frame = frameID(993)
+        let current = identity(mapID: map, frameID: frame)
+        let objects = try (0..<2).map { index in
+            try metadata(
+                id: objectID(993 + index), mapID: map, frameID: frame,
+                label: "chair", position: vec(Double(index), 0, -2))
+        }
+        let store = QueryAnnotationTestStore(objects: objects)
+        _ = try await store.rename(objects[0], name: "창가 가구")
+        let controller = SpatialObjectQueryController(
+            snapshotProvider: { _ in try await store.snapshot() },
+            currentIdentityProvider: { current },
+            classificationCorrectionProvider: { expected, label in
+                try await store.correct(expected, label: label)
+            })
+        var invalidations = 0
+        controller.onObjectRenamed = { invalidations += 1 }
+        controller.submit("창가 가구 찾아줘", now: 100)
+        try await waitForIdle(controller)
+        XCTAssertTrue(controller.canCorrectClassification)
+        controller.correctSelectedClassification("table", now: 101)
+        try await waitForIdle(controller)
+        let corrected = try XCTUnwrap(
+            controller.latestPresentation?.result.selectedCandidate?.record.metadata)
+        XCTAssertEqual(corrected.object.id, objects[0].object.id)
+        XCTAssertEqual(corrected.object.displayName, "창가 가구")
+        XCTAssertEqual(corrected.object.semanticLabel, "table")
+        XCTAssertEqual(corrected.position, objects[0].position)
+        XCTAssertEqual(invalidations, 1)
+        let snapshot = try await store.snapshot()
+        XCTAssertEqual(snapshot.records[1].metadata, objects[1])
+        controller.submit("table 찾아줘", now: 102)
+        try await waitForIdle(controller)
+        XCTAssertEqual(
+            controller.latestPresentation?.result.selectedCandidate?.record.metadata.object.id,
+            objects[0].object.id)
+    }
+
+    func testClassificationDraftCannotApplyToADifferentSelectedObject() async throws {
+        let map = mapID(995), frame = frameID(995)
+        let current = identity(mapID: map, frameID: frame)
+        let a = try metadata(id: objectID(995), mapID: map, frameID: frame, label: "chair")
+        let b = try metadata(id: objectID(996), mapID: map, frameID: frame, label: "table")
+        let store = QueryAnnotationTestStore(objects: [a, b])
+        let controller = SpatialObjectQueryController(
+            snapshotProvider: { _ in try await store.snapshot() },
+            currentIdentityProvider: { current },
+            classificationCorrectionProvider: { expected, label in
+                try await store.correct(expected, label: label)
+            })
+        controller.submit("chair 찾아줘", now: 100)
+        try await waitForIdle(controller)
+        let reviewed = try XCTUnwrap(controller.latestPresentation?.result.selectedCandidate?.record.metadata)
+        controller.submit("table 찾아줘", now: 101)
+        try await waitForIdle(controller)
+        controller.correctSelectedClassification("cup", expected: reviewed, now: 102)
+        try await waitForIdle(controller)
+        let unchanged = try await store.snapshot()
+        XCTAssertEqual(unchanged.records.map(\.metadata), [a, b])
+        if case .failed = controller.state {} else { XCTFail("Changed selection requires another review") }
+    }
+
     func testFutureStateTimeKeepsOriginalDateButCannotPublishGuidance() async throws {
         let map = mapID(970), frame = frameID(970)
         let original = try metadata(id: objectID(970), mapID: map, frameID: frame, label: "chair")
@@ -1090,6 +1153,17 @@ private actor QueryAnnotationTestStore {
         SpatialObjectQueryRepositorySnapshot(records: objects.map {
             StoredSpatialObjectRecord(metadata: $0, memoryTier: .localMap)
         }, alignmentCatalog: try CoordinateAlignmentCatalogSnapshot())
+    }
+    func correct(_ expected: SpatialObjectMetadata, label: String) throws -> SpatialObjectMetadata {
+        let index = objects.firstIndex { $0.object.id == expected.object.id && $0.mapID == expected.mapID }!
+        guard objects[index] == expected else { throw SpatialObjectError.invalidTimestamp }
+        var object = objects[index].object
+        object.semanticLabel = label
+        object.stateUpdatedAt = max(object.stateUpdatedAt, 101)
+        let corrected = try SpatialObjectMetadata(
+            mapID: expected.mapID, object: object, position: expected.position)
+        objects[index] = corrected
+        return corrected
     }
     func rename(_ expected: SpatialObjectMetadata, name: String?) throws -> SpatialObjectMetadata {
         let index = objects.firstIndex { $0.object.id == expected.object.id && $0.mapID == expected.mapID }!

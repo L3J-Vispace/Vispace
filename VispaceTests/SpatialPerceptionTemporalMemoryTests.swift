@@ -113,6 +113,239 @@ final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
         }
     }
 
+    func testVerifiedVisionTrackingUpdatesIsolatedObjectAndPersistsMovement() async throws {
+        try await withNewObjectTemporalHarness(
+            includesLandmark: false,
+            tracker: TemporalRecordingObjectTracker()
+        ) { harness in
+            let wall = Date().timeIntervalSince1970, uptime = ProcessInfo.processInfo.systemUptime
+            var original: SpatialObjectMetadata?
+            for index in 0..<12 {
+                try await sendNewObjectFrame(
+                    harness, index: index, baseTime: wall, baseUptime: uptime,
+                    cameraOffsetX: index >= 9 ? 0.205 : 0)
+                let objects = await harness.store.objects()
+                if index == 2 { original = try XCTUnwrap(objects.first) }
+                if index >= 3 {
+                    XCTAssertEqual(objects.count, 1)
+                    XCTAssertEqual(objects.first?.object.id, original?.object.id)
+                    if index < 9 || index == 11 {
+                        XCTAssertEqual(objects.first?.object.lastSeenAt, wall + Double(index) * 0.2)
+                    }
+                }
+            }
+            let stored = await harness.store.objects()
+            let latest = try XCTUnwrap(stored.first), initial = try XCTUnwrap(original)
+            XCTAssertEqual(latest.position.value.x, initial.position.value.x + 0.205, accuracy: 0.0001)
+            let recovery = try await harness.journal.recover(
+                mapID: harness.identity.mapID!,
+                coordinateFrameID: harness.identity.coordinateFrameID)
+            XCTAssertEqual(recovery?.snapshot.metadata(for: initial.object.id), latest)
+            XCTAssertEqual(recovery?.snapshot.revision, 10)
+            let batches = await harness.recorder.batches()
+            XCTAssertTrue(batches.dropFirst().allSatisfy { $0.observations.first?.identitySupport != nil })
+            XCTAssertNil(harness.controller.persistenceFailureMessage)
+        }
+    }
+
+    func testVerifiedTrackingContinuouslyMovesBeyondEvidenceWindowAndStops() async throws {
+        try await withNewObjectTemporalHarness(
+            includesLandmark: false,
+            tracker: TemporalRecordingObjectTracker()
+        ) { harness in
+            let wall = Date().timeIntervalSince1970, uptime = ProcessInfo.processInfo.systemUptime
+            var original: SpatialObjectMetadata?
+            for index in 0..<48 {
+                let offset = Float(min(max(index - 2, 0), 42)) * 0.10
+                try await sendNewObjectFrame(
+                    harness, index: index, baseTime: wall,
+                    baseUptime: uptime, cameraOffsetX: offset)
+                let values = await harness.store.objects()
+                if index == 2 { original = try XCTUnwrap(values.first) }
+                if index > 2 {
+                    let current = try XCTUnwrap(values.first)
+                    XCTAssertEqual(values.count, 1)
+                    XCTAssertEqual(current.object.id, original?.object.id)
+                    XCTAssertEqual(current.object.lastSeenAt, wall + Double(index) * 0.2)
+                    XCTAssertEqual(
+                        current.position.value.x,
+                        try XCTUnwrap(original).position.value.x + Double(offset), accuracy: 0.001)
+                }
+            }
+            let recovery = try await harness.journal.recover(
+                mapID: harness.identity.mapID!,
+                coordinateFrameID: harness.identity.coordinateFrameID)
+            XCTAssertEqual(recovery?.snapshot.revision, 46)
+            XCTAssertGreaterThan(try XCTUnwrap(recovery?.snapshot.objects.values.first).position.value.x, 4)
+            XCTAssertNil(harness.controller.persistenceFailureMessage)
+        }
+    }
+
+    func testClassificationCorrectionSurvivesSubsequentRawLabelTrackingFrames() async throws {
+        try await withNewObjectTemporalHarness(
+            includesLandmark: false,
+            tracker: TemporalRecordingObjectTracker()
+        ) { harness in
+            let wall = Date().timeIntervalSince1970, uptime = ProcessInfo.processInfo.systemUptime
+            for index in 0..<6 {
+                try await sendNewObjectFrame(harness, index: index, baseTime: wall, baseUptime: uptime)
+            }
+            let stored = await harness.store.objects()
+            let original = try XCTUnwrap(stored.first)
+            var named = original.object
+            try named.setDisplayName("창가 가구")
+            await harness.store.upsert(
+                try SpatialObjectMetadata(
+                    mapID: original.mapID,
+                    object: named, position: original.position))
+            // User mutations can use the latest already-ingested pose without
+            // manufacturing another sensor observation or changing lastSeenAt.
+            let pose = try temporalSnapshot(
+                identity: harness.identity, capturedAt: wall + 1,
+                timestamp: uptime + 1, includesDepth: true
+            ).pose
+            _ = try await harness.service.correctClassification(
+                objectID: original.object.id,
+                semanticLabel: "table", expectedTemporalRevision: original.object.temporalRevision, pose: pose
+            )
+            for index in 6..<9 {
+                try await sendNewObjectFrame(harness, index: index, baseTime: wall, baseUptime: uptime)
+            }
+            let values = await harness.store.objects()
+            let corrected = try XCTUnwrap(values.first)
+            XCTAssertEqual(values.count, 1)
+            XCTAssertEqual(corrected.object.id, original.object.id)
+            XCTAssertEqual(corrected.object.semanticLabel, "table")
+            XCTAssertEqual(corrected.object.detectorSemanticLabel, "chair")
+            XCTAssertEqual(corrected.object.displayName, "창가 가구")
+            XCTAssertEqual(corrected.object.lastSeenAt, wall + 1.6)
+            let recovery = try await harness.journal.recover(
+                mapID: original.mapID,
+                coordinateFrameID: original.position.coordinateFrameID)
+            XCTAssertEqual(recovery?.snapshot.metadata(for: original.object.id), corrected)
+            let batches = await harness.recorder.batches()
+            XCTAssertEqual(batches.last?.observations.first?.promotionEvidence.semanticLabel, "chair")
+            XCTAssertEqual(batches.last?.observations.first?.metadata.object.semanticLabel, "table")
+        }
+    }
+
+    func testFarObservationRequiresReviewAndUserConfirmationCommitsOriginalID() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let identity = ARCaptureIdentity(mapID: MapID(), status: .confirmed)
+        let original = try temporalExistingMetadata(
+            id: ObjectID(), label: "chair",
+            position: temporalTestPosition(), identity: identity)
+        let store = TemporalControllerMetadataStore(
+            document: SpatialMetadataDocument(
+                maps: [
+                    temporalTestMapMetadata(
+                        mapID: identity.mapID!, coordinateFrameID: identity.coordinateFrameID)
+                ], objects: [original]))
+        let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let service = TemporalSpatialMemoryService(
+            journalRepository: journal,
+            metadataProvider: { await store.snapshot() }, metadataWriter: { await store.upsert($0) })
+        let channel = LatestValueChannel<ARFrameSnapshot>()
+        let detector = TemporalSequenceObjectDetector(
+            outputs: Array(repeating: [temporalDetection()], count: 8))
+        let controller = SpatialPerceptionController(
+            frames: channel.stream,
+            detectorResolution: ObjectDetectorResolution(detector: detector, availability: .available),
+            tracker: TemporalRecordingObjectTracker(), detectorInterval: 0.1,
+            confirmedIdentityProvider: { _ in identity }, metadataProvider: { await store.objects() },
+            metadataWriter: { _ in },
+            temporalMemoryProcessor: { batch, pose in
+                try await service.process(batch, pose: pose)
+            }, processingBudgetProvider: { .normal })
+        controller.activate()
+        defer { controller.deactivate() }
+        let wall = Date().timeIntervalSince1970, uptime = ProcessInfo.processInfo.systemUptime
+        var reviewedID: UUID?
+        for index in 0..<8 {
+            var transform = matrix_identity_float4x4
+            transform.columns.3.x = 2
+            channel.send(
+                try temporalSnapshot(
+                    identity: identity, capturedAt: wall + Double(index) * 0.2,
+                    timestamp: uptime + Double(index) * 0.2, includesDepth: true, cameraTransform: transform))
+            try await waitForTemporalDetector(detector, expectedCount: index + 1)
+            await controller.waitForProcessingCompletionForTesting()
+            if index == 2 { reviewedID = try XCTUnwrap(controller.identityConfirmationCandidates.first?.id) }
+            if index == 3 {
+                XCTAssertEqual(
+                    controller.identityConfirmationCandidates.first?.id, reviewedID,
+                    "Stable review IDs must survive ordinary new frames while the user taps")
+                let before = await store.objects()
+                XCTAssertEqual(before, [original], "Far proximity alone must not write or merge")
+                try await controller.confirmObservedObjectIdentity(
+                    candidateID: XCTUnwrap(reviewedID),
+                    existingObjectID: original.object.id,
+                    expectedTemporalRevision: original.object.temporalRevision)
+            }
+        }
+        let objects = await store.objects()
+        XCTAssertEqual(objects.count, 1)
+        let moved = try XCTUnwrap(objects.first)
+        XCTAssertEqual(moved.object.id, original.object.id)
+        XCTAssertEqual(moved.position.value.x, 2, accuracy: 0.01)
+        XCTAssertEqual(moved.object.firstSeenAt, original.object.firstSeenAt)
+        let recovery = try await journal.recover(
+            mapID: original.mapID, coordinateFrameID: original.position.coordinateFrameID)
+        XCTAssertEqual(recovery?.snapshot.metadata(for: original.object.id), moved)
+        XCTAssertTrue(controller.identityConfirmationCandidates.isEmpty)
+        XCTAssertNil(controller.persistenceFailureMessage)
+    }
+
+    func testSameClassObjectElsewhereDoesNotSuppressIndividualEmptyDepthEvidence() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let identity = ARCaptureIdentity(mapID: MapID(), status: .confirmed)
+        let a = try temporalExistingMetadata(
+            id: ObjectID(), label: "chair", position: temporalTestPosition(), identity: identity)
+        let b = try temporalExistingMetadata(
+            id: ObjectID(), label: "chair", position: temporalTestPosition(0.06), identity: identity)
+        let store = TemporalControllerMetadataStore(
+            document: SpatialMetadataDocument(
+                maps: [
+                    temporalTestMapMetadata(
+                        mapID: identity.mapID!, coordinateFrameID: identity.coordinateFrameID)
+                ], objects: [a, b]))
+        let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let service = TemporalSpatialMemoryService(
+            journalRepository: journal, policy: temporalTestPolicy(),
+            metadataProvider: { await store.snapshot() }, metadataWriter: { await store.upsert($0) })
+        let channel = LatestValueChannel<ARFrameSnapshot>()
+        let detection = DetectedObject(
+            label: "chair", confidence: 0.95,
+            boundingBox: NormalizedBoundingBox(x: 0.72, y: 0.4, width: 0.16, height: 0.2))
+        let detector = TemporalSequenceObjectDetector(outputs: Array(repeating: [detection], count: 5))
+        let controller = SpatialPerceptionController(
+            frames: channel.stream,
+            detectorResolution: ObjectDetectorResolution(detector: detector, availability: .available),
+            detectorInterval: 0.1, confirmedIdentityProvider: { _ in identity },
+            metadataProvider: { await store.objects() }, metadataWriter: { _ in },
+            temporalMemoryProcessor: { batch, pose in try await service.process(batch, pose: pose) },
+            processingBudgetProvider: { .normal })
+        controller.activate()
+        defer { controller.deactivate() }
+        let wall = Date().timeIntervalSince1970, uptime = ProcessInfo.processInfo.systemUptime
+        for index in 0..<5 {
+            channel.send(
+                try temporalSnapshot(
+                    identity: identity, capturedAt: wall + Double(index),
+                    timestamp: uptime + Double(index), includesDepth: true, rawDepth: temporalDepth(meters: 3)
+                ))
+            try await waitForTemporalDetector(detector, expectedCount: index + 1)
+            await controller.waitForProcessingCompletionForTesting()
+        }
+        let recovered = try await service.recover(
+            mapID: identity.mapID!, coordinateFrameID: identity.coordinateFrameID)
+        XCTAssertEqual(recovered.metadata(for: a.object.id)?.object.presence, .removed)
+        XCTAssertEqual(recovered.metadata(for: b.object.id), b)
+        XCTAssertNil(controller.persistenceFailureMessage)
+    }
+
     func testClockRollbackWarningSurvivesAFrameWithoutAStorageAttempt() async throws {
         let channel = LatestValueChannel<ARFrameSnapshot>()
         let detector = TemporalSequenceObjectDetector(
@@ -426,11 +659,15 @@ final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
 
     func testTrackerCadenceCannotCreateMissButEmptyDetectorPassCan() async throws {
         let channel = LatestValueChannel<ARFrameSnapshot>()
+        // Leave room for ObjectDepthLocator's measured extent and padding so
+        // the whole stored footprint stays inside the reliable camera region.
+        let detection = DetectedObject(label: "chair", confidence: 0.95,
+            boundingBox: NormalizedBoundingBox(x: 0.2, y: 0.2, width: 0.6, height: 0.6))
         let detector = TemporalSequenceObjectDetector(
             outputs: [
-                [temporalDetection()],
-                [temporalDetection()],
-                [temporalDetection()],
+                [detection],
+                [detection],
+                [detection],
                 [],
             ]
         )
@@ -492,7 +729,7 @@ final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
                 includesDepth: true
             )
         )
-        try await waitForTemporalTracker(tracker, expectedCount: 1)
+        try await waitForTemporalTracker(tracker, expectedCount: 3)
         try await waitForTemporalIdle(controller)
         let afterTrackerCount = await processor.callCount()
         XCTAssertEqual(afterTrackerCount, 1)
@@ -514,9 +751,12 @@ final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
         try await waitForTemporalIdle(controller)
 
         let calls = await processor.recordedCalls()
-        XCTAssertEqual(calls[1].batch.observations, [])
-        XCTAssertEqual(calls[1].batch.expectedVisibleObjectIDs, [persistentID])
-        XCTAssertEqual(calls[1].pose.capturedAt, baseTime + 0.65)
+        XCTAssertEqual(calls.count, 2)
+        let missCall = try XCTUnwrap(calls.dropFirst().first,
+            "The empty detector pass must produce a miss for the fully visible measured footprint")
+        XCTAssertEqual(missCall.batch.observations, [])
+        XCTAssertEqual(missCall.batch.expectedVisibleObjectIDs, [persistentID])
+        XCTAssertEqual(missCall.pose.capturedAt, baseTime + 0.65)
     }
 
     func testSameClassDetectorHitWithoutDepthDoesNotBecomeFalseMissingEvidence()
@@ -738,7 +978,14 @@ final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
             depthMeters: occluderDepths,
             confidence: Array(repeating: ARDepthConfidence.high.rawValue, count: 100)
         )
+        var chairOpeningDepths = Array(repeating: Float(2), count: 100)
+        chairOpeningDepths[55] = 3
+        let backgroundThroughOpening = ARDepthSnapshot(
+            dimensions: ImageDimensions(width: 10, height: 10),
+            depthMeters: chairOpeningDepths,
+            confidence: Array(repeating: ARDepthConfidence.high.rawValue, count: 100))
         let cases: [(String, ARDepthSnapshot?, ARDepthSnapshot?)] = [
+            ("one background ray through an object opening", backgroundThroughOpening, nil),
             ("no depth", nil, nil),
             ("smoothed depth alone", nil, temporalDepth(meters: 3)),
             ("occluded", temporalDepth(meters: 1), nil),
@@ -797,6 +1044,7 @@ final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
 
     private func withNewObjectTemporalHarness(
         includesLandmark: Bool,
+        tracker: any ObjectTracking = TemporalUnavailableObjectTracker(),
         body: @MainActor (NewObjectTemporalHarness) async throws -> Void
     ) async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -822,6 +1070,7 @@ final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
         let controller = SpatialPerceptionController(
             frames: channel.stream,
             detectorResolution: ObjectDetectorResolution(detector: detector, availability: .available),
+            tracker: tracker,
             detectorInterval: 0.1, confirmedIdentityProvider: { _ in identity },
             metadataProvider: { await store.objects() }, metadataWriter: { _ in },
             temporalMemoryProcessor: { batch, pose in
@@ -832,7 +1081,7 @@ final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
         )
         let harness = NewObjectTemporalHarness(
             identity: identity, channel: channel, detector: detector, controller: controller,
-            store: store, journal: journal, recorder: recorder
+            store: store, journal: journal, recorder: recorder, service: service
         )
         controller.activate()
         do {
@@ -937,6 +1186,7 @@ private struct NewObjectTemporalHarness: Sendable {
     let store: TemporalControllerMetadataStore
     let journal: TemporalSpatialMemoryJournalRepository
     let recorder: TemporalCommittedBatchRecorder
+    let service: TemporalSpatialMemoryService
 }
 
 private actor TemporalCommittedBatchRecorder {
@@ -1040,6 +1290,12 @@ private actor TemporalSequenceObjectDetector: ObjectDetector {
     }
 }
 
+private actor TemporalUnavailableObjectTracker: ObjectTracking {
+    func seed(_ seeds: [TrackingSeed]) async {}
+    func track(in frame: ARFrameSnapshot) async throws -> [TrackedObject] { [] }
+    func reset() async {}
+}
+
 private actor TemporalRecordingObjectTracker: ObjectTracking {
     private var seeds: [TrackingSeed] = []
     private var invocations = 0
@@ -1097,6 +1353,9 @@ private func temporalExistingMetadata(
         id: id,
         semanticLabel: label,
         position: position,
+        bounds: try AABB(
+            min: Vec3(x: position.x - 0.04, y: position.y - 0.04, z: position.z - 0.04),
+            max: Vec3(x: position.x + 0.04, y: position.y + 0.04, z: position.z + 0.04)),
         certainty: certainty,
         presence: presence,
         confidence: temporalTestVector(),

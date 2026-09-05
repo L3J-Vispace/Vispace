@@ -67,12 +67,21 @@ struct CameraScreen: View {
             } else {
                 ARGuidanceOverlay(controller: guidanceController)
                 SpatialQueryPanel(
+                    perceptionController: perceptionController,
                     queryController: queryController,
                     relationQueryController: relationQueryController,
                     placementController: placementController,
                     navigationController: navigationController,
                     onManageData: {
                         showsDataManagement = true
+                    },
+                    distanceDescription: { position in
+                        guard let frame = sessionController.latestDepthFrame else { return "현재 거리 확인 불가" }
+                        let camera = frame.pose.cameraTransform.column3
+                        let distance = hypot(
+                            hypot(position.x - Double(camera.x), position.y - Double(camera.y)),
+                            position.z - Double(camera.z))
+                        return "카메라에서 약 \(distance.formatted(.number.precision(.fractionLength(1))))m"
                     }
                 )
                 if sessionController.persistenceFailureMessage != nil

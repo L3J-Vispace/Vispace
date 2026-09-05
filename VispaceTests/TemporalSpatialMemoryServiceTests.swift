@@ -4,6 +4,64 @@ import XCTest
 @testable import Vispace
 
 final class TemporalSpatialMemoryServiceTests: XCTestCase {
+    func testUserCorrectionJournalsCurrentNameAndSurvivesServiceRestart() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(91), frameID = temporalTestFrameID(91)
+        let objectID = temporalTestObjectID(91)
+        let store = TemporalMetadataStore(
+            document: SpatialMetadataDocument(
+                maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)]))
+        let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let service = TemporalSpatialMemoryService(
+            journalRepository: journal, policy: temporalTestPolicy(),
+            metadataProvider: { try await store.snapshot() }, metadataWriter: { try await store.upsert($0) })
+        _ = try await service.process(
+            TemporalSpatialRecognitionBatch(
+                sequence: 1,
+                observations: [
+                    temporalTestNewObservation(
+                        mapID: mapID, coordinateFrameID: frameID,
+                        objectID: objectID, at: 100)
+                ], expectedVisibleObjectIDs: []),
+            pose: temporalTestPose(
+                mapID: mapID, coordinateFrameID: frameID,
+                capturedAt: 100, sessionTimestamp: 1, sequence: 1))
+        let values = await store.allObjects()
+        let old = try XCTUnwrap(values.first)
+        try await store.renameAnnotation(expected: old, displayName: "내 책상")
+        _ = try await service.correctClassification(
+            objectID: objectID, semanticLabel: "table",
+            expectedTemporalRevision: old.object.temporalRevision,
+            pose: temporalTestPose(
+                mapID: mapID, coordinateFrameID: frameID,
+                capturedAt: 101, sessionTimestamp: 2, sequence: 2))
+        let cold = TemporalSpatialMemoryService(
+            journalRepository: journal, policy: temporalTestPolicy(),
+            metadataProvider: { try await store.snapshot() }, metadataWriter: { try await store.upsert($0) })
+        let restored = try await cold.recover(mapID: mapID, coordinateFrameID: frameID)
+        let corrected = try XCTUnwrap(restored.metadata(for: objectID))
+        XCTAssertEqual(corrected.object.displayName, "내 책상")
+        XCTAssertEqual(corrected.object.semanticLabel, "table")
+        XCTAssertEqual(corrected.position, old.position)
+        XCTAssertEqual(corrected.object.firstSeenAt, old.object.firstSeenAt)
+        XCTAssertEqual(corrected.object.temporalRevision, 2)
+        XCTAssertTrue(
+            restored.recentDeltas.flatMap(\.changes).contains(
+                .reclassified(objectID: objectID, from: old.object.semanticLabel, to: "table", at: 101)))
+        do {
+            _ = try await cold.correctClassification(
+                objectID: objectID, semanticLabel: "cup",
+                expectedTemporalRevision: old.object.temporalRevision,
+                pose: temporalTestPose(
+                    mapID: mapID, coordinateFrameID: frameID,
+                    capturedAt: 102, sessionTimestamp: 3, sequence: 3))
+            XCTFail("A correction to an outdated selected record must fail")
+        } catch {
+            XCTAssertEqual(error as? TemporalSpatialMemoryError, .staleClassificationCorrection(objectID))
+        }
+    }
+
     func testColdRecoveryUsesOneCompleteBatchAndKeepsDeltaWriterContract() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1077,6 +1135,20 @@ private actor TemporalMetadataStore {
 
     func writeAttemptCount() -> Int {
         writeAttempts
+    }
+
+    /// Mirrors the repository's separate user-annotation mutation. A rename
+    /// does not claim a newer sensor observation or temporal revision.
+    func renameAnnotation(expected: SpatialObjectMetadata, displayName: String?) throws {
+        guard let index = document.objects.firstIndex(where: {
+            $0.mapID == expected.mapID && $0.object.id == expected.object.id
+        }), document.objects[index] == expected else {
+            throw TemporalMetadataStoreError.staleWrite
+        }
+        var object = expected.object
+        try object.setDisplayName(displayName)
+        document.objects[index] = try SpatialObjectMetadata(mapID: expected.mapID,
+            object: object, position: expected.position)
     }
 
     func upsert(_ metadata: SpatialObjectMetadata) throws {

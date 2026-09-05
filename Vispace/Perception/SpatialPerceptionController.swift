@@ -51,6 +51,22 @@ public struct SpatialPerceptionMetrics: Equatable, Sendable {
     public init() {}
 }
 
+public struct ObjectIdentityConfirmationCandidate: Identifiable, Equatable, Sendable {
+    public let id: UUID
+    public let observedObjectID: ObjectID
+    public let observedMetadata: SpatialObjectMetadata
+    public let existingCandidates: [SpatialObjectMetadata]
+    public let frameID: FrameID
+    public let capturedAt: TimeInterval
+    public let sessionToken: ARSessionFrameToken
+}
+
+public enum ObjectIdentityConfirmationError: Error, Equatable, Sendable {
+    case staleCandidate
+    case staleExistingObject
+    case unavailable
+}
+
 /// Owns the Phase 1 perception flow from bounded AR frame admission through
 /// multi-frame object promotion and durable metadata persistence.
 ///
@@ -78,6 +94,8 @@ public final class SpatialPerceptionController: ObservableObject {
         ) async throws -> TemporalSpatialMemoryServiceResult
 
     @Published public private(set) var state: SpatialPerceptionState = .inactive
+    @Published public private(set) var identityConfirmationCandidates: [ObjectIdentityConfirmationCandidate] =
+        []
     @Published public private(set) var latestDetections: [DetectedObject] = []
     @Published public private(set) var metrics = SpatialPerceptionMetrics()
     /// Persists across ordinary scanning state changes until a durable write succeeds.
@@ -146,6 +164,15 @@ public final class SpatialPerceptionController: ObservableObject {
     private var temporalIdentityByPromotedObjectID: [ObjectID: TemporalIdentityResolution] = [:]
     private var latestTemporalMetadataByObjectID: [ObjectID: SpatialObjectMetadata] = [:]
     private var lastTemporalSequenceNumber: UInt64?
+    private struct IdentityReview: Sendable {
+        let candidate: ObjectIdentityConfirmationCandidate
+        let frame: ARFrameSnapshot
+        var pose: ARPoseSnapshot { frame.pose }
+    }
+    private var acceptedNewObjects: [ObjectID: IdentityReview] = [:]
+    private var identityReviews: [ObjectID: IdentityReview] = [:]
+    private var queuedIdentityConfirmations: [ObjectID: PersistentObjectIdentitySupport] = [:]
+    private var trackingSamples: [VisionTrackID: [ContinuousObjectTrackingSample]] = [:]
     private var lastCalendarSample: (wall: TimeInterval, monotonic: TimeInterval)?
 
     public convenience init(
@@ -339,6 +366,23 @@ public final class SpatialPerceptionController: ObservableObject {
             activeFrameToken = frame.pose.sessionToken
         }
         lastCalendarSample = (frame.pose.capturedAt, frame.pose.timestamp)
+        identityReviews = identityReviews.filter {
+            $0.value.pose.sessionToken == frame.pose.sessionToken
+                && $0.value.pose.mapID == identity.mapID
+                && $0.value.pose.coordinateFrameID == identity.coordinateFrameID
+                && frame.pose.timestamp - $0.value.pose.timestamp <= 2
+        }
+        queuedIdentityConfirmations = queuedIdentityConfirmations.filter { _, support in
+            if case .userConfirmation(
+                _, _, let mapID, let coordinateFrameID, let segmentID, _, _, let reviewedAt, _) = support
+            {
+                return mapID == identity.mapID && coordinateFrameID == identity.coordinateFrameID
+                    && segmentID == identity.segmentID && frame.pose.capturedAt - reviewedAt <= 2
+            }
+            return false
+        }
+        acceptedNewObjects = acceptedNewObjects.filter { identityReviews[$0.key] != nil }
+        refreshIdentityReviewList()
         state = identity.mapID == nil ? .waitingForMap : .scanning
 
         if let lastResourceAcceptedTimestamp,
@@ -773,9 +817,12 @@ public final class SpatialPerceptionController: ObservableObject {
                     }
                     metrics.promotedObjects &+= 1
                 }
+                identityReviews.removeValue(forKey: value.promotedObjectID)
+                acceptedNewObjects.removeValue(forKey: value.promotedObjectID)
                 latestTemporalMetadataByObjectID[value.observation.metadata.object.id] =
                     value.observation.metadata
             }
+            refreshIdentityReviewList()
             removeTerminalCoverageObjects(from: result)
         } catch is CancellationError {
             return
@@ -825,6 +872,29 @@ public final class SpatialPerceptionController: ObservableObject {
         case .unavailable:
             metrics.depthFailures &+= 1
             return nil
+        }
+
+        let sample = ContinuousObjectTrackingSample(
+            frameID: FrameID(rawValue: frame.pose.id.rawValue),
+            position: located.position, captureSegmentID: identity.segmentID,
+            monotonicTimestamp: frame.pose.timestamp,
+            trackerConfidence: perceptionObservation.trackerConfidence,
+            associationMargin: perceptionObservation.associationMargin, bounds: located.bounds,
+            geometryConfidence: located.geometryConfidence)
+        if perceptionObservation.trackerConfidence.map({ $0.value >= 0.8 }) != true
+            || perceptionObservation.associationMargin < 0.15
+        {
+            trackingSamples[perceptionObservation.trackID] = [sample]
+        } else {
+            var samples = trackingSamples[perceptionObservation.trackID] ?? []
+            if let previous = samples.last,
+                (frame.pose.timestamp - previous.monotonicTimestamp > 0.6
+                    || previous.captureSegmentID != identity.segmentID)
+            {
+                samples.removeAll()
+            }
+            samples.append(sample)
+            trackingSamples[perceptionObservation.trackID] = Array(samples.suffix(32))
         }
 
         let promotionObservation = try ObjectPromotionObservation(
@@ -912,8 +982,58 @@ public final class SpatialPerceptionController: ObservableObject {
         let decision: PersistentObjectReidentificationDecision
         let metadata: SpatialObjectMetadata
         let referenceMetadata: SpatialObjectMetadata
-        if context.candidates.isEmpty {
+        var identitySupport: PersistentObjectIdentitySupport?
+        let establishedExisting = established.flatMap { established in
+            existingObjects.first { $0.object.id == established.referenceMetadata.object.id }
+        }
+        let continuousIncoming: SpatialObjectMetadata
+        if let existing = establishedExisting, existing.object.detectorSemanticLabel != nil {
+            continuousIncoming = try metadataReusingPersistentIdentity(
+                currentPromotedMetadata, existing: existing)
+        } else {
+            continuousIncoming = currentPromotedMetadata
+        }
+        let continuousSupport = establishedExisting.map {
+            PersistentObjectIdentitySupport.continuousTracking(
+                objectID: $0.object.id,
+                samples: trackingSamples[perceptionObservation.trackID] ?? [])
+        }
+        if let review = acceptedNewObjects[promotedMetadata.object.id], established == nil,
+            review.pose.sessionToken == frame.pose.sessionToken,
+            frame.pose.timestamp - review.pose.timestamp <= 2,
+            review.candidate.observedMetadata.position.value.distance(
+                to: currentPromotedMetadata.position.value) <= 0.12
+        {
+            decision = .genuinelyNew
+            metadata = currentPromotedMetadata
+            referenceMetadata = currentPromotedMetadata
+        } else if let support = queuedIdentityConfirmations[promotedMetadata.object.id],
+            let existing = existingObjects.first(where: { $0.object.id == support.objectID }),
+            let supportedDecision = try reidentificationResolver.resolveSupportedIdentity(
+                incoming: metadataReusingPersistentIdentity(currentPromotedMetadata, existing: existing),
+                promotionEvidence: promotionEvidence, support: support, against: existing)
+        {
+            decision = supportedDecision
+            identitySupport = support
+            metadata = try metadataReusingPersistentIdentity(currentPromotedMetadata, existing: existing)
+            referenceMetadata = existing
+        } else if let existing = establishedExisting, let support = continuousSupport,
+            let supportedDecision = try reidentificationResolver.resolveSupportedIdentity(
+                incoming: continuousIncoming, promotionEvidence: promotionEvidence,
+                support: support, against: existing)
+        {
+            decision = supportedDecision
+            identitySupport = support
+            metadata = try metadataReusingPersistentIdentity(currentPromotedMetadata, existing: existing)
+            referenceMetadata = existing
+        } else if context.candidates.isEmpty {
             guard established == nil else {
+                return nil
+            }
+            if publishIdentityReview(
+                for: currentPromotedMetadata, frame: frame,
+                existingObjects: existingObjects)
+            {
                 return nil
             }
             decision = .genuinelyNew
@@ -956,9 +1076,20 @@ public final class SpatialPerceptionController: ObservableObject {
                     metrics.ambiguousReidentifications &+= 1
                     return nil
                 }
+                if publishIdentityReview(
+                    for: currentPromotedMetadata, frame: frame,
+                    existingObjects: existingObjects)
+                {
+                    return nil
+                }
                 metadata = currentPromotedMetadata
                 referenceMetadata = currentPromotedMetadata
             case .ambiguousCandidates:
+                if established == nil {
+                    _ = publishIdentityReview(
+                        for: currentPromotedMetadata, frame: frame,
+                        existingObjects: existingObjects)
+                }
                 metrics.ambiguousReidentifications &+= 1
                 return nil
             }
@@ -972,11 +1103,118 @@ public final class SpatialPerceptionController: ObservableObject {
             observation: try TemporalSpatialObservation(
                 metadata: metadata,
                 promotionEvidence: promotionEvidence,
-                identityDecision: decision
+                identityDecision: decision,
+                identitySupport: identitySupport
             ),
             identityResolution: resolution,
             establishesIdentity: established == nil
         )
+    }
+
+    /// Records explicit user authority for the next stable observation. Returning
+    /// means the confirmation was queued; the normal temporal batch performs
+    /// the durable write and rechecks both identities and the reviewed position.
+    public func confirmObservedObjectIdentity(
+        candidateID: UUID, existingObjectID: ObjectID,
+        expectedTemporalRevision: UInt64?
+    ) async throws {
+        guard isActive, temporalMemoryProcessor != nil else {
+            throw ObjectIdentityConfirmationError.unavailable
+        }
+        guard let review = identityReviews.values.first(where: { $0.candidate.id == candidateID }),
+            review.pose.sessionToken == activeFrameToken,
+            ProcessInfo.processInfo.systemUptime - review.pose.timestamp <= 2,
+            confirmedIdentityProvider(review.frame)?.mapID == review.pose.mapID,
+            confirmedIdentityProvider(review.frame)?.coordinateFrameID == review.pose.coordinateFrameID,
+            confirmedIdentityProvider(review.frame)?.segmentID == review.pose.segmentID
+        else {
+            throw ObjectIdentityConfirmationError.staleCandidate
+        }
+        guard
+            let reviewedExisting = review.candidate.existingCandidates.first(where: {
+                $0.object.id == existingObjectID
+            }),
+            reviewedExisting.object.temporalRevision == expectedTemporalRevision
+        else {
+            throw ObjectIdentityConfirmationError.staleExistingObject
+        }
+        let generation = lifecycleGeneration
+        let current = try await metadataProvider()
+        guard generation == lifecycleGeneration, isActive,
+            identityReviews[review.candidate.observedObjectID]?.candidate.id == candidateID
+        else {
+            throw ObjectIdentityConfirmationError.staleCandidate
+        }
+        guard current.first(where: { $0.object.id == existingObjectID }) == reviewedExisting else {
+            throw ObjectIdentityConfirmationError.staleExistingObject
+        }
+        queuedIdentityConfirmations[review.candidate.observedObjectID] = .userConfirmation(
+            objectID: existingObjectID, expectedTemporalRevision: expectedTemporalRevision,
+            mapID: reviewedExisting.mapID, coordinateFrameID: reviewedExisting.position.coordinateFrameID,
+            captureSegmentID: review.pose.segmentID, reviewedFrameID: review.candidate.frameID,
+            reviewedPosition: review.candidate.observedMetadata.position.value,
+            reviewedAt: review.pose.capturedAt,
+            confirmedAt: max(review.pose.capturedAt, Date().timeIntervalSince1970))
+    }
+
+    /// The user can also establish that a same-class detection is a distinct
+    /// physical object. This never merges or edits any existing record.
+    public func acceptObservedObjectAsNew(candidateID: UUID) async throws {
+        guard isActive, let review = identityReviews.values.first(where: { $0.candidate.id == candidateID }),
+            review.pose.sessionToken == activeFrameToken,
+            ProcessInfo.processInfo.systemUptime - review.pose.timestamp <= 2,
+            confirmedIdentityProvider(review.frame)?.mapID == review.pose.mapID,
+            confirmedIdentityProvider(review.frame)?.coordinateFrameID == review.pose.coordinateFrameID,
+            confirmedIdentityProvider(review.frame)?.segmentID == review.pose.segmentID
+        else {
+            throw ObjectIdentityConfirmationError.staleCandidate
+        }
+        acceptedNewObjects[review.candidate.observedObjectID] = review
+    }
+
+    private func publishIdentityReview(
+        for metadata: SpatialObjectMetadata, frame: ARFrameSnapshot,
+        existingObjects: [SpatialObjectMetadata]
+    ) -> Bool {
+        let candidates = existingObjects.filter {
+            $0.object.id != metadata.object.id && $0.mapID == metadata.mapID
+                && $0.position.coordinateFrameID == metadata.position.coordinateFrameID
+                && ($0.object.semanticLabel == metadata.object.semanticLabel
+                    || $0.object.detectorSemanticLabel == metadata.object.semanticLabel)
+                && $0.object.certainty == .confirmed && $0.object.presence != .removed
+        }.sorted { $0.object.id < $1.object.id }
+        guard !candidates.isEmpty else { return false }
+        identityReviews = identityReviews.filter {
+            $0.value.pose.sessionToken == frame.pose.sessionToken
+                && frame.pose.timestamp - $0.value.pose.timestamp <= 2
+        }
+        // Keep exactly the snapshot the user is reviewing while its physical
+        // hypothesis and existing records remain unchanged within the expiry.
+        if let current = identityReviews[metadata.object.id],
+            current.pose.sessionToken == frame.pose.sessionToken,
+            current.candidate.existingCandidates.map(\.object.id)
+                == Array(candidates.prefix(32)).map(\.object.id),
+            current.candidate.observedMetadata.position.value.distance(to: metadata.position.value) <= 0.12
+        {
+            refreshIdentityReviewList()
+            return true
+        }
+        // Bounded UI hypotheses; no provisional identity is written to disk.
+        if identityReviews.count >= 32 && identityReviews[metadata.object.id] == nil { return true }
+        identityReviews[metadata.object.id] = IdentityReview(
+            candidate: ObjectIdentityConfirmationCandidate(
+                id: UUID(), observedObjectID: metadata.object.id, observedMetadata: metadata,
+                existingCandidates: Array(candidates.prefix(32)),
+                frameID: FrameID(rawValue: frame.pose.id.rawValue), capturedAt: frame.pose.capturedAt,
+                sessionToken: frame.pose.sessionToken), frame: frame)
+        refreshIdentityReviewList()
+        return true
+    }
+
+    private func refreshIdentityReviewList() {
+        identityConfirmationCandidates = identityReviews.values.map(\.candidate).sorted {
+            $0.observedObjectID < $1.observedObjectID
+        }
     }
 
     private func refreshedPromotedMetadata(
@@ -1070,7 +1308,15 @@ public final class SpatialPerceptionController: ObservableObject {
                 throw CancellationError()
             }
 
-            let observations = associateDetectionsWithTracks(detections)
+            let predictions: [TrackedObject]
+            if activeTracks.isEmpty {
+                predictions = []
+            } else {
+                predictions = try await tracker.track(in: frame)
+            }
+            try Task.checkCancellation()
+            guard generation == lifecycleGeneration else { throw CancellationError() }
+            let observations = associateDetectionsWithTracks(detections, predictions: predictions)
             await tracker.seed(
                 observations.map {
                     TrackingSeed(id: $0.trackID, boundingBox: $0.detection.boundingBox)
@@ -1094,6 +1340,13 @@ public final class SpatialPerceptionController: ObservableObject {
                     )
                 }
             )
+            trackingSamples = trackingSamples.filter { activeTracks[$0.key] != nil }
+            if observations.isEmpty {
+                identityReviews.removeAll()
+                acceptedNewObjects.removeAll()
+                queuedIdentityConfirmations.removeAll()
+                refreshIdentityReviewList()
+            }
             lastDetectorTimestamp = frame.pose.timestamp
             return PerceptionFrameObservations(
                 observations: observations,
@@ -1135,10 +1388,22 @@ public final class SpatialPerceptionController: ObservableObject {
                     confidence: min(1, combinedConfidence),
                     boundingBox: trackedObject.boundingBox
                 ),
-                trackID: updated.id
+                trackID: updated.id,
+                trackerConfidence: ConfidenceScore(clamping: Double(trackedObject.confidence)),
+                associationMargin: 1
+                    - (tracked.filter { $0.id != trackedObject.id }.map {
+                        $0.boundingBox.intersectionOverUnion(with: trackedObject.boundingBox)
+                    }.max() ?? 0)
             )
         }
         activeTracks = nextTracks
+        trackingSamples = trackingSamples.filter { nextTracks[$0.key] != nil }
+        if observations.isEmpty {
+            identityReviews.removeAll()
+            acceptedNewObjects.removeAll()
+            queuedIdentityConfirmations.removeAll()
+            refreshIdentityReviewList()
+        }
         return PerceptionFrameObservations(
             observations: observations.sorted { left, right in
                 left.trackID.rawValue.uuidString < right.trackID.rawValue.uuidString
@@ -1148,13 +1413,16 @@ public final class SpatialPerceptionController: ObservableObject {
     }
 
     private func associateDetectionsWithTracks(
-        _ detections: [DetectedObject]
+        _ detections: [DetectedObject], predictions: [TrackedObject]
     ) -> [PerceptionObservation] {
+        let predictionsByID = Dictionary(
+            predictions.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var availableTracks = activeTracks
         var observations: [PerceptionObservation] = []
         observations.reserveCapacity(detections.count)
 
-        for detection in detections where detection.boundingBox.isValidNonEmpty {
+        for (detectionIndex, detection) in detections.enumerated() where detection.boundingBox.isValidNonEmpty
+        {
             let normalizedLabel = detection.label
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
@@ -1163,10 +1431,9 @@ public final class SpatialPerceptionController: ObservableObject {
                 guard track.label.lowercased() == normalizedLabel else {
                     return nil
                 }
-                let iou = track.boundingBox.intersectionOverUnion(
-                    with: detection.boundingBox
-                )
-                let centerDistance = track.boundingBox.centerDistance(
+                let predictedBox = predictionsByID[track.id]?.boundingBox ?? track.boundingBox
+                let iou = predictedBox.intersectionOverUnion(with: detection.boundingBox)
+                let centerDistance = predictedBox.centerDistance(
                     to: detection.boundingBox
                 )
                 guard iou >= 0.20 || centerDistance <= 0.12 else {
@@ -1183,9 +1450,25 @@ public final class SpatialPerceptionController: ObservableObject {
             }
             let trackID = candidates.first?.track.id ?? VisionTrackID()
             availableTracks.removeValue(forKey: trackID)
+            let prediction = predictionsByID[trackID]
+            let overlap = prediction?.boundingBox.intersectionOverUnion(with: detection.boundingBox) ?? 0
+            let otherDetectionOverlap =
+                prediction.map { prediction in
+                    detections.enumerated().filter { $0.offset != detectionIndex }.map {
+                        prediction.boundingBox.intersectionOverUnion(with: $0.element.boundingBox)
+                    }.max() ?? 0
+                } ?? 0
+            let otherTrackOverlap =
+                predictions.filter { $0.id != trackID }.map {
+                    $0.boundingBox.intersectionOverUnion(with: detection.boundingBox)
+                }.max() ?? 0
+            let margin = overlap - max(otherDetectionOverlap, otherTrackOverlap)
             observations.append(
-                PerceptionObservation(detection: detection, trackID: trackID)
-            )
+                PerceptionObservation(
+                    detection: detection, trackID: trackID,
+                    trackerConfidence: overlap >= 0.60 && margin >= 0.15
+                        ? prediction.map { ConfidenceScore(clamping: Double($0.confidence)) } : nil,
+                    associationMargin: margin))
         }
         return observations
     }
@@ -1195,7 +1478,7 @@ public final class SpatialPerceptionController: ObservableObject {
     /// restart or foreground transition cannot erase coverage knowledge. The
     /// current-session cache supplements the durable snapshot only for a commit
     /// that has just completed. A candidate must still project into the
-    /// conservative interior of the current camera image and have no same-class
+    /// conservative interior of the current camera image and have no overlapping
     /// image detection in this pass. Reliable raw depth must also prove that
     /// the stored position is unobstructed in this exact frame. Tracker-only
     /// cadence frames never enter this set.
@@ -1216,120 +1499,107 @@ public final class SpatialPerceptionController: ObservableObject {
             // value left in the in-memory coverage cache.
             candidateMetadataByObjectID[metadata.object.id] = metadata
         }
-        let detectedLabels = Set(
-            detections.map {
-                $0.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            }
-        )
         return Set(
             candidateMetadataByObjectID.values.compactMap { metadata in
-                let semanticKey = metadata.object.semanticLabel
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .lowercased()
-                guard !detectedLabels.contains(semanticKey),
-                    projectsIntoReliableDetectorRegion(metadata, in: frame)
-                else {
-                    return nil
-                }
-                return metadata.object.id
-            }
-        )
+                projectsIntoReliableDetectorRegion(metadata, in: frame, detections: detections)
+                    ? metadata.object.id : nil
+            })
     }
 
+    /// Each object's projected volume is evaluated independently. Detections
+    /// elsewhere in the image do not hide empty-space evidence for this ID.
     private func projectsIntoReliableDetectorRegion(
-        _ metadata: SpatialObjectMetadata,
-        in frame: ARFrameSnapshot
+        _ metadata: SpatialObjectMetadata, in frame: ARFrameSnapshot,
+        detections: [DetectedObject]
     ) -> Bool {
         guard metadata.object.certainty == .confirmed,
             metadata.object.presence != .removed,
             metadata.mapID == frame.pose.mapID,
             metadata.position.coordinateFrameID == frame.pose.coordinateFrameID,
-            frame.cameraImageDimensions.width > 0,
-            frame.cameraImageDimensions.height > 0
-        else {
-            return false
-        }
-
-        let cameraTransform = frame.pose.cameraTransform.simdValue
-        let transformValues = [
-            cameraTransform.columns.0.x, cameraTransform.columns.0.y,
-            cameraTransform.columns.0.z, cameraTransform.columns.0.w,
-            cameraTransform.columns.1.x, cameraTransform.columns.1.y,
-            cameraTransform.columns.1.z, cameraTransform.columns.1.w,
-            cameraTransform.columns.2.x, cameraTransform.columns.2.y,
-            cameraTransform.columns.2.z, cameraTransform.columns.2.w,
-            cameraTransform.columns.3.x, cameraTransform.columns.3.y,
-            cameraTransform.columns.3.z, cameraTransform.columns.3.w,
-        ]
-        guard transformValues.allSatisfy(\.isFinite) else {
-            return false
-        }
-        let worldToCamera = simd_inverse(cameraTransform)
-        let cameraPoint =
-            worldToCamera
-            * SIMD4<Float>(
-                Float(metadata.position.value.x),
-                Float(metadata.position.value.y),
-                Float(metadata.position.value.z),
-                1
-            )
-        guard cameraPoint.x.isFinite, cameraPoint.y.isFinite,
-            cameraPoint.z.isFinite, cameraPoint.w.isFinite,
-            abs(cameraPoint.w) > Float.ulpOfOne
-        else {
-            return false
-        }
-
-        let x = cameraPoint.x / cameraPoint.w
-        let y = cameraPoint.y / cameraPoint.w
-        let depth = -(cameraPoint.z / cameraPoint.w)
-        guard depth.isFinite, depth >= 0.20, depth <= 8 else {
-            return false
-        }
+            frame.cameraImageDimensions.width > 0, frame.cameraImageDimensions.height > 0
+        else { return false }
+        let transform = frame.pose.cameraTransform.simdValue
+        let worldToCamera = simd_inverse(transform)
         let intrinsics = frame.cameraIntrinsics.simdValue
-        let fx = intrinsics.columns.0.x
-        let fy = intrinsics.columns.1.y
-        let cx = intrinsics.columns.2.x
-        let cy = intrinsics.columns.2.y
-        guard fx.isFinite, fy.isFinite, cx.isFinite, cy.isFinite,
-            fx > 0, fy > 0
-        else {
-            return false
+        let fx = intrinsics.columns.0.x, fy = intrinsics.columns.1.y
+        let cx = intrinsics.columns.2.x, cy = intrinsics.columns.2.y
+        guard fx.isFinite, fy.isFinite, cx.isFinite, cy.isFinite, fx > 0, fy > 0
+        else { return false }
+        func project(_ point: Vec3) -> SIMD3<Float>? {
+            let value = worldToCamera * SIMD4<Float>(Float(point.x), Float(point.y), Float(point.z), 1)
+            guard value.x.isFinite, value.y.isFinite, value.z.isFinite, value.w.isFinite,
+                abs(value.w) > Float.ulpOfOne
+            else { return nil }
+            let depth = -value.z / value.w
+            guard depth >= 0.20, depth <= 8 else { return nil }
+            let x = (fx * (value.x / value.w / depth) + cx) / Float(frame.cameraImageDimensions.width)
+            let y = (cy - fy * (value.y / value.w / depth)) / Float(frame.cameraImageDimensions.height)
+            guard x.isFinite, y.isFinite, x >= 0.05, x <= 0.95, y >= 0.05, y <= 0.95
+            else { return nil }
+            return SIMD3<Float>(x, y, depth)
         }
-        let pixelX = fx * (x / depth) + cx
-        let pixelY = cy - fy * (y / depth)
-        let normalizedX = Double(pixelX) / Double(frame.cameraImageDimensions.width)
-        let normalizedY = Double(pixelY) / Double(frame.cameraImageDimensions.height)
-        let reliableMargin = 0.05
-        guard
-            normalizedX.isFinite && normalizedY.isFinite
-                && normalizedX >= reliableMargin
-                && normalizedX <= 1 - reliableMargin
-                && normalizedY >= reliableMargin
-                && normalizedY <= 1 - reliableMargin
-        else {
-            return false
+        // A point-only legacy record has no measured footprint: a background
+        // ray through a chair's opening cannot establish that it was removed.
+        guard let bounds = metadata.object.bounds else { return false }
+        var points = [metadata.position.value]
+        do {
+            for x in [bounds.min.x, bounds.max.x] {
+                for y in [bounds.min.y, bounds.max.y] {
+                    for z in [bounds.min.z, bounds.max.z] {
+                        guard let corner = try? Vec3(x: x, y: y, z: z) else { return false }
+                        points.append(corner)
+                    }
+                }
+            }
         }
-
-        // A neighborhood median can select background beside a foreground
-        // occluder, and smoothed depth can retain a surface from an older
-        // frame. Neither proves visibility along this exact current ray.
+        let projected = points.compactMap(project)
+        guard projected.count == points.count, let center = projected.first else { return false }
+        let minX = projected.map(\.x).min()!, maxX = projected.map(\.x).max()!
+        let minY = projected.map(\.y).min()!, maxY = projected.map(\.y).max()!
+        // Match in raw camera-image coordinates, including rotated Vision input.
+        // Any label overlapping this footprint may be the object or an occluder.
+        for detection in detections where detection.boundingBox.isValidNonEmpty {
+            let corners = [
+                SIMD2<Double>(0, 0), SIMD2<Double>(1, 0),
+                SIMD2<Double>(0, 1), SIMD2<Double>(1, 1),
+            ].compactMap {
+                detection.boundingBox.cameraImageTopLeftPoint(
+                    relativeToTopLeft: $0,
+                    for: frame.imageOrientation)
+            }
+            guard corners.count == 4 else { return false }
+            if corners.map(\.x).max()! >= minX - 0.015,
+                corners.map(\.x).min()! <= maxX + 0.015,
+                corners.map(\.y).max()! >= minY - 0.015,
+                corners.map(\.y).min()! <= maxY + 0.015
+            {
+                return false
+            }
+        }
+        let samplePoints = [
+            SIMD2<Float>(center.x, center.y),
+            SIMD2<Float>(minX + (maxX - minX) * 0.25, minY + (maxY - minY) * 0.25),
+            SIMD2<Float>(minX + (maxX - minX) * 0.75, minY + (maxY - minY) * 0.25),
+            SIMD2<Float>(minX + (maxX - minX) * 0.25, minY + (maxY - minY) * 0.75),
+            SIMD2<Float>(minX + (maxX - minX) * 0.75, minY + (maxY - minY) * 0.75),
+        ]
+        let farthestStoredDepth = projected.map(\.z).max()!
         let sampler = ARDepthSampler(minimumConfidence: .high, neighborhoodRadius: 0)
-        guard
-            case .sample(let sample) = sampler.sample(
-                normalizedImagePoint: SIMD2<Float>(Float(normalizedX), Float(normalizedY)),
-                in: frame,
-                prefersSmoothedDepth: false
-            ), sample.source == .raw,
-            sample.frameID == frame.pose.id,
-            sample.coordinateFrameID == metadata.position.coordinateFrameID,
-            sample.confidence == .high
-        else {
-            return false
+        var sampledPixels = Set<SIMD2<Int>>()
+        for point in samplePoints {
+            guard
+                case .sample(let sample) = sampler.sample(
+                    normalizedImagePoint: point,
+                    in: frame, prefersSmoothedDepth: false), sample.source == .raw,
+                sample.frameID == frame.pose.id,
+                sample.coordinateFrameID == metadata.position.coordinateFrameID,
+                sample.confidence == .high,
+                sample.depthMeters > farthestStoredDepth + 0.10
+            else { return false }
+            sampledPixels.insert(sample.depthPixel)
         }
-        // Depth at the stored surface can still be the undetected object.
-        // Admit a miss only when the measured surface is clearly beyond it.
-        return sample.depthMeters > depth + 0.10
+        // Several requests landing on one depth texel are one piece of evidence.
+        return sampledPixels.count >= 3
     }
 
     private func finishProcessing(
@@ -1384,6 +1654,11 @@ public final class SpatialPerceptionController: ObservableObject {
         nextSequenceNumber = 0
         activeFrameToken = nil
         activeTracks.removeAll(keepingCapacity: false)
+        trackingSamples.removeAll()
+        identityReviews.removeAll()
+        acceptedNewObjects.removeAll()
+        queuedIdentityConfirmations.removeAll()
+        identityConfirmationCandidates = []
         lastDetectorTimestamp = nil
         lastResourceAcceptedTimestamp = nil
         lastCalendarSample = nil
@@ -1402,6 +1677,8 @@ public final class SpatialPerceptionController: ObservableObject {
     private struct PerceptionObservation: Sendable {
         let detection: DetectedObject
         let trackID: VisionTrackID
+        var trackerConfidence: ConfidenceScore? = nil
+        var associationMargin: Double = 0
     }
 
     private struct PerceptionFrameObservations: Sendable {
@@ -1446,7 +1723,8 @@ public final class SpatialPerceptionController: ObservableObject {
     ) throws -> SpatialObjectMetadata {
         let object = try SpatialObject(
             id: existing.object.id,
-            semanticLabel: incoming.object.semanticLabel,
+            semanticLabel: existing.object.detectorSemanticLabel == nil
+                ? incoming.object.semanticLabel : existing.object.semanticLabel,
             nodeID: existing.object.nodeID,
             position: incoming.object.position,
             bounds: incoming.object.bounds ?? existing.object.bounds,
@@ -1455,7 +1733,10 @@ public final class SpatialPerceptionController: ObservableObject {
             confidence: incoming.object.confidence,
             firstSeenAt: min(existing.object.firstSeenAt, incoming.object.firstSeenAt),
             lastSeenAt: incoming.object.lastSeenAt,
-            stateUpdatedAt: incoming.object.lastSeenAt
+            stateUpdatedAt: incoming.object.lastSeenAt,
+            displayName: existing.object.displayName,
+            temporalRevision: existing.object.temporalRevision,
+            detectorSemanticLabel: existing.object.detectorSemanticLabel
         )
         return try SpatialObjectMetadata(
             mapID: incoming.mapID,

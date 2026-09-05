@@ -1090,6 +1090,70 @@ final class TemporalSpatialMemoryTests: XCTestCase {
         XCTAssertEqual(coordinator.snapshot, before)
     }
 
+    func testExplicitClassificationCorrectionPreservesIdentityNameLocationAndHistory() throws {
+        let id = objectID(81_901)
+        var coordinator = makeCoordinator()
+        _ = try coordinator.apply(
+            update(
+                revision: 0, sequence: 1, at: 100,
+                observations: [newObservation(id: id, at: 100)]))
+        let before = try XCTUnwrap(coordinator.snapshot.metadata(for: id))
+        let correction = try ObjectClassificationCorrection(
+            objectID: id,
+            expectedSemanticLabel: before.object.semanticLabel, expectedTemporalRevision: nil,
+            semanticLabel: "table", displayName: "내 책상")
+        let value = try TemporalSpatialUpdate(
+            baseRevision: 1, sequence: 2, timestamp: 101,
+            mapID: map, coordinateFrameID: frame, observations: [], expectedVisibleObjectIDs: [],
+            classificationCorrections: [correction])
+        let delta = try applied(coordinator.apply(value))
+        let corrected = try XCTUnwrap(coordinator.snapshot.metadata(for: id))
+        XCTAssertEqual(corrected.object.id, before.object.id)
+        XCTAssertEqual(corrected.object.semanticLabel, "table")
+        XCTAssertEqual(corrected.object.displayName, "내 책상")
+        XCTAssertEqual(corrected.position, before.position)
+        XCTAssertEqual(corrected.object.firstSeenAt, before.object.firstSeenAt)
+        XCTAssertEqual(corrected.object.lastSeenAt, before.object.lastSeenAt)
+        XCTAssertTrue(delta.changes.contains(.reclassified(objectID: id, from: "의자", to: "table", at: 101)))
+        XCTAssertTrue(
+            coordinator.snapshot.recentDeltas.first?.changes.contains(.added(object: before, at: 100)) == true
+        )
+        let restored = try TemporalSpatialMemoryCoordinator(
+            restoring: JSONDecoder().decode(
+                TemporalSpatialMemorySnapshot.self, from: JSONEncoder().encode(coordinator.snapshot)),
+            policy: testPolicy())
+        XCTAssertEqual(restored.snapshot.metadata(for: id), corrected)
+    }
+
+    func testStaleClassificationCorrectionAndDetectorLabelFluctuationAreAtomic() throws {
+        let id = objectID(81_902)
+        var coordinator = makeCoordinator()
+        _ = try coordinator.apply(
+            update(
+                revision: 0, sequence: 1, at: 100,
+                observations: [newObservation(id: id, at: 100)]))
+        let before = coordinator.snapshot
+        let stale = try ObjectClassificationCorrection(
+            objectID: id, expectedSemanticLabel: "table",
+            expectedTemporalRevision: nil, semanticLabel: "cup", displayName: nil)
+        XCTAssertThrowsError(
+            try coordinator.apply(
+                TemporalSpatialUpdate(
+                    baseRevision: 1, sequence: 2,
+                    timestamp: 101, mapID: map, coordinateFrameID: frame, observations: [],
+                    expectedVisibleObjectIDs: [], classificationCorrections: [stale])))
+        XCTAssertEqual(coordinator.snapshot, before)
+        let old = existingObservation(id: id, at: 101)
+        var object = old.metadata.object
+        object.semanticLabel = "table"
+        XCTAssertThrowsError(
+            try TemporalSpatialObservation(
+                metadata: SpatialObjectMetadata(
+                    mapID: map, object: object, position: old.metadata.position),
+                promotionEvidence: old.promotionEvidence, identityDecision: old.identityDecision))
+        XCTAssertEqual(coordinator.snapshot, before)
+    }
+
     private func makeCoordinator() -> TemporalSpatialMemoryCoordinator {
         TemporalSpatialMemoryCoordinator(
             mapID: map,

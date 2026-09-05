@@ -716,7 +716,13 @@ public struct ObjectObservationPromoter: Codable, Sendable {
             return nil
         }
 
-        let representativePosition = meanPosition(of: candidate.observations)
+        // Once promoted, this remains only a transient association window.
+        // Follow its latest observation so sustained motion does not split it
+        // merely by moving away from a rolling mean. Durable identity reuse
+        // still requires the separate persistent resolver and memory evidence.
+        let representativePosition = candidate.promotedMetadata == nil
+            ? meanPosition(of: candidate.observations)
+            : candidate.observations.last!.position.value
         let distance3D = euclideanDistance(
             representativePosition,
             observation.position.value

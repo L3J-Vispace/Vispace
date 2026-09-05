@@ -23,6 +23,9 @@ public struct SpatialObject: Codable, Hashable, Sendable {
     public static let maximumDisplayNameLength = 64
     public let id: ObjectID
     public var semanticLabel: String
+    /// Original detector class retained after an explicit user correction.
+    /// It is an observation alias, never independent physical identity proof.
+    public var detectorSemanticLabel: String?
     public var nodeID: SpatialNodeID?
     public var position: Vec3
     public var bounds: AABB?
@@ -52,7 +55,8 @@ public struct SpatialObject: Codable, Hashable, Sendable {
         lastSeenAt: TimeInterval,
         stateUpdatedAt: TimeInterval? = nil,
         displayName: String? = nil,
-        temporalRevision: UInt64? = nil
+        temporalRevision: UInt64? = nil,
+        detectorSemanticLabel: String? = nil
     ) throws {
         let normalizedLabel = semanticLabel.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedStateUpdatedAt = stateUpdatedAt ?? lastSeenAt
@@ -72,6 +76,11 @@ public struct SpatialObject: Codable, Hashable, Sendable {
 
         self.id = id
         self.semanticLabel = normalizedLabel
+        let detectorLabel = detectorSemanticLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard detectorLabel.map({ !$0.isEmpty && $0.count <= 64 }) ?? true else {
+            throw SpatialObjectError.emptySemanticLabel
+        }
+        self.detectorSemanticLabel = detectorLabel
         self.nodeID = nodeID
         self.position = position
         self.bounds = bounds
@@ -99,6 +108,7 @@ public struct SpatialObject: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case id
         case semanticLabel
+        case detectorSemanticLabel
         case nodeID
         case position
         case bounds
@@ -128,7 +138,8 @@ public struct SpatialObject: Codable, Hashable, Sendable {
                 lastSeenAt: container.decode(TimeInterval.self, forKey: .lastSeenAt),
                 stateUpdatedAt: container.decode(TimeInterval.self, forKey: .stateUpdatedAt),
                 displayName: container.decodeIfPresent(String.self, forKey: .displayName),
-                temporalRevision: container.decodeIfPresent(UInt64.self, forKey: .temporalRevision)
+                temporalRevision: container.decodeIfPresent(UInt64.self, forKey: .temporalRevision),
+                detectorSemanticLabel: container.decodeIfPresent(String.self, forKey: .detectorSemanticLabel)
             )
         } catch let error as DecodingError {
             throw error
@@ -145,6 +156,7 @@ public struct SpatialObject: Codable, Hashable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(id, forKey: .id)
         try container.encode(semanticLabel, forKey: .semanticLabel)
+        try container.encodeIfPresent(detectorSemanticLabel, forKey: .detectorSemanticLabel)
         try container.encodeIfPresent(nodeID, forKey: .nodeID)
         try container.encode(position, forKey: .position)
         try container.encodeIfPresent(bounds, forKey: .bounds)

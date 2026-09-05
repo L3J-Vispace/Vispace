@@ -176,6 +176,37 @@ final class VispaceServices: ObservableObject {
             },
             renameProvider: { expected, displayName in
                 try await repository.renameObject(expected: expected, displayName: displayName)
+            },
+            classificationCorrectionProvider: { expected, label in
+                guard let frame = await sessionController.latestDepthFrame,
+                    frame.pose.mapID == expected.mapID,
+                    frame.pose.coordinateFrameID == expected.position.coordinateFrameID
+                else {
+                    throw SpatialSceneGraphServiceError.mapCoordinateFrameMismatch
+                }
+                guard
+                    let current = try await repository.metadataSnapshot().objects.first(where: {
+                        $0.mapID == expected.mapID && $0.object.id == expected.object.id
+                    }), current.position.coordinateFrameID == expected.position.coordinateFrameID,
+                    current.object.semanticLabel == expected.object.semanticLabel,
+                    current.object.displayName == expected.object.displayName,
+                    current.object.detectorSemanticLabel == expected.object.detectorSemanticLabel,
+                    current.object.certainty == expected.object.certainty,
+                    current.object.presence != .removed,
+                    current.object.firstSeenAt == expected.object.firstSeenAt
+                else {
+                    throw SpatialSceneGraphServiceError.outOfOrderObservation
+                }
+                _ = try await temporalMemoryService.correctClassification(
+                    objectID: current.object.id,
+                    semanticLabel: label, expectedTemporalRevision: current.object.temporalRevision,
+                    pose: frame.pose)
+                guard
+                    let corrected = try await repository.metadataSnapshot().objects.first(where: {
+                        $0.mapID == expected.mapID && $0.object.id == expected.object.id
+                    })
+                else { throw SpatialSceneGraphServiceError.missingChangedObject }
+                return corrected
             }
         )
         let relationQueryController = SpatialRelationQueryController(

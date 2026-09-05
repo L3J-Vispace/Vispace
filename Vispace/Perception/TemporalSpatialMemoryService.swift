@@ -25,17 +25,20 @@ public struct TemporalSpatialRecognitionBatch: Hashable, Sendable {
     public let sequence: UInt64
     public let observations: [TemporalSpatialObservation]
     public let expectedVisibleObjectIDs: [ObjectID]
+    public let classificationCorrections: [ObjectClassificationCorrection]
 
     public init(
         id: SpatialDeltaID = SpatialDeltaID(),
         sequence: UInt64,
         observations: [TemporalSpatialObservation],
-        expectedVisibleObjectIDs: [ObjectID]
+        expectedVisibleObjectIDs: [ObjectID],
+        classificationCorrections: [ObjectClassificationCorrection] = []
     ) {
         self.id = id
         self.sequence = sequence
         self.observations = observations
         self.expectedVisibleObjectIDs = expectedVisibleObjectIDs
+        self.classificationCorrections = classificationCorrections
     }
 }
 
@@ -197,6 +200,13 @@ public actor TemporalSpatialMemoryService {
             mapID: mapID,
             coordinateFrameID: pose.coordinateFrameID
         )
+        for observation in batch.observations where observation.identitySupport != nil {
+            guard observation.promotionEvidence.captureSegmentID == pose.segmentID,
+                observation.promotionEvidence.frameIDs.last == FrameID(rawValue: pose.id.rawValue)
+            else {
+                throw TemporalSpatialMemoryError.promotionEvidenceMismatch(observation.metadata.object.id)
+            }
+        }
         _ = try await recover(
             mapID: mapID,
             coordinateFrameID: pose.coordinateFrameID
@@ -236,7 +246,8 @@ public actor TemporalSpatialMemoryService {
             coordinateFrameID: pose.coordinateFrameID,
             observations: batch.observations,
             expectedVisibleObjectIDs: batch.expectedVisibleObjectIDs,
-            clock: clock
+            clock: clock,
+            classificationCorrections: batch.classificationCorrections
         )
         var next = current
         let application = try next.apply(update)
@@ -309,6 +320,35 @@ public actor TemporalSpatialMemoryService {
             throw TemporalSpatialMemoryServiceError.committedJournalProjectionPending
         }
         return .applied(delta)
+    }
+
+    /// Corrects classification without manufacturing an observation or changing its location.
+    @discardableResult
+    public func correctClassification(
+        objectID: ObjectID, semanticLabel: String,
+        expectedTemporalRevision: UInt64?, pose: ARPoseSnapshot
+    )
+        async throws -> TemporalSpatialMemoryServiceResult
+    {
+        try validateCaptureAuthority(pose)
+        let (mapID, _) = try validatedPoseIdentity(pose)
+        let document = try await validatedMetadataDocument(
+            mapID: mapID,
+            coordinateFrameID: pose.coordinateFrameID)
+        guard let metadata = document.objects.first(where: { $0.object.id == objectID }),
+            metadata.mapID == mapID,
+            metadata.position.coordinateFrameID == pose.coordinateFrameID,
+            metadata.object.temporalRevision == expectedTemporalRevision
+        else { throw TemporalSpatialMemoryError.staleClassificationCorrection(objectID) }
+        let correction = try ObjectClassificationCorrection(
+            objectID: objectID,
+            expectedSemanticLabel: metadata.object.semanticLabel,
+            expectedTemporalRevision: expectedTemporalRevision,
+            semanticLabel: semanticLabel, displayName: metadata.object.displayName)
+        return try await process(
+            TemporalSpatialRecognitionBatch(
+                sequence: 0, observations: [],
+                expectedVisibleObjectIDs: [], classificationCorrections: [correction]), pose: pose)
     }
 
     /// Call after ingestion has stopped and before deleting durable storage.

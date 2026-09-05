@@ -129,9 +129,12 @@ public final class SpatialObjectQueryController: ObservableObject {
             _ currentMapID: MapID?
         ) async throws -> SpatialObjectQueryRepositorySnapshot
     public typealias CurrentIdentityProvider = @MainActor @Sendable () -> ARCaptureIdentity
+    public typealias ClassificationCorrectionProvider =
+        @Sendable (SpatialObjectMetadata, String) async throws -> SpatialObjectMetadata
     public typealias RenameProvider = @Sendable (SpatialObjectMetadata, String?) async throws -> SpatialObjectMetadata
     public var onObjectRenamed: (@MainActor () -> Void)?
     public var canRenameObjects: Bool { renameProvider != nil }
+    public var canCorrectClassification: Bool { classificationCorrectionProvider != nil }
 
     @Published public private(set) var state: SpatialObjectQueryControllerState = .idle
     @Published public private(set) var latestPresentation: SpatialObjectQueryPresentation?
@@ -147,6 +150,7 @@ public final class SpatialObjectQueryController: ObservableObject {
     private let searchEngine: DeterministicSpatialObjectSearchEngine
     private let positionResolver: ValidatedCurrentFramePositionResolver
     private let renameProvider: RenameProvider?
+    private let classificationCorrectionProvider: ClassificationCorrectionProvider?
     private var latestSubmittedQuery = ""
     private var latestSubmittedFloor: SpatialNodeID?
     private var presentedIdentity: ARCaptureIdentity?
@@ -159,6 +163,7 @@ public final class SpatialObjectQueryController: ObservableObject {
         repository: SpatialObjectQueryRepository,
         currentIdentityProvider: @escaping CurrentIdentityProvider,
         renameProvider: RenameProvider? = nil,
+        classificationCorrectionProvider: ClassificationCorrectionProvider? = nil,
         searchEngine: DeterministicSpatialObjectSearchEngine =
             DeterministicSpatialObjectSearchEngine(),
         positionResolver: ValidatedCurrentFramePositionResolver =
@@ -169,6 +174,7 @@ public final class SpatialObjectQueryController: ObservableObject {
         }
         self.currentIdentityProvider = currentIdentityProvider
         self.renameProvider = renameProvider
+        self.classificationCorrectionProvider = classificationCorrectionProvider
         self.searchEngine = searchEngine
         self.positionResolver = positionResolver
     }
@@ -177,6 +183,7 @@ public final class SpatialObjectQueryController: ObservableObject {
         snapshotProvider: @escaping SnapshotProvider,
         currentIdentityProvider: @escaping CurrentIdentityProvider,
         renameProvider: RenameProvider? = nil,
+        classificationCorrectionProvider: ClassificationCorrectionProvider? = nil,
         searchEngine: DeterministicSpatialObjectSearchEngine =
             DeterministicSpatialObjectSearchEngine(),
         positionResolver: ValidatedCurrentFramePositionResolver =
@@ -185,6 +192,7 @@ public final class SpatialObjectQueryController: ObservableObject {
         self.snapshotProvider = snapshotProvider
         self.currentIdentityProvider = currentIdentityProvider
         self.renameProvider = renameProvider
+        self.classificationCorrectionProvider = classificationCorrectionProvider
         self.searchEngine = searchEngine
         self.positionResolver = positionResolver
     }
@@ -268,6 +276,91 @@ public final class SpatialObjectQueryController: ObservableObject {
             } catch {
                 guard let self, self.isCurrent(requestID: requestID, identity: identity) else { return }
                 self.publishFailure(message: "물체 이름을 저장하지 못했어요. 기록을 다시 확인한 후 시도해 주세요.")
+                self.finish(requestID: requestID)
+            }
+        }
+        queryTask = task
+        trackedQueryTasks[taskID] = task
+    }
+
+    public func correctSelectedClassification(
+        _ semanticLabel: String,
+        expected: SpatialObjectMetadata? = nil,
+        now: TimeInterval = Date().timeIntervalSince1970
+    ) {
+        guard now.isFinite, now >= 0, let classificationCorrectionProvider,
+            let presentation = latestPresentation,
+            let selected = presentation.result.selectedCandidate,
+            presentedIdentity == currentIdentityProvider()
+        else { return }
+        let original = selected.record.metadata
+        if let expected {
+            guard expected.object.id == original.object.id, expected.mapID == original.mapID,
+                expected.position.coordinateFrameID == original.position.coordinateFrameID,
+                expected.object.semanticLabel == original.object.semanticLabel,
+                expected.object.displayName == original.object.displayName,
+                expected.object.detectorSemanticLabel == original.object.detectorSemanticLabel,
+                expected.object.firstSeenAt == original.object.firstSeenAt
+            else {
+                publishFailure(message: "선택한 물체가 달라졌어요. 종류를 바꿀 물체를 다시 확인해 주세요.")
+                return
+            }
+        }
+        let correction: ObjectClassificationCorrection
+        do {
+            correction = try ObjectClassificationCorrection(
+                objectID: original.object.id,
+                expectedSemanticLabel: original.object.semanticLabel,
+                expectedTemporalRevision: original.object.temporalRevision,
+                semanticLabel: semanticLabel, displayName: original.object.displayName)
+        } catch {
+            publishFailure(message: "물체 종류는 줄바꿈 없이 64자 이내로 입력해 주세요.")
+            return
+        }
+        cancelCurrentQuery(resetToIdle: false)
+        latestRequestID &+= 1
+        let requestID = latestRequestID, identity = currentIdentityProvider()
+        let floor = latestSubmittedFloor
+        latestGroundedTarget = nil
+        latestPresentation = nil
+        state = .searching(requestID: requestID)
+        let taskID = UUID()
+        let task = Task { @MainActor [weak self] in
+            defer { self?.trackedQueryDidFinish(taskID) }
+            do {
+                try Task.checkCancellation()
+                let corrected = try await classificationCorrectionProvider(original, correction.semanticLabel)
+                try Task.checkCancellation()
+                guard let self, self.isCurrent(requestID: requestID, identity: identity) else {
+                    self?.rejectStaleResult(requestID: requestID)
+                    self?.finish(requestID: requestID)
+                    return
+                }
+                guard corrected.mapID == original.mapID, corrected.object.id == original.object.id,
+                    corrected.object.semanticLabel == correction.semanticLabel,
+                    corrected.object.displayName == original.object.displayName,
+                    corrected.position.coordinateFrameID == original.position.coordinateFrameID,
+                    corrected.object.firstSeenAt == original.object.firstSeenAt,
+                    corrected.object.presence != .removed
+                else {
+                    self.publishFailure(message: "물체 종류 저장 결과를 확인하지 못했어요. 다시 검색해 주세요.")
+                    self.finish(requestID: requestID)
+                    return
+                }
+                self.onObjectRenamed?()
+                let query = "\(corrected.object.displayLabel) 찾아줘"
+                self.latestSubmittedQuery = query
+                self.startQuery(
+                    query, currentFloorNodeID: floor, now: now, selection: corrected,
+                    selectedRoute: IntentRoute(
+                        kind: .searchObject, normalizedUtterance: query,
+                        matchedSignals: ["찾아"], requiresLLM: false))
+            } catch is CancellationError {
+                self?.rejectStaleResult(requestID: requestID)
+                self?.finish(requestID: requestID)
+            } catch {
+                guard let self, self.isCurrent(requestID: requestID, identity: identity) else { return }
+                self.publishFailure(message: "물체 종류를 저장하지 못했어요. 기록을 다시 확인한 후 시도해 주세요.")
                 self.finish(requestID: requestID)
             }
         }
