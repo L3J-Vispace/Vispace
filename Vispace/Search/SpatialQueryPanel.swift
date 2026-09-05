@@ -276,7 +276,8 @@ struct SpatialQueryPanel: View {
         let map = candidate.matchesCurrentMap == true ? "현재 공간" : "다른 저장 공간"
         let date = Date(timeIntervalSince1970: candidate.record.metadata.object.lastSeenAt)
             .formatted(date: .abbreviated, time: .shortened)
-        let state = candidate.confidenceGrade == .low ? "위치 신뢰 낮음" : "마지막 관측 \(date)"
+        let state = candidate.hasFutureObservationTime ? "마지막 관측 \(date) · 기록 시각 확인 필요"
+            : (candidate.confidenceGrade == .low ? "마지막 관측 \(date) · 위치 신뢰 낮음" : "마지막 관측 \(date)")
         return "\(map) · \(state)"
     }
 

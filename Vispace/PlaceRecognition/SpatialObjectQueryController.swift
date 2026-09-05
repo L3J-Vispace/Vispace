@@ -579,6 +579,11 @@ public final class SpatialObjectQueryController: ObservableObject {
             }
             return "‘\(label)’의 저장된 위치가 없어요. 자동 인식이 지원되는 물체 종류를 확인하거나, 저장된 물체에 붙인 이름으로 검색해 주세요."
         case .lowConfidence:
+            if result.issues.contains(.observationTimeInFuture), let candidate = result.candidates.first {
+                let date = Date(timeIntervalSince1970: candidate.record.metadata.object.lastSeenAt)
+                    .formatted(date: .abbreviated, time: .shortened)
+                return "‘\(label)’의 저장된 관측 날짜는 \(date)예요. 기록 시각이 현재보다 앞서 있어 새 관측으로 확인하기 전에는 AR 안내를 표시하지 않아요."
+            }
             return "‘\(label)’ 기록은 있지만 위치 신뢰도가 낮아 AR 안내를 표시하지 않았어요."
         case .unsupportedIntent:
             return "이 요청은 물체 찾기, 마지막 확인 위치, 또는 길 안내 검색으로 확정할 수 없어요."
