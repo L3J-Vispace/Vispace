@@ -315,7 +315,8 @@ public struct ARIndoorNavigationTargetAdapter: Sendable {
                 confidence: confidence,
                 firstSeenAt: original.firstSeenAt,
                 lastSeenAt: original.lastSeenAt,
-                stateUpdatedAt: original.stateUpdatedAt
+                stateUpdatedAt: original.stateUpdatedAt,
+                displayName: original.displayName
             ),
             let transformedMetadata = try? SpatialObjectMetadata(
                 mapID: currentMapID,

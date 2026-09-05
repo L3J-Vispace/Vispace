@@ -619,6 +619,46 @@ final class WorldMapCheckpointRepositoryTests: XCTestCase {
         XCTAssertEqual(snapshot.objects, [newer])
     }
 
+    func testRenamePersistsOnlyOneObjectWithoutChangingObservationOrdering() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = makeRepository(root: directory)
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let map = try await repository.saveCheckpoint(archive: Data("world-map".utf8), captureIdentity: identity)
+        func makeRecord(_ index: Int, timestamp: TimeInterval = 2) throws -> SpatialObjectMetadata {
+            let object = try SpatialObject(
+                id: ObjectID(rawValue: UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", 990 + index))!),
+                semanticLabel: "chair", position: Vec3(x: Double(index), y: 0, z: -2),
+                certainty: .confirmed, confidence: ConfidenceVector(semantic: .one, geometry: .one,
+                    tracking: .one, place: .one, identity: .one, objectState: .one),
+                firstSeenAt: 1, lastSeenAt: timestamp)
+            return try SpatialObjectMetadata(mapID: map.mapID, object: object,
+                position: FramedPosition(coordinateFrameID: identity.coordinateFrameID, value: object.position,
+                    observedAt: timestamp, trackingQuality: .normal, uncertainty: .highConfidenceDepth))
+        }
+        let original = try (0..<3).map { try makeRecord($0) }
+        for record in original { try await repository.upsertObjectMetadata(record) }
+        let renamed = try await repository.renameObject(expected: original[1], displayName: "창가 의자")
+        XCTAssertEqual(renamed.object.semanticLabel, "chair")
+        XCTAssertEqual(renamed.position, original[1].position)
+        XCTAssertEqual(renamed.object.stateUpdatedAt, original[1].object.stateUpdatedAt)
+        let reloaded = makeRepository(root: directory)
+        let snapshot = try await reloaded.metadataSnapshot()
+        XCTAssertEqual(snapshot.objects.first { $0.object.id == original[1].object.id }?.object.displayName, "창가 의자")
+        XCTAssertEqual(snapshot.objects.filter { $0.object.id != original[1].object.id }, [original[0], original[2]])
+        let queryRepository = SpatialObjectQueryRepository(metadataProvider: { try await reloaded.metadataSnapshot() },
+            alignmentCatalogProvider: { try CoordinateAlignmentCatalogSnapshot() })
+        let records = try await queryRepository.loadSnapshot(currentMapID: map.mapID).records
+        let result = DeterministicSpatialObjectSearchEngine().search(utterance: "창가 의자 찾아줘", records: records,
+            context: try SpatialObjectSearchContext(currentMapID: map.mapID, now: 10))
+        XCTAssertEqual(result.selectedCandidate?.record.metadata.object.id, original[1].object.id)
+        // A new camera observation without the annotation cannot erase a name.
+        try await reloaded.upsertObjectMetadata(makeRecord(1, timestamp: 3))
+        let afterObservation = try await reloaded.metadataSnapshot()
+        XCTAssertEqual(afterObservation.objects.first { $0.object.id == original[1].object.id }?.object.displayName, "창가 의자")
+        XCTAssertEqual(afterObservation.objects.first { $0.object.id == original[1].object.id }?.object.lastSeenAt, 3)
+    }
+
     private func makeRepository(
         root: URL,
         maximumCheckpointsPerMap: Int = WorldMapCheckpointRepository

@@ -12,6 +12,8 @@ struct SpatialQueryPanel: View {
     @State private var rejection: SpatialCommandRejection?
     @State private var editsFurniture = false
     @State private var selectedFurniture: FurnitureKind = .sofa
+    @State private var editsObjectName = false
+    @State private var objectNameDraft = ""
 
     var body: some View {
         VStack(spacing: 10) {
@@ -124,6 +126,12 @@ struct SpatialQueryPanel: View {
                 placementController.evaluate(selectedFurniture, dimensions: dimensions)
             }
         }
+        .sheet(isPresented: $editsObjectName) {
+            ObjectNameEditor(name: objectNameDraft) { name in
+                navigationController.clearRoute()
+                queryController.renameSelectedObject(name)
+            }
+        }
     }
 
     private var isSearching: Bool {
@@ -207,12 +215,69 @@ struct SpatialQueryPanel: View {
         let dateText = observedAt.map {
             Date(timeIntervalSince1970: $0).formatted(date: .abbreviated, time: .shortened)
         }
-        return messageCard(
-            message: presentation.message + (dateText.map { "\n마지막 관측: \($0)" } ?? ""),
-            systemImage: presentation.canStartARGuidance
-                ? "location.fill"
-                : "info.circle.fill"
-        )
+        return VStack(alignment: .leading, spacing: 8) {
+            messageCard(
+                message: presentation.message + (dateText.map { "\n마지막 관측: \($0)" } ?? ""),
+                systemImage: presentation.canStartARGuidance ? "location.fill" : "info.circle.fill"
+            )
+            if presentation.result.candidates.count > 1 {
+                ScrollView {
+                    VStack(spacing: 6) {
+                        ForEach(Array(presentation.result.candidates.enumerated()), id: \.element.record.metadata.object.id) { index, candidate in
+                            Button {
+                                navigationController.clearRoute()
+                                queryController.selectCandidate(objectID: candidate.record.metadata.object.id,
+                                    mapID: candidate.record.metadata.mapID)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("\(candidate.record.metadata.object.displayLabel) · 후보 \(index + 1)")
+                                        .font(.subheadline.weight(.semibold))
+                                    Text(candidateDescription(candidate))
+                                        .font(.caption)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(11)
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.white)
+                            .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 12))
+                            .accessibilityIdentifier("vispace.query.candidate.\(index)")
+                        }
+                    }
+                }
+                .frame(maxHeight: 190)
+            }
+            if let selected = presentation.result.selectedCandidate {
+                HStack {
+                    if queryController.canRenameObjects && selected.record.metadata.object.presence != .removed {
+                        Button(selected.record.metadata.object.displayName == nil ? "이름 지정" : "이름 변경") {
+                            objectNameDraft = selected.record.metadata.object.displayName ?? ""
+                            editsObjectName = true
+                        }
+                        .accessibilityIdentifier("vispace.query.rename")
+                    }
+                    Spacer()
+                    Button("다른 후보 다시 보기") {
+                        query = selected.record.metadata.object.semanticLabel
+                        navigationController.clearRoute()
+                        queryController.submit(query)
+                    }
+                }
+                .font(.subheadline.weight(.semibold))
+                .padding(12)
+                .foregroundStyle(.white)
+                .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 12))
+            }
+        }
+        .frame(maxWidth: 520)
+    }
+
+    private func candidateDescription(_ candidate: GroundedSpatialObjectCandidate) -> String {
+        let map = candidate.matchesCurrentMap == true ? "현재 공간" : "다른 저장 공간"
+        let date = Date(timeIntervalSince1970: candidate.record.metadata.object.lastSeenAt)
+            .formatted(date: .abbreviated, time: .shortened)
+        let state = candidate.confidenceGrade == .low ? "위치 신뢰 낮음" : "마지막 관측 \(date)"
+        return "\(map) · \(state)"
     }
 
     private func messageCard(message: String, systemImage: String) -> some View {
@@ -241,6 +306,40 @@ struct SpatialQueryPanel: View {
         .frame(maxWidth: 520)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("vispace.query.result")
+    }
+}
+
+private struct ObjectNameEditor: View {
+    @Environment(\.dismiss) private var dismiss
+    @State var name: String
+    let onSave: (String) -> Void
+
+    private var isValid: Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty || (trimmed.count <= SpatialObject.maximumDisplayNameLength
+            && trimmed.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+            && trimmed.unicodeScalars.contains(where: CharacterSet.alphanumerics.contains))
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("예: 창가 의자", text: $name)
+                    .accessibilityIdentifier("vispace.query.name.field")
+                Text("이름은 선택한 물체에만 저장돼요. 빈칸으로 저장하면 지정한 이름을 지워요. 자동 인식 종류는 유지됩니다.")
+                    .font(.footnote)
+                if !isValid { Text("줄바꿈 없이 64자 이내의 이름을 입력해 주세요.").foregroundStyle(.red) }
+            }
+            .navigationTitle("물체 이름")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("취소") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("저장") { dismiss(); onSave(name) }
+                        .disabled(!isValid)
+                        .accessibilityIdentifier("vispace.query.name.save")
+                }
+            }
+        }
     }
 }
 

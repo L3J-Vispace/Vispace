@@ -6,6 +6,128 @@ import XCTest
 
 @MainActor
 final class SpatialObjectQueryControllerTests: XCTestCase {
+    func testExplicitChoiceAmongThreeCandidatesPublishesOnlyChosenCurrentRecord() async throws {
+        let map = mapID(980), frame = frameID(980)
+        let current = identity(mapID: map, frameID: frame)
+        let records = try (0..<3).map { index in
+            record(try metadata(id: objectID(980 + index), mapID: map, frameID: frame,
+                label: "chair", position: vec(Double(index), 0, -2)), aliases: ["의자"])
+        }
+        let controller = self.controller(identityBox: QueryIdentityBox(current), records: records)
+        controller.submit("의자 찾아줘", now: 100)
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.latestPresentation?.result.status, .ambiguous)
+        XCTAssertEqual(controller.latestPresentation?.result.candidates.count, 3)
+        XCTAssertNil(controller.latestGroundedTarget)
+        controller.selectCandidate(objectID: records[1].metadata.object.id, mapID: map, now: 101)
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.latestGroundedTarget?.objectID, records[1].metadata.object.id)
+        XCTAssertEqual(controller.latestGroundedTarget?.currentFramePosition, records[1].metadata.position)
+    }
+
+    func testLastSeenChoiceCanSelectUnchangedRemovedObjectAmongThreeCandidates() async throws {
+        let map = mapID(971), frame = frameID(971)
+        let current = identity(mapID: map, frameID: frame)
+        let records = try (0..<3).map { index in
+            record(try metadata(id: objectID(971 + index), mapID: map, frameID: frame,
+                label: "chair", position: vec(Double(index), 0, -2), presence: .removed), aliases: ["의자"])
+        }
+        let controller = self.controller(identityBox: QueryIdentityBox(current), records: records)
+        controller.submit("의자 마지막 위치", now: 100)
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.latestPresentation?.result.status, .ambiguous)
+        controller.selectCandidate(objectID: records[1].metadata.object.id, mapID: map, now: 101)
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.latestGroundedTarget?.objectID, records[1].metadata.object.id)
+        XCTAssertEqual(controller.latestGroundedTarget?.intent, .lastSeen)
+        XCTAssertEqual(controller.latestPresentation?.result.selectedCandidate?.record.metadata.object.presence, .removed)
+    }
+
+    func testCandidateSelectionRechecksMovedAndLowConfidenceRecords() async throws {
+        let map = mapID(985), frame = frameID(985)
+        let current = identity(mapID: map, frameID: frame)
+        let objects = try (0..<3).map { index in
+            try metadata(id: objectID(985 + index), mapID: map, frameID: frame,
+                label: "chair", position: vec(Double(index), 0, -2))
+        }
+        for change in 0..<2 {
+            let provider = SuspendedQuerySnapshotProvider()
+            let controller = SpatialObjectQueryController(snapshotProvider: { map in
+                try await provider.load(currentMapID: map)
+            }, currentIdentityProvider: { current })
+            controller.submit("의자 찾아줘", now: 100)
+            try await waitForRequestCount(provider, 1)
+            await provider.resume(requestIndex: 0, with: snapshot(records: objects.map { record($0, aliases: ["의자"]) }))
+            try await waitForIdle(controller)
+            controller.selectCandidate(objectID: objects[1].object.id, mapID: map, now: 101)
+            try await waitForRequestCount(provider, 2)
+            let changed = try metadata(id: objects[1].object.id, mapID: map, frameID: frame,
+                label: "chair", position: change == 0 ? vec(5, 0, -2) : objects[1].position.value,
+                confidence: change == 1 ? ConfidenceVector() : objects[1].object.confidence)
+            await provider.resume(requestIndex: 1, with: snapshot(records: [record(changed, aliases: ["의자"])]))
+            try await waitForIdle(controller)
+            XCTAssertNil(controller.latestGroundedTarget)
+            if change == 1 { XCTAssertEqual(controller.latestPresentation?.result.status, .lowConfidence) }
+            else if case .failed = controller.state {} else { XCTFail("Moved candidate must require another review") }
+        }
+    }
+
+    func testCaptureTransitionWhileSelectingCannotPublishOldFrame() async throws {
+        let map = mapID(989), frame = frameID(989)
+        let identityBox = QueryIdentityBox(identity(mapID: map, frameID: frame))
+        let objects = try (0..<3).map { index in
+            record(try metadata(id: objectID(989 + index), mapID: map, frameID: frame, label: "chair"), aliases: ["의자"])
+        }
+        let provider = SuspendedQuerySnapshotProvider()
+        let controller = SpatialObjectQueryController(snapshotProvider: { map in
+            try await provider.load(currentMapID: map)
+        }, currentIdentityProvider: { identityBox.value })
+        controller.submit("의자 찾아줘", now: 100)
+        try await waitForRequestCount(provider, 1)
+        await provider.resume(requestIndex: 0, with: snapshot(records: objects))
+        try await waitForIdle(controller)
+        controller.selectCandidate(objectID: objects[1].metadata.object.id, mapID: map, now: 101)
+        try await waitForRequestCount(provider, 2)
+        identityBox.value = identity(mapID: map, frameID: frameID(999))
+        await provider.resume(requestIndex: 1, with: snapshot(records: objects))
+        try await waitForIdle(controller)
+        XCTAssertNil(controller.latestGroundedTarget)
+        XCTAssertNil(controller.latestPresentation)
+    }
+
+    func testRenamingSelectedCandidateRevalidatesAndSearchesItsAlias() async throws {
+        let map = mapID(975), frame = frameID(975)
+        let current = identity(mapID: map, frameID: frame)
+        let objects = try (0..<3).map { index in
+            try metadata(id: objectID(975 + index), mapID: map, frameID: frame,
+                label: "chair", position: vec(Double(index), 0, -2))
+        }
+        let store = QueryAnnotationTestStore(objects: objects)
+        let controller = SpatialObjectQueryController(snapshotProvider: { _ in try await store.snapshot() },
+            currentIdentityProvider: { current }, renameProvider: { expected, name in
+                try await store.rename(expected, name: name)
+            })
+        var invalidations = 0
+        controller.onObjectRenamed = { invalidations += 1 }
+        controller.submit("chair", now: 100)
+        try await waitForIdle(controller)
+        controller.selectCandidate(objectID: objects[1].object.id, mapID: map, now: 101)
+        try await waitForIdle(controller)
+        controller.renameSelectedObject("창가 의자", now: 102)
+        XCTAssertNil(controller.latestGroundedTarget)
+        try await waitForIdle(controller)
+        XCTAssertEqual(invalidations, 1)
+        XCTAssertEqual(controller.latestPresentation?.result.selectedCandidate?.record.metadata.object.displayName, "창가 의자")
+        XCTAssertEqual(controller.latestGroundedTarget?.objectID, objects[1].object.id)
+        controller.submit("창가 의자 찾아줘", now: 103)
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.latestGroundedTarget?.objectID, objects[1].object.id)
+        let snapshot = try await store.snapshot()
+        XCTAssertEqual(snapshot.records[0].metadata, objects[0])
+        XCTAssertEqual(snapshot.records[2].metadata, objects[2])
+        XCTAssertEqual(snapshot.records[1].metadata.position, objects[1].position)
+    }
+
     func testSearchFindsAnObjectBeyondTheFormer512RecordLimit() async throws {
         let map = mapID(990)
         let frame = frameID(990)
@@ -942,6 +1064,24 @@ final class SpatialObjectQueryControllerTests: XCTestCase {
 
     private func testUUID(_ value: Int) -> UUID {
         UUID(uuidString: String(format: "00000000-0000-0000-0000-%012x", value))!
+    }
+}
+
+private actor QueryAnnotationTestStore {
+    var objects: [SpatialObjectMetadata]
+    init(objects: [SpatialObjectMetadata]) { self.objects = objects }
+    func snapshot() throws -> SpatialObjectQueryRepositorySnapshot {
+        SpatialObjectQueryRepositorySnapshot(records: objects.map {
+            StoredSpatialObjectRecord(metadata: $0, memoryTier: .localMap)
+        }, alignmentCatalog: try CoordinateAlignmentCatalogSnapshot())
+    }
+    func rename(_ expected: SpatialObjectMetadata, name: String?) throws -> SpatialObjectMetadata {
+        let index = objects.firstIndex { $0.object.id == expected.object.id && $0.mapID == expected.mapID }!
+        var object = objects[index].object
+        try object.setDisplayName(name)
+        let renamed = try SpatialObjectMetadata(mapID: expected.mapID, object: object, position: objects[index].position)
+        objects[index] = renamed
+        return renamed
     }
 }
 

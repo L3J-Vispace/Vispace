@@ -15,6 +15,7 @@ public enum WorldMapCheckpointRepositoryError: Error, Equatable, Sendable {
     case unknownOrQuarantinedMap
     case coordinateFrameMismatch
     case staleObjectUpdate(ObjectID)
+    case objectAnnotationConflict(ObjectID)
     case logicalMapCapacityReached(maximum: Int)
 }
 
@@ -354,6 +355,39 @@ public actor WorldMapCheckpointRepository {
         }
     }
 
+    /// Annotation transaction: factual observation times and temporal revision
+    /// stay unchanged, and concurrent perception updates keep their coordinates.
+    @discardableResult
+    public func renameObject(expected: SpatialObjectMetadata, displayName: String?) async throws -> SpatialObjectMetadata {
+        try Task.checkCancellation()
+        await operationGate.acquire()
+        do {
+            try Task.checkCancellation()
+            var document = try loadDocumentRecoveringInvalidCatalog()
+            guard document.maps.contains(where: { $0.mapID == expected.mapID && $0.availability == .active }),
+                let index = document.objects.firstIndex(where: {
+                    $0.mapID == expected.mapID && $0.object.id == expected.object.id
+                }) else { throw WorldMapCheckpointRepositoryError.objectAnnotationConflict(expected.object.id) }
+            let current = document.objects[index]
+            guard current.object.presence != .removed, current.object.certainty == .confirmed,
+                current.object.semanticLabel == expected.object.semanticLabel,
+                current.object.displayName == expected.object.displayName,
+                current.position.coordinateFrameID == expected.position.coordinateFrameID
+            else { throw WorldMapCheckpointRepositoryError.objectAnnotationConflict(expected.object.id) }
+            var object = current.object
+            try object.setDisplayName(displayName)
+            let renamed = try SpatialObjectMetadata(mapID: current.mapID, object: object, position: current.position)
+            document.objects[index] = renamed
+            try Task.checkCancellation()
+            try commit(document)
+            await operationGate.release()
+            return renamed
+        } catch {
+            await operationGate.release()
+            throw error
+        }
+    }
+
     public func upsertObjectMetadata(_ metadata: SpatialObjectMetadata) async throws {
         try Task.checkCancellation()
         await operationGate.acquire()
@@ -392,6 +426,13 @@ public actor WorldMapCheckpointRepository {
             $0.mapID == metadata.mapID && $0.object.id == metadata.object.id
         }) {
             let existing = document.objects[index]
+            // The observation pipeline is not an annotation writer. Preserve
+            // the latest user name even if an in-flight observation predates it.
+            var observedObject = metadata.object
+            try observedObject.setDisplayName(existing.object.displayName)
+            let metadata = try SpatialObjectMetadata(
+                mapID: metadata.mapID, object: observedObject, position: metadata.position
+            )
             if existing == metadata {
                 return
             }

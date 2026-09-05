@@ -6,6 +6,24 @@ import simd
 
 @MainActor
 final class ARGuidanceControllerTests: XCTestCase {
+    func testExplicitLastSeenMarkerAllowsUnchangedRemovedSourceRecord() async throws {
+        let (stream, continuation) = AsyncStream<ARPoseSnapshot>.makeStream()
+        let context = ContextFixture()
+        let source = try context.metadata(presence: .removed)
+        let controller = ARGuidanceController(poses: stream,
+            sourceMetadataProvider: { _, _ in source }, nowProvider: { 10 })
+        controller.activate()
+        controller.show(try context.target(sourceMetadata: source, representsLastSeenLocation: true))
+        continuation.yield(context.pose())
+        for _ in 0..<25 {
+            if controller.renderableWorldPosition != nil { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertNotNil(controller.renderableWorldPosition)
+        XCTAssertTrue(controller.target?.representsLastSeenLocation == true)
+        await controller.deactivateAndWaitForPendingWork()
+    }
+
     func testTargetExpiresWithoutAnotherPose() async throws {
         let (stream, continuation) = AsyncStream<ARPoseSnapshot>.makeStream()
         let context = ContextFixture()
@@ -201,7 +219,8 @@ private struct ContextFixture {
     func target(
         label: String = "sofa",
         resolvedAt: TimeInterval = 10,
-        sourceMetadata: SpatialObjectMetadata? = nil
+        sourceMetadata: SpatialObjectMetadata? = nil,
+        representsLastSeenLocation: Bool = false
     ) throws -> ARGuidanceTarget {
         try ARGuidanceTarget(
             objectID: objectID,
@@ -216,18 +235,19 @@ private struct ContextFixture {
                 uncertainty: .highConfidenceDepth
             ),
             confidenceGrade: .high,
-            representsLastSeenLocation: false,
+            representsLastSeenLocation: representsLastSeenLocation,
             resolvedAt: resolvedAt,
             sourceMetadata: sourceMetadata
         )
     }
 
-    func metadata(position: Vec3? = nil, confidence: Double = 0.9) throws -> SpatialObjectMetadata {
+    func metadata(position: Vec3? = nil, confidence: Double = 0.9,
+                  presence: ObjectPresence = .visible) throws -> SpatialObjectMetadata {
         let position = position ?? targetPosition
         return try SpatialObjectMetadata(
             mapID: mapID,
             object: SpatialObject(id: objectID, semanticLabel: "sofa", position: position,
-                certainty: .confirmed, confidence: ConfidenceVector(
+                certainty: .confirmed, presence: presence, confidence: ConfidenceVector(
                     semantic: ConfidenceScore(clamping: confidence), geometry: ConfidenceScore(clamping: confidence)),
                 firstSeenAt: 1, lastSeenAt: 9),
             position: FramedPosition(coordinateFrameID: frameID, value: position, observedAt: 9,

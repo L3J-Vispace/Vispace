@@ -147,8 +147,8 @@ public struct SpatialObjectSearchResult: Hashable, Sendable {
     public let candidates: [GroundedSpatialObjectCandidate]
     public let issues: [SpatialObjectSearchIssue]
 
-    /// Only deterministic, unambiguous, non-low-confidence searches expose a
-    /// selected candidate for AR guidance.
+    /// Only a resolved identity above the confidence floor exposes a candidate.
+    /// The controller may also resolve ambiguity through an explicit user choice.
     public var selectedCandidate: GroundedSpatialObjectCandidate? {
         guard status == .found else {
             return nil
@@ -234,8 +234,9 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
             )
         }
 
+        let matchingIDs = Set(termMatches.map(\.objectID))
         let matchingRecords = records.filter { record in
-            canonicalLabels.contains(normalizeLabel(record.metadata.object.semanticLabel))
+            matchingIDs.contains(record.metadata.object.id)
                 && record.metadata.object.certainty == .confirmed
                 && (context.includeRemoved || record.metadata.object.presence != .removed)
         }
@@ -304,6 +305,28 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
         case .relationQuery, .complexAsk:
             return false
         }
+    }
+
+    /// Explicit user choice resolves identity ambiguity only. Fresh metadata
+    /// still has to satisfy eligibility and the normal confidence floor.
+    public func select(record: StoredSpatialObjectRecord, route: IntentRoute,
+                       context: SpatialObjectSearchContext) -> SpatialObjectSearchResult {
+        guard supportsObjectLookup(route.kind) else {
+            return SpatialObjectSearchResult(route: route, status: .unsupportedIntent,
+                matchedSemanticLabels: [], candidates: [], issues: [.unsupportedIntent])
+        }
+        guard record.metadata.object.certainty == .confirmed,
+            record.metadata.object.presence != .removed
+                || (route.kind == .lastSeen && context.includeRemoved) else {
+            return SpatialObjectSearchResult(route: route, status: .notFound,
+                matchedSemanticLabels: [record.metadata.object.semanticLabel],
+                candidates: [], issues: [.noEligibleStoredObject])
+        }
+        let candidate = rankedCandidate(for: record, context: context).candidate
+        let isLow = candidate.confidenceGrade == .low
+        return SpatialObjectSearchResult(route: route, status: isLow ? .lowConfidence : .found,
+            matchedSemanticLabels: [record.metadata.object.semanticLabel], candidates: [candidate],
+            issues: isLow ? [.groundedPositionLowConfidence] : [])
     }
 
     private func routeForBareSemanticLabelIfNeeded(
@@ -488,6 +511,7 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
         for record in records {
             let canonicalLabel = normalizeLabel(record.metadata.object.semanticLabel)
             let terms = [record.metadata.object.semanticLabel] + record.semanticAliases
+                + [record.metadata.object.displayName].compactMap { $0 }
             for term in Set(terms.map(normalizeLabel)).sorted() {
                 let termTokens = lexicalTokens(term)
                 guard !termTokens.isEmpty, termTokens.count <= queryTokens.count else {
@@ -501,6 +525,7 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
                     matches.append(
                         SemanticTermMatch(
                             canonicalLabel: canonicalLabel,
+                            objectID: record.metadata.object.id,
                             range: range,
                             specificity: termTokens.count
                         )
@@ -511,8 +536,7 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
 
         let unshadowed = matches.filter { match in
             !matches.contains { other in
-                other.canonicalLabel != match.canonicalLabel
-                    && other.specificity > match.specificity
+                other.specificity > match.specificity
                     && other.range.lowerBound <= match.range.lowerBound
                     && other.range.upperBound >= match.range.upperBound
             }
@@ -599,6 +623,7 @@ private struct RankedCandidate: Sendable {
 
 private struct SemanticTermMatch: Hashable, Sendable {
     let canonicalLabel: String
+    let objectID: ObjectID
     let range: Range<Int>
     let specificity: Int
 }

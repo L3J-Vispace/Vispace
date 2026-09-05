@@ -129,6 +129,9 @@ public final class SpatialObjectQueryController: ObservableObject {
             _ currentMapID: MapID?
         ) async throws -> SpatialObjectQueryRepositorySnapshot
     public typealias CurrentIdentityProvider = @MainActor @Sendable () -> ARCaptureIdentity
+    public typealias RenameProvider = @Sendable (SpatialObjectMetadata, String?) async throws -> SpatialObjectMetadata
+    public var onObjectRenamed: (@MainActor () -> Void)?
+    public var canRenameObjects: Bool { renameProvider != nil }
 
     @Published public private(set) var state: SpatialObjectQueryControllerState = .idle
     @Published public private(set) var latestPresentation: SpatialObjectQueryPresentation?
@@ -143,6 +146,10 @@ public final class SpatialObjectQueryController: ObservableObject {
     private let currentIdentityProvider: CurrentIdentityProvider
     private let searchEngine: DeterministicSpatialObjectSearchEngine
     private let positionResolver: ValidatedCurrentFramePositionResolver
+    private let renameProvider: RenameProvider?
+    private var latestSubmittedQuery = ""
+    private var latestSubmittedFloor: SpatialNodeID?
+    private var presentedIdentity: ARCaptureIdentity?
 
     private var queryTask: Task<Void, Never>?
     private var trackedQueryTasks: [UUID: Task<Void, Never>] = [:]
@@ -151,6 +158,7 @@ public final class SpatialObjectQueryController: ObservableObject {
     public init(
         repository: SpatialObjectQueryRepository,
         currentIdentityProvider: @escaping CurrentIdentityProvider,
+        renameProvider: RenameProvider? = nil,
         searchEngine: DeterministicSpatialObjectSearchEngine =
             DeterministicSpatialObjectSearchEngine(),
         positionResolver: ValidatedCurrentFramePositionResolver =
@@ -160,6 +168,7 @@ public final class SpatialObjectQueryController: ObservableObject {
             try await repository.loadSnapshot(currentMapID: currentMapID)
         }
         self.currentIdentityProvider = currentIdentityProvider
+        self.renameProvider = renameProvider
         self.searchEngine = searchEngine
         self.positionResolver = positionResolver
     }
@@ -167,6 +176,7 @@ public final class SpatialObjectQueryController: ObservableObject {
     public init(
         snapshotProvider: @escaping SnapshotProvider,
         currentIdentityProvider: @escaping CurrentIdentityProvider,
+        renameProvider: RenameProvider? = nil,
         searchEngine: DeterministicSpatialObjectSearchEngine =
             DeterministicSpatialObjectSearchEngine(),
         positionResolver: ValidatedCurrentFramePositionResolver =
@@ -174,6 +184,7 @@ public final class SpatialObjectQueryController: ObservableObject {
     ) {
         self.snapshotProvider = snapshotProvider
         self.currentIdentityProvider = currentIdentityProvider
+        self.renameProvider = renameProvider
         self.searchEngine = searchEngine
         self.positionResolver = positionResolver
     }
@@ -191,6 +202,81 @@ public final class SpatialObjectQueryController: ObservableObject {
         currentFloorNodeID: SpatialNodeID? = nil,
         now: TimeInterval = Date().timeIntervalSince1970
     ) {
+        latestSubmittedQuery = utterance
+        latestSubmittedFloor = currentFloorNodeID
+        startQuery(utterance, currentFloorNodeID: currentFloorNodeID, now: now)
+    }
+
+    public func selectCandidate(objectID: ObjectID, mapID: MapID,
+                                now: TimeInterval = Date().timeIntervalSince1970) {
+        guard let presentation = latestPresentation,
+            presentedIdentity == currentIdentityProvider(),
+            let candidate = presentation.result.candidates.first(where: {
+                $0.record.metadata.object.id == objectID && $0.record.metadata.mapID == mapID
+            }) else { return }
+        startQuery(latestSubmittedQuery, currentFloorNodeID: latestSubmittedFloor, now: now,
+            selection: candidate.record.metadata, selectedRoute: presentation.result.route)
+    }
+
+    public func renameSelectedObject(_ displayName: String?,
+                                     now: TimeInterval = Date().timeIntervalSince1970) {
+        guard now.isFinite, now >= 0, let renameProvider,
+            let presentation = latestPresentation,
+            let selected = presentation.result.selectedCandidate,
+            presentedIdentity == currentIdentityProvider() else { return }
+        let original = selected.record.metadata
+        var validation = original.object
+        do { try validation.setDisplayName(displayName) } catch {
+            publishFailure(message: "이름은 줄바꿈 없이 64자 이내로 입력해 주세요.")
+            return
+        }
+        cancelCurrentQuery(resetToIdle: false)
+        latestRequestID &+= 1
+        let requestID = latestRequestID
+        let identity = currentIdentityProvider()
+        let query = latestSubmittedQuery
+        let floor = latestSubmittedFloor
+        latestGroundedTarget = nil
+        latestPresentation = nil
+        state = .searching(requestID: requestID)
+        let name = validation.displayName
+        let taskID = UUID()
+        let task = Task { @MainActor [weak self] in
+            defer { self?.trackedQueryDidFinish(taskID) }
+            do {
+                try Task.checkCancellation()
+                let renamed = try await renameProvider(original, name)
+                try Task.checkCancellation()
+                guard let self, self.isCurrent(requestID: requestID, identity: identity) else {
+                    self?.rejectStaleResult(requestID: requestID)
+                    self?.finish(requestID: requestID)
+                    return
+                }
+                guard renamed.mapID == original.mapID, renamed.object.id == original.object.id,
+                    renamed.object.semanticLabel == original.object.semanticLabel,
+                    renamed.object.displayName == name else {
+                    self.publishFailure(message: "물체 이름 저장 결과를 확인하지 못했어요. 다시 검색해 주세요.")
+                    self.finish(requestID: requestID)
+                    return
+                }
+                self.onObjectRenamed?()
+                self.startQuery(query, currentFloorNodeID: floor, now: now,
+                    selection: renamed, selectedRoute: presentation.result.route)
+            } catch is CancellationError {
+                self?.rejectStaleResult(requestID: requestID)
+                self?.finish(requestID: requestID)
+            } catch {
+                guard let self, self.isCurrent(requestID: requestID, identity: identity) else { return }
+                self.publishFailure(message: "물체 이름을 저장하지 못했어요. 기록을 다시 확인한 후 시도해 주세요.")
+                self.finish(requestID: requestID)
+            }
+        }
+        queryTask = task
+        trackedQueryTasks[taskID] = task
+    }
+
+    private func startQuery(_ utterance: String, currentFloorNodeID: SpatialNodeID?, now: TimeInterval,
+                            selection: SpatialObjectMetadata? = nil, selectedRoute: IntentRoute? = nil) {
         guard now.isFinite, now >= 0 else {
             cancelCurrentQuery(resetToIdle: false)
             publishFailure()
@@ -234,13 +320,26 @@ public final class SpatialObjectQueryController: ObservableObject {
                     includeRemoved: DeterministicIntentRouter().route(query).kind == .lastSeen
                 )
                 let records = snapshot.records
-                let result = await Task.detached(priority: .userInitiated) {
-                    engine.search(
+                let result: SpatialObjectSearchResult
+                if let selection, let selectedRoute {
+                    guard let latestRecord = records.first(where: {
+                        $0.metadata.mapID == selection.mapID && $0.metadata.object.id == selection.object.id
+                    }), Self.matchesSelectedRecord(latestRecord.metadata, selection,
+                        allowsRemoved: selectedRoute.kind == .lastSeen) else {
+                        self.publishFailure(message: "선택한 물체 기록이 달라졌어요. 다시 검색해 위치를 확인해 주세요.")
+                        self.finish(requestID: requestID)
+                        return
+                    }
+                    result = engine.select(record: latestRecord, route: selectedRoute, context: context)
+                } else {
+                    result = await Task.detached(priority: .userInitiated) {
+                        engine.search(
                         utterance: query,
                         records: records,
                         context: context
-                    )
-                }.value
+                        )
+                    }.value
+                }
                 try Task.checkCancellation()
                 guard self.isCurrent(requestID: requestID, identity: identity) else {
                     self.rejectStaleResult(requestID: requestID)
@@ -270,6 +369,7 @@ public final class SpatialObjectQueryController: ObservableObject {
                     )
                 )
                 self.latestPresentation = presentation
+                self.presentedIdentity = identity
                 self.latestGroundedTarget = Self.groundedTarget(
                     from: result,
                     resolvedPosition: resolvedPosition,
@@ -365,13 +465,27 @@ public final class SpatialObjectQueryController: ObservableObject {
         queryTask = nil
     }
 
-    private func publishFailure() {
+    private func publishFailure(message: String = "저장된 공간 정보를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.") {
         latestPresentation = nil
         latestGroundedTarget = nil
         state = .failed(
-            message: "저장된 공간 정보를 불러오지 못했어요. 잠시 후 다시 시도해 주세요."
+            message: message
         )
         metrics.failuresPublished &+= 1
+    }
+
+    private static func matchesSelectedRecord(_ current: SpatialObjectMetadata,
+                                              _ selected: SpatialObjectMetadata,
+                                              allowsRemoved: Bool) -> Bool {
+        current.mapID == selected.mapID && current.object.id == selected.object.id
+            && current.object.semanticLabel == selected.object.semanticLabel
+            && current.object.displayName == selected.object.displayName
+            && current.object.presence == selected.object.presence
+            && (current.object.presence != .removed || allowsRemoved)
+            && current.object.certainty == .confirmed
+            && current.position.coordinateFrameID == selected.position.coordinateFrameID
+            && current.position.value == selected.position.value
+            && current.position.uncertainty == selected.position.uncertainty
     }
 
     private static func boundedQuery(_ utterance: String) -> String {
@@ -430,7 +544,8 @@ public final class SpatialObjectQueryController: ObservableObject {
         guidanceAvailability: SpatialObjectQueryGuidanceAvailability
     ) -> String {
         let rawLabel =
-            result.matchedSemanticLabels.first
+            result.selectedCandidate?.record.metadata.object.displayName
+            ?? result.matchedSemanticLabels.first
             ?? result.candidates.first?.record.metadata.object.semanticLabel
             ?? "물체"
         let label = String(rawLabel.prefix(64))
@@ -457,12 +572,12 @@ public final class SpatialObjectQueryController: ObservableObject {
                 return "‘\(label)’ 기록은 찾았지만 안내 좌표를 확정하지 못했어요."
             }
         case .ambiguous:
-            return "‘\(label)’ 후보가 여러 개라 하나의 위치로 확정할 수 없어요. 주변 특징을 더 보여 주세요."
+            return "‘\(label)’ 후보가 여러 개예요. 찾으려는 물체를 선택해 주세요."
         case .notFound:
             if result.issues.contains(.noSemanticTarget) {
                 return "찾을 물체를 이해하지 못했어요. 물체 이름과 함께 다시 말해 주세요."
             }
-            return "‘\(label)’의 저장된 위치를 찾지 못했어요. 카메라로 공간을 조금 더 둘러봐 주세요."
+            return "‘\(label)’의 저장된 위치가 없어요. 자동 인식이 지원되는 물체 종류를 확인하거나, 저장된 물체에 붙인 이름으로 검색해 주세요."
         case .lowConfidence:
             return "‘\(label)’ 기록은 있지만 위치 신뢰도가 낮아 AR 안내를 표시하지 않았어요."
         case .unsupportedIntent:

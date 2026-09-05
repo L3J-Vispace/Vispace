@@ -160,7 +160,7 @@ public actor SpatialObjectQueryRepository {
                     memoryTier: Self.memoryTier(for: metadata, currentMapID: currentMapID),
                     semanticAliases: aliasCatalog.aliases(
                         for: metadata.object.semanticLabel
-                    )
+                    ) + [metadata.object.displayName].compactMap { $0 }
                 )
             }
         return SpatialObjectQueryRepositorySnapshot(

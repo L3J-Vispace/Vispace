@@ -159,6 +159,9 @@ final class VispaceServices: ObservableObject {
             repository: queryRepository,
             currentIdentityProvider: {
                 sessionController.captureIdentity
+            },
+            renameProvider: { expected, displayName in
+                try await repository.renameObject(expected: expected, displayName: displayName)
             }
         )
         let relationQueryController = SpatialRelationQueryController(
@@ -356,6 +359,14 @@ final class VispaceServices: ObservableObject {
         self.placementStreamBridge = placementStreamBridge
         guidanceController.onTargetInvalidated = { [weak queryController] in
             queryController?.invalidateForCaptureTransition()
+        }
+        queryController.onObjectRenamed = {
+            [weak relationQueryController, weak guidanceController,
+                weak navigationController, weak placementController] in
+            relationQueryController?.invalidateForCaptureTransition()
+            guidanceController?.clear()
+            navigationController?.clearRoute()
+            placementController?.cancelCurrentEvaluation()
         }
         var lastIdentity = sessionController.captureIdentity
         sessionController.onCaptureIdentityChange = {

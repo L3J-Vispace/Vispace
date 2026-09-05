@@ -322,7 +322,7 @@ public final class ARGuidanceController: ObservableObject {
                             current.object.id == source.object.id,
                             current.object.semanticLabel == source.object.semanticLabel,
                             current.object.presence == source.object.presence,
-                            current.object.presence != .removed,
+                            current.object.presence != .removed || target.representsLastSeenLocation,
                             current.object.certainty == source.object.certainty,
                             current.object.confidence == source.object.confidence,
                             current.position.coordinateFrameID == source.position.coordinateFrameID,

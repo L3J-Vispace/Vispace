@@ -342,7 +342,12 @@ public actor TemporalSpatialMemoryService {
             $0.key < $1.key
         }) {
             if let durable = durableByID[objectID] {
-                if durable != journalMetadata {
+                var comparableObject = durable.object
+                try comparableObject.setDisplayName(journalMetadata.object.displayName)
+                let comparableDurable = try SpatialObjectMetadata(
+                    mapID: durable.mapID, object: comparableObject, position: durable.position
+                )
+                if comparableDurable != journalMetadata {
                     guard
                         journalMetadata.object.stateUpdatedAt
                             > durable.object.stateUpdatedAt
