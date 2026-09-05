@@ -107,7 +107,7 @@ final class WorldMapBlobStoreTests: XCTestCase {
         await assertThrowsErrorAsync {
             _ = try await store.saveArchive(Data("valid".utf8), id: id)
         } verify: { error in
-            XCTAssertEqual(error as? WorldMapBlobStoreError, .blobAlreadyExists)
+            XCTAssertEqual(error as? SpatialStorageError, .unsafePath)
         }
         XCTAssertEqual(
             try FileManager.default.destinationOfSymbolicLink(atPath: destination.path),
