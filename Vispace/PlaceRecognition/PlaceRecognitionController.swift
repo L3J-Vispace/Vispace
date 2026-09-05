@@ -107,6 +107,7 @@ public final class PlaceRecognitionController: ObservableObject {
             [SpatialObjectMetadata]
         ) async throws -> PlaceCoordinateAlignmentResolution
     public typealias LogicalMergeWriter = @Sendable (LogicalMapMergeCommit) async throws -> Void
+    public typealias MutationAcknowledger = @Sendable (PlaceAssociationStateID, UInt64) async throws -> Void
     public typealias CheckpointRequester = @MainActor @Sendable () -> Void
     public typealias ExistingMapAssociator =
         @MainActor @Sendable (
@@ -137,6 +138,7 @@ public final class PlaceRecognitionController: ObservableObject {
     private let catalogProvider: CatalogProvider
     private let fingerprintWriter: FingerprintWriter
     private let associationWriter: AssociationWriter
+    private let mutationAcknowledger: MutationAcknowledger
     private let coordinateCompatibilityProvider: CoordinateCompatibilityProvider
     private let checkpointRequester: CheckpointRequester
     private let existingMapAssociator: ExistingMapAssociator
@@ -174,6 +176,7 @@ public final class PlaceRecognitionController: ObservableObject {
         catalogProvider: @escaping CatalogProvider,
         fingerprintWriter: @escaping FingerprintWriter,
         associationWriter: @escaping AssociationWriter,
+        mutationAcknowledger: @escaping MutationAcknowledger = { _, _ in },
         coordinateCompatibilityProvider: @escaping CoordinateCompatibilityProvider = {
             snapshot, candidate, _ in
             try PlaceCoordinateAlignmentResolution(
@@ -201,6 +204,7 @@ public final class PlaceRecognitionController: ObservableObject {
             catalogProvider: catalogProvider,
             fingerprintWriter: fingerprintWriter,
             associationWriter: associationWriter,
+            mutationAcknowledger: mutationAcknowledger,
             coordinateCompatibilityProvider: coordinateCompatibilityProvider,
             existingMapAssociator: existingMapAssociator,
             logicalMergeWriter: logicalMergeWriter,
@@ -219,6 +223,7 @@ public final class PlaceRecognitionController: ObservableObject {
         catalogProvider: @escaping CatalogProvider,
         fingerprintWriter: @escaping FingerprintWriter,
         associationWriter: @escaping AssociationWriter,
+        mutationAcknowledger: @escaping MutationAcknowledger = { _, _ in },
         coordinateCompatibilityProvider: @escaping CoordinateCompatibilityProvider = {
             snapshot, candidate, _ in
             try PlaceCoordinateAlignmentResolution(
@@ -246,6 +251,7 @@ public final class PlaceRecognitionController: ObservableObject {
             catalogProvider: catalogProvider,
             fingerprintWriter: fingerprintWriter,
             associationWriter: associationWriter,
+            mutationAcknowledger: mutationAcknowledger,
             coordinateCompatibilityProvider: coordinateCompatibilityProvider,
             existingMapAssociator: existingMapAssociator,
             logicalMergeWriter: logicalMergeWriter,
@@ -265,6 +271,7 @@ public final class PlaceRecognitionController: ObservableObject {
         catalogProvider: @escaping CatalogProvider,
         fingerprintWriter: @escaping FingerprintWriter,
         associationWriter: @escaping AssociationWriter,
+        mutationAcknowledger: @escaping MutationAcknowledger = { _, _ in },
         coordinateCompatibilityProvider: @escaping CoordinateCompatibilityProvider,
         existingMapAssociator: @escaping ExistingMapAssociator,
         logicalMergeWriter: @escaping LogicalMergeWriter,
@@ -281,6 +288,7 @@ public final class PlaceRecognitionController: ObservableObject {
         self.catalogProvider = catalogProvider
         self.fingerprintWriter = fingerprintWriter
         self.associationWriter = associationWriter
+        self.mutationAcknowledger = mutationAcknowledger
         self.coordinateCompatibilityProvider = coordinateCompatibilityProvider
         self.existingMapAssociator = existingMapAssociator
         self.logicalMergeWriter = logicalMergeWriter
@@ -510,6 +518,23 @@ public final class PlaceRecognitionController: ObservableObject {
             try await fingerprintWriter(record)
             try Task.checkCancellation()
             metrics.fingerprintsPersisted &+= 1
+        }
+        // A mapped snapshot is published only after checkpoint/association
+        // completion. Recover acknowledgements from durable proposals as well
+        // as the live attempt so an app restart cannot permanently pin them.
+        for attempt in catalog.associationStates where
+            attempt.context.sourceCoordinateFrameID == coordinateFrameID
+                && catalog.acknowledgedMutationRevisions[attempt.id] != attempt.revision {
+            let completed: Bool
+            switch attempt.latestDecision.mutation {
+            case .createNewMap: completed = attempt.context.sourceMapID == nil
+            case .associateExisting(let targetMapID): completed = targetMapID == mapID
+            case .mergeMaps, .deferDecision: completed = false
+            }
+            if completed {
+                try await mutationAcknowledger(attempt.id, attempt.revision)
+                try Task.checkCancellation()
+            }
         }
         settledUnmappedFrameID = nil
         awaitingCheckpointFrameID = nil
@@ -744,6 +769,8 @@ public final class PlaceRecognitionController: ObservableObject {
             return
         }
         try await logicalMergeWriter(commit)
+        try Task.checkCancellation()
+        try await mutationAcknowledger(stateRecord.id, stateRecord.revision)
         try Task.checkCancellation()
         settledMergePairs.insert(pair)
         metrics.logicalMergesCommitted &+= 1

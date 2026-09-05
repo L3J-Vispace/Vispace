@@ -18,14 +18,18 @@ public enum PlaceMemoryRepositoryError: Error, Equatable, Sendable {
     case staleAssociationStateUpdate(id: PlaceAssociationStateID)
     case associationHistoryDiverged(id: PlaceAssociationStateID)
     case retiredAssociationState(id: PlaceAssociationStateID)
+    case invalidMutationAcknowledgement(id: PlaceAssociationStateID)
 }
 
-public enum PlaceAssociationHistoryRetention: Sendable {
+public enum PlaceAssociationHistoryRetention: Equatable, Sendable {
     case preserveAll
     /// Retire older attempts containing no mutation proposal, atomically with
     /// admission of a newer attempt. Proposed mutations remain pinned because
     /// this catalog has no durable acknowledgement that they were executed.
     case retireOlderDeferredAttempts
+    /// Retires deferred attempts or mutations whose exact durable revision
+    /// was acknowledged after the corresponding map operation completed.
+    case retireCompletedAttempts
 }
 
 /// A stable identifier for one bounded place-association attempt.
@@ -291,12 +295,14 @@ public struct PlaceMemoryCatalogSnapshot: Codable, Hashable, Sendable {
     /// Unknown IDs at or below this creation time have been retired. Retained
     /// IDs are still allowed exact retries and valid append-only extensions.
     public fileprivate(set) var retiredAssociationCreatedAtThrough: TimeInterval?
+    public fileprivate(set) var acknowledgedMutationRevisions: [PlaceAssociationStateID: UInt64]
 
     public init(
         schemaVersion: UInt16 = Self.currentSchemaVersion,
         fingerprints: [PlaceFingerprintRecord] = [],
         associationStates: [PlaceAssociationStateRecord] = [],
-        retiredAssociationCreatedAtThrough: TimeInterval? = nil
+        retiredAssociationCreatedAtThrough: TimeInterval? = nil,
+        acknowledgedMutationRevisions: [PlaceAssociationStateID: UInt64] = [:]
     ) throws {
         guard schemaVersion == Self.currentSchemaVersion else {
             throw PlaceMemoryRepositoryError.unsupportedCatalogSchema(actual: schemaVersion)
@@ -328,6 +334,14 @@ public struct PlaceMemoryCatalogSnapshot: Codable, Hashable, Sendable {
         self.fingerprints = fingerprints.sorted(by: Self.fingerprintOrder)
         self.associationStates = associationStates.sorted(by: Self.associationOrder)
         self.retiredAssociationCreatedAtThrough = retiredAssociationCreatedAtThrough
+        for (id, revision) in acknowledgedMutationRevisions {
+            guard let state = associationStates.first(where: { $0.id == id }),
+                state.revision == revision,
+                !state.containsOnlyDeferredDecisions,
+                state.latestDecision.mutation != .deferDecision
+            else { throw PlaceMemoryRepositoryError.invalidMutationAcknowledgement(id: id) }
+        }
+        self.acknowledgedMutationRevisions = acknowledgedMutationRevisions
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -335,6 +349,22 @@ public struct PlaceMemoryCatalogSnapshot: Codable, Hashable, Sendable {
         case fingerprints
         case associationStates
         case retiredAssociationCreatedAtThrough
+        case acknowledgedMutationRevisions
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(fingerprints, forKey: .fingerprints)
+        try container.encode(associationStates, forKey: .associationStates)
+        try container.encodeIfPresent(retiredAssociationCreatedAtThrough, forKey: .retiredAssociationCreatedAtThrough)
+        // Codable represents dictionaries with custom keys as alternating
+        // key/value arrays. Sort those keys explicitly for deterministic bytes.
+        var acknowledgements = container.nestedUnkeyedContainer(forKey: .acknowledgedMutationRevisions)
+        for (id, revision) in acknowledgedMutationRevisions.sorted(by: { $0.key < $1.key }) {
+            try acknowledgements.encode(id)
+            try acknowledgements.encode(revision)
+        }
     }
 
     public init(from decoder: Decoder) throws {
@@ -352,7 +382,10 @@ public struct PlaceMemoryCatalogSnapshot: Codable, Hashable, Sendable {
                 ),
                 retiredAssociationCreatedAtThrough: container.decodeIfPresent(
                     TimeInterval.self, forKey: .retiredAssociationCreatedAtThrough
-                )
+                ),
+                acknowledgedMutationRevisions: container.decodeIfPresent(
+                    [PlaceAssociationStateID: UInt64].self, forKey: .acknowledgedMutationRevisions
+                ) ?? [:]
             )
         } catch let error as DecodingError {
             throw error
@@ -514,6 +547,7 @@ public actor PlaceMemoryRepository {
                 throw PlaceMemoryRepositoryError.associationHistoryDiverged(id: state.id)
             }
             catalog.associationStates[index] = state
+            catalog.acknowledgedMutationRevisions.removeValue(forKey: state.id)
         } else {
             if let retiredThrough = catalog.retiredAssociationCreatedAtThrough,
                 state.createdAt <= retiredThrough
@@ -521,15 +555,20 @@ public actor PlaceMemoryRepository {
                 throw PlaceMemoryRepositoryError.retiredAssociationState(id: state.id)
             }
             if catalog.associationStates.count >= maximumAssociationStates,
-                case .retireOlderDeferredAttempts = retention,
+                retention != .preserveAll,
                 let retired = catalog.associationStates
-                    .filter({ $0.createdAt < state.createdAt && $0.containsOnlyDeferredDecisions })
+                    .filter({
+                        $0.createdAt < state.createdAt && ($0.containsOnlyDeferredDecisions
+                            || (retention == .retireCompletedAttempts
+                                && catalog.acknowledgedMutationRevisions[$0.id] == $0.revision))
+                    })
                     .min(by: {
                         if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
                         return $0.id < $1.id
                     })
             {
                 catalog.associationStates.removeAll { $0.id == retired.id }
+                catalog.acknowledgedMutationRevisions.removeValue(forKey: retired.id)
                 catalog.retiredAssociationCreatedAtThrough = max(
                     catalog.retiredAssociationCreatedAtThrough ?? 0, retired.createdAt
                 )
@@ -546,12 +585,47 @@ public actor PlaceMemoryRepository {
         try commit(catalog)
     }
 
+    /// Call only after the mutation has durably completed. A stale or missing
+    /// revision cannot acknowledge a newer proposal; retries are idempotent.
+    public func acknowledgeAssociationMutation(id: PlaceAssociationStateID, revision: UInt64) async throws {
+        try Task.checkCancellation()
+        var catalog = try loadCatalogRecoveringInvalidData()
+        guard let state = catalog.associationStates.first(where: { $0.id == id }),
+            state.revision == revision, !state.containsOnlyDeferredDecisions,
+            state.latestDecision.mutation != .deferDecision
+        else { throw PlaceMemoryRepositoryError.invalidMutationAcknowledgement(id: id) }
+        if catalog.acknowledgedMutationRevisions[id] == revision { return }
+        catalog.acknowledgedMutationRevisions[id] = revision
+        try Task.checkCancellation()
+        try commit(catalog)
+    }
+
+    public func deleteMap(mapID: MapID) async throws {
+        try Task.checkCancellation()
+        var catalog = try loadCatalogRecoveringInvalidData()
+        let retired = catalog.associationStates.filter { state in
+            state.context.sourceMapID == mapID || state.observations.contains { observation in
+                observation.candidates.contains { $0.mapID == mapID }
+            }
+        }
+        let retiredIDs = Set(retired.map(\.id))
+        catalog.fingerprints.removeAll { $0.mapID == mapID }
+        catalog.associationStates.removeAll { retiredIDs.contains($0.id) }
+        catalog.acknowledgedMutationRevisions = catalog.acknowledgedMutationRevisions.filter { !retiredIDs.contains($0.key) }
+        if let retiredAt = retired.map(\.createdAt).max() {
+            catalog.retiredAssociationCreatedAtThrough = max(catalog.retiredAssociationCreatedAtThrough ?? 0, retiredAt)
+        }
+        try Task.checkCancellation()
+        try commit(catalog, reclaiming: true)
+    }
+
     private func loadCatalogRecoveringInvalidData() throws -> PlaceMemoryCatalogSnapshot {
         try SpatialStorageDirectory.prepare(
             at: directoryURL,
             fileManager: fileManager,
             createIfMissing: false
         )
+        try SpatialStorageDirectory.validatePath(at: catalogURL, fileManager: fileManager)
         guard fileManager.fileExists(atPath: catalogURL.path) else {
             return try PlaceMemoryCatalogSnapshot()
         }
@@ -572,7 +646,10 @@ public actor PlaceMemoryRepository {
         }
 
         do {
+            try SpatialStorageDirectory.validateJSONSchemas(data)
             return try JSONDecoder().decode(PlaceMemoryCatalogSnapshot.self, from: data)
+        } catch let error as SpatialStorageError {
+            throw error
         } catch {
             try quarantineCatalog(reason: String(describing: error))
             return try PlaceMemoryCatalogSnapshot()
@@ -580,6 +657,7 @@ public actor PlaceMemoryRepository {
     }
 
     private func readBoundedCatalog() throws -> Data {
+        try SpatialStorageDirectory.validateRegularFile(at: catalogURL, fileManager: fileManager)
         let handle = try FileHandle(forReadingFrom: catalogURL)
         defer { try? handle.close() }
 
@@ -617,7 +695,7 @@ public actor PlaceMemoryRepository {
         }
     }
 
-    private func commit(_ catalog: PlaceMemoryCatalogSnapshot) throws {
+    private func commit(_ catalog: PlaceMemoryCatalogSnapshot, reclaiming: Bool = false) throws {
         try validateConfiguredCapacity(catalog)
         try prepareDirectory()
         let encoder = JSONEncoder()
@@ -629,13 +707,13 @@ public actor PlaceMemoryRepository {
                 maximum: Self.maximumCatalogBytes
             )
         }
-        try data.write(
-            to: catalogURL,
-            options: [.atomic, .completeFileProtectionUnlessOpen]
+        try SpatialStorageDirectory.atomicWrite(
+            data, to: catalogURL, directory: directoryURL, fileManager: fileManager, reclaiming: reclaiming
         )
     }
 
     private func quarantineCatalog(reason: String) throws {
+        try SpatialStorageDirectory.validatePath(at: catalogURL, fileManager: fileManager)
         guard fileManager.fileExists(atPath: catalogURL.path) else {
             return
         }
@@ -663,10 +741,12 @@ public actor PlaceMemoryRepository {
         )
         do {
             try fileManager.moveItem(at: catalogURL, to: destination)
+            try? fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: destination.path)
         } catch {
             try? fileManager.removeItem(at: reasonURL)
             throw error
         }
+        try? SpatialStorageDirectory.maintainArtifacts(at: directoryURL, fileManager: fileManager)
     }
 
     private func prepareDirectory() throws {

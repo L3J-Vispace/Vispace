@@ -5,6 +5,109 @@ import XCTest
 @testable import Vispace
 
 final class SpatialStorageDirectoryTests: XCTestCase {
+    func testFutureCatalogSchemasStayInPlaceForEveryRepository() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for fixture in SpatialCatalogFixture.allCases {
+            let directory = root.appendingPathComponent(fixture.fileName)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: fixture.emptyCatalogData()) as? [String: Any])
+            object["schemaVersion"] = 99
+            let data = try JSONSerialization.data(withJSONObject: object)
+            let file = directory.appendingPathComponent(fixture.fileName)
+            try data.write(to: file)
+            for _ in 0..<2 {
+                do { _ = try await fixture.recordCount(at: directory); XCTFail("Expected compatibility failure") }
+                catch { XCTAssertEqual(error as? SpatialStorageError, .unsupportedSchema(actual: 99)) }
+                XCTAssertEqual(try Data(contentsOf: file), data)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("Quarantine").path))
+            }
+        }
+    }
+
+    func testCatalogAndDirectorySymlinksCannotReachExternalData() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let external = root.appendingPathComponent("external.json")
+        let bytes = try JSONEncoder().encode(PlaceMemoryCatalogSnapshot())
+        try bytes.write(to: external)
+        let directory = root.appendingPathComponent("store")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: directory.appendingPathComponent(PlaceMemoryRepository.catalogFileName), withDestinationURL: external)
+        do { _ = try await PlaceMemoryRepository(directoryURL: directory).catalogSnapshot(); XCTFail("Expected link rejection") }
+        catch { XCTAssertEqual(error as? SpatialStorageError, .unsafePath) }
+        let link = root.appendingPathComponent("linked-store")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: directory)
+        XCTAssertThrowsError(try SpatialStorageDirectory.prepare(at: link)) { error in
+            XCTAssertEqual(error as? SpatialStorageError, .unsafePath)
+        }
+        XCTAssertEqual(try Data(contentsOf: external), bytes)
+    }
+
+    func testLowDiskSpaceRejectsAtomicWriteWithoutReplacingCatalog() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try SpatialStorageDirectory.prepare(at: root)
+        let destination = root.appendingPathComponent("catalog.json")
+        let original = Data("original".utf8)
+        try original.write(to: destination)
+        XCTAssertThrowsError(try SpatialStorageDirectory.atomicWrite(
+            Data("replacement".utf8), to: destination, directory: root,
+            fileManager: FullDiskSpatialFileManager()
+        )) { error in
+            guard let storageError = error as? SpatialStorageError, case .insufficientFreeSpace = storageError else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertEqual(try Data(contentsOf: destination), original)
+    }
+
+    func testDeletionCanUseReservedHeadroomWhileStillRequiringAtomicWriteSpace() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try SpatialStorageDirectory.prepare(at: root)
+        let destination = root.appendingPathComponent("catalog.json")
+        try Data(repeating: 1, count: 100).write(to: destination)
+        let reduced = Data("{}".utf8)
+        let manager = FullDiskSpatialFileManager(freeBytes: 10)
+        XCTAssertThrowsError(try SpatialStorageDirectory.atomicWrite(reduced, to: destination, directory: root, fileManager: manager))
+        try SpatialStorageDirectory.atomicWrite(reduced, to: destination, directory: root, fileManager: manager, reclaiming: true)
+        XCTAssertEqual(try Data(contentsOf: destination), reduced)
+        XCTAssertThrowsError(try SpatialStorageDirectory.atomicWrite(Data(repeating: 0, count: 11), to: destination, directory: root, fileManager: manager, reclaiming: true))
+        XCTAssertEqual(try Data(contentsOf: destination), reduced)
+    }
+
+    func testFractionalSchemaDoesNotTruncateToSupportedVersion() throws {
+        XCTAssertThrowsError(try SpatialStorageDirectory.validateJSONSchemas(Data("{\"schemaVersion\":1.9}".utf8))) { error in
+            XCTAssertTrue(error is DecodingError)
+        }
+        XCTAssertThrowsError(try SpatialStorageDirectory.validateJSONSchemas(Data("{\"schemaVersion\":1,\"schema\":{\"version\":2}}".utf8))) { error in
+            XCTAssertEqual(error as? SpatialStorageError, .unsupportedSchema(actual: 2))
+        }
+    }
+
+    func testMaintenanceBoundsQuarantineAndPreservesUnknownFiles() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let quarantine = root.appendingPathComponent("Quarantine")
+        try SpatialStorageDirectory.prepare(at: quarantine)
+        let now = Date()
+        for index in 0..<70 {
+            let file = quarantine.appendingPathComponent("place-memory-v1.\(UUID().uuidString).json.quarantined")
+            try Data([UInt8(index)]).write(to: file)
+            try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(Double(index) - 100)], ofItemAtPath: file.path)
+        }
+        let unknown = quarantine.appendingPathComponent("keep.reason.txt")
+        try Data("keep".utf8).write(to: unknown)
+        let staged = root.appendingPathComponent(".\(UUID().uuidString).\(UUID().uuidString).staged")
+        try Data("abandoned".utf8).write(to: staged)
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-90_000)], ofItemAtPath: staged.path)
+        try SpatialStorageDirectory.maintainArtifacts(at: root, now: now)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: quarantine.path).count, 65)
+        XCTAssertEqual(try Data(contentsOf: unknown), Data("keep".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staged.path))
+    }
     func testPolicyRequestsProtectionForNewAndExistingDirectories() throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -241,6 +344,17 @@ final class SpatialStorageDirectoryTests: XCTestCase {
             "vispace-storage-policy-tests-\(UUID().uuidString)",
             isDirectory: true
         )
+    }
+}
+
+private final class FullDiskSpatialFileManager: FileManager, @unchecked Sendable {
+    private let freeBytes: Int64
+    init(freeBytes: Int64 = 0) {
+        self.freeBytes = freeBytes
+        super.init()
+    }
+    override func attributesOfFileSystem(forPath path: String) throws -> [FileAttributeKey: Any] {
+        [.systemFreeSize: NSNumber(value: freeBytes)]
     }
 }
 

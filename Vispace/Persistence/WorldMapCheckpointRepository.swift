@@ -247,12 +247,12 @@ public actor WorldMapCheckpointRepository {
     /// Returns the newest valid checkpoint. Invalid candidates are preserved in
     /// quarantine with a reason, marked in metadata, and older checkpoints are
     /// tried in descending update order.
-    public func loadLatestValidCheckpoint() async throws -> WorldMapRestoreCandidate? {
+    public func loadLatestValidCheckpoint(mapID: MapID? = nil) async throws -> WorldMapRestoreCandidate? {
         try Task.checkCancellation()
         await operationGate.acquire()
         do {
             try Task.checkCancellation()
-            let candidate = try await loadLatestValidCheckpointLocked()
+            let candidate = try await loadLatestValidCheckpointLocked(mapID: mapID)
             await operationGate.release()
             return candidate
         } catch {
@@ -261,13 +261,13 @@ public actor WorldMapCheckpointRepository {
         }
     }
 
-    private func loadLatestValidCheckpointLocked() async throws -> WorldMapRestoreCandidate? {
+    private func loadLatestValidCheckpointLocked(mapID: MapID?) async throws -> WorldMapRestoreCandidate? {
         try Task.checkCancellation()
         var document = try loadDocumentRecoveringInvalidCatalog()
         await reconcileDetachedBlobs(referencedBy: document)
         try Task.checkCancellation()
         let orderedIndices = document.maps.indices
-            .filter { document.maps[$0].availability == .active }
+            .filter { document.maps[$0].availability == .active && (mapID == nil || document.maps[$0].mapID == mapID) }
             .sorted { lhs, rhs in
                 let left = document.maps[lhs]
                 let right = document.maps[rhs]
@@ -428,7 +428,7 @@ public actor WorldMapCheckpointRepository {
                 continue
             } catch {
                 logger.error(
-                    "Deferred checkpoint quarantine retry failed: \(String(describing: error), privacy: .public)"
+                    "Deferred checkpoint quarantine retry failed: \(String(describing: error), privacy: .private)"
                 )
             }
         }
@@ -440,7 +440,7 @@ public actor WorldMapCheckpointRepository {
             activeBlobIDs = try await blobStore.activeBlobIDs()
         } catch {
             logger.error(
-                "Checkpoint orphan enumeration failed: \(String(describing: error), privacy: .public)"
+                "Checkpoint orphan enumeration failed: \(String(describing: error), privacy: .private)"
             )
             return
         }
@@ -455,7 +455,7 @@ public actor WorldMapCheckpointRepository {
                 continue
             } catch {
                 logger.error(
-                    "Detached checkpoint quarantine failed: \(String(describing: error), privacy: .public)"
+                    "Detached checkpoint quarantine failed: \(String(describing: error), privacy: .private)"
                 )
             }
         }
@@ -488,12 +488,11 @@ public actor WorldMapCheckpointRepository {
         case .emptyArchive,
             .archiveTooLarge,
             .encodedBlobTooLarge,
-            .unsupportedEnvelopeVersion,
             .invalidEnvelope,
             .checksumMismatch,
             .postWriteVerificationFailed:
             return true
-        case .blobAlreadyExists, .blobNotFound:
+        case .blobAlreadyExists, .blobNotFound, .unsupportedEnvelopeVersion:
             return false
         }
     }
@@ -504,6 +503,7 @@ public actor WorldMapCheckpointRepository {
             fileManager: fileManager,
             createIfMissing: false
         )
+        try SpatialStorageDirectory.validatePath(at: metadataURL, fileManager: fileManager)
         guard fileManager.fileExists(atPath: metadataURL.path) else {
             return SpatialMetadataDocument()
         }
@@ -512,8 +512,7 @@ public actor WorldMapCheckpointRepository {
         do {
             data = try readBoundedMetadata()
         } catch let error as WorldMapCheckpointRepositoryError {
-            try quarantineMetadata(reason: String(describing: error))
-            return SpatialMetadataDocument()
+            return try recoverMetadataAfterCorruption(reason: String(describing: error))
         } catch {
             // Transient protection or filesystem failures are not evidence of
             // corruption and must not move a potentially valid catalog.
@@ -521,15 +520,66 @@ public actor WorldMapCheckpointRepository {
         }
 
         do {
+            try SpatialStorageDirectory.validateJSONSchemas(data, allowsLegacyRoot: true)
             return try SpatialMetadataMigrator.decodeAndMigrate(data)
+        } catch let error as SpatialStorageError {
+            throw error
         } catch {
-            try quarantineMetadata(reason: String(describing: error))
-            return SpatialMetadataDocument()
+            return try recoverMetadataAfterCorruption(reason: String(describing: error))
         }
     }
 
-    private func readBoundedMetadata() throws -> Data {
-        let handle = try FileHandle(forReadingFrom: metadataURL)
+    /// Run while capture and perception have drained. Deleting bytes first
+    /// keeps the catalog available to retry an interrupted explicit deletion.
+    public func deleteMap(mapID: MapID) async throws {
+        try Task.checkCancellation()
+        await operationGate.acquire()
+        do {
+            try Task.checkCancellation()
+            var document = try loadDocumentRecoveringInvalidCatalog()
+            for metadata in document.maps where metadata.mapID == mapID {
+                try await blobStore.deleteArchive(id: WorldMapBlobID(rawValue: metadata.worldMapBlobID))
+                try Task.checkCancellation()
+            }
+            document.maps.removeAll { $0.mapID == mapID }
+            document.objects.removeAll { $0.mapID == mapID }
+            try commit(document, preservePrevious: false)
+            await operationGate.release()
+        } catch {
+            await operationGate.release()
+            throw error
+        }
+    }
+
+    private var backupURL: URL { directoryURL.appendingPathComponent("spatial-metadata-v1.previous.json") }
+
+    private func recoverMetadataAfterCorruption(reason: String) throws -> SpatialMetadataDocument {
+        // Validate the backup before touching either file. An incompatible or
+        // temporarily inaccessible backup is not evidence of corruption.
+        var recovered: SpatialMetadataDocument?
+        var backupData: Data?
+        try SpatialStorageDirectory.validatePath(at: backupURL, fileManager: fileManager)
+        if fileManager.fileExists(atPath: backupURL.path) {
+            let data = try readBoundedMetadata(at: backupURL)
+            do {
+                try SpatialStorageDirectory.validateJSONSchemas(data, allowsLegacyRoot: true)
+                recovered = try SpatialMetadataMigrator.decodeAndMigrate(data)
+                backupData = data
+            } catch let error as SpatialStorageError { throw error }
+            catch { /* Preserve an invalid backup for explicit inspection. */ }
+        }
+        try quarantineMetadata(reason: reason)
+        if let recovered, let backupData {
+            try SpatialStorageDirectory.atomicWrite(backupData, to: metadataURL, directory: directoryURL, fileManager: fileManager)
+            return recovered
+        }
+        return SpatialMetadataDocument()
+    }
+
+    private func readBoundedMetadata(at source: URL? = nil) throws -> Data {
+        let source = source ?? metadataURL
+        try SpatialStorageDirectory.validateRegularFile(at: source, fileManager: fileManager)
+        let handle = try FileHandle(forReadingFrom: source)
         defer { try? handle.close() }
         let readLimit = Self.maximumMetadataBytes + 1
         var data = Data()
@@ -552,7 +602,7 @@ public actor WorldMapCheckpointRepository {
         return data
     }
 
-    private func commit(_ document: SpatialMetadataDocument) throws {
+    private func commit(_ document: SpatialMetadataDocument, preservePrevious: Bool = true) throws {
         try document.validate()
         try prepareDirectory()
         let encoder = JSONEncoder()
@@ -564,13 +614,23 @@ public actor WorldMapCheckpointRepository {
                 maximum: Self.maximumMetadataBytes
             )
         }
-        try data.write(
-            to: metadataURL,
-            options: [.atomic, .completeFileProtectionUnlessOpen]
+        if !preservePrevious || !fileManager.fileExists(atPath: metadataURL.path) {
+            // Update the recovery copy before publishing deletion, so even a
+            // crash between these writes cannot recover a deleted place.
+            try SpatialStorageDirectory.atomicWrite(data, to: backupURL, directory: directoryURL, fileManager: fileManager, reclaiming: !preservePrevious)
+        } else if fileManager.fileExists(atPath: metadataURL.path) {
+            let previous = try readBoundedMetadata()
+            try SpatialStorageDirectory.validateJSONSchemas(previous, allowsLegacyRoot: true)
+            _ = try SpatialMetadataMigrator.decodeAndMigrate(previous)
+            try SpatialStorageDirectory.atomicWrite(previous, to: backupURL, directory: directoryURL, fileManager: fileManager, reclaiming: !preservePrevious)
+        }
+        try SpatialStorageDirectory.atomicWrite(
+            data, to: metadataURL, directory: directoryURL, fileManager: fileManager, reclaiming: !preservePrevious
         )
     }
 
     private func quarantineMetadata(reason: String) throws {
+        try SpatialStorageDirectory.validatePath(at: metadataURL, fileManager: fileManager)
         guard fileManager.fileExists(atPath: metadataURL.path) else {
             return
         }
@@ -599,10 +659,12 @@ public actor WorldMapCheckpointRepository {
         )
         do {
             try fileManager.moveItem(at: metadataURL, to: destination)
+            try? fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: destination.path)
         } catch {
             try? fileManager.removeItem(at: reasonURL)
             throw error
         }
+        try? SpatialStorageDirectory.maintainArtifacts(at: directoryURL, fileManager: fileManager)
     }
 
     private func prepareDirectory() throws {

@@ -540,6 +540,14 @@ public actor TemporalSpatialMemoryJournalRepository {
         }
     }
 
+    public func deleteMap(mapID: MapID) async throws {
+        try Task.checkCancellation()
+        var catalog = try loadCatalogRecoveringInvalidData()
+        catalog.journals.removeAll { $0.mapID == mapID }
+        try Task.checkCancellation()
+        try commit(catalog, reclaiming: true)
+    }
+
     private func loadCatalogRecoveringInvalidData() throws
         -> TemporalSpatialMemoryJournalCatalog
     {
@@ -548,6 +556,7 @@ public actor TemporalSpatialMemoryJournalRepository {
             fileManager: fileManager,
             createIfMissing: false
         )
+        try SpatialStorageDirectory.validatePath(at: catalogURL, fileManager: fileManager)
         guard fileManager.fileExists(atPath: catalogURL.path) else {
             return try TemporalSpatialMemoryJournalCatalog()
         }
@@ -565,10 +574,13 @@ public actor TemporalSpatialMemoryJournalRepository {
         }
 
         do {
+            try SpatialStorageDirectory.validateJSONSchemas(data)
             return try JSONDecoder().decode(
                 TemporalSpatialMemoryJournalCatalog.self,
                 from: data
             )
+        } catch let error as SpatialStorageError {
+            throw error
         } catch {
             try quarantineCatalog(reason: String(describing: error))
             return try TemporalSpatialMemoryJournalCatalog()
@@ -576,6 +588,7 @@ public actor TemporalSpatialMemoryJournalRepository {
     }
 
     private func readBoundedCatalog() throws -> Data {
+        try SpatialStorageDirectory.validateRegularFile(at: catalogURL, fileManager: fileManager)
         let handle = try FileHandle(forReadingFrom: catalogURL)
         defer { try? handle.close() }
         let readLimit = Self.maximumCatalogBytes + 1
@@ -618,7 +631,7 @@ public actor TemporalSpatialMemoryJournalRepository {
         }
     }
 
-    private func commit(_ catalog: TemporalSpatialMemoryJournalCatalog) throws {
+    private func commit(_ catalog: TemporalSpatialMemoryJournalCatalog, reclaiming: Bool = false) throws {
         try validateConfiguredCapacity(catalog)
         try prepareDirectory()
         let encoder = JSONEncoder()
@@ -630,13 +643,13 @@ public actor TemporalSpatialMemoryJournalRepository {
                 maximum: Self.maximumCatalogBytes
             )
         }
-        try data.write(
-            to: catalogURL,
-            options: [.atomic, .completeFileProtectionUnlessOpen]
+        try SpatialStorageDirectory.atomicWrite(
+            data, to: catalogURL, directory: directoryURL, fileManager: fileManager, reclaiming: reclaiming
         )
     }
 
     private func quarantineCatalog(reason: String) throws {
+        try SpatialStorageDirectory.validatePath(at: catalogURL, fileManager: fileManager)
         guard fileManager.fileExists(atPath: catalogURL.path) else {
             return
         }
@@ -664,10 +677,12 @@ public actor TemporalSpatialMemoryJournalRepository {
         )
         do {
             try fileManager.moveItem(at: catalogURL, to: destination)
+            try? fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: destination.path)
         } catch {
             try? fileManager.removeItem(at: reasonURL)
             throw error
         }
+        try? SpatialStorageDirectory.maintainArtifacts(at: directoryURL, fileManager: fileManager)
     }
 
     private func prepareDirectory() throws {

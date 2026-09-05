@@ -54,6 +54,7 @@ public enum WorldMapBlobStoreError: Error, Equatable, Sendable {
 /// Stores only secure-coded ARWorldMap archives. Camera/depth pixel buffers have
 /// no persistence entry point, and arbitrary Data fails secure type validation.
 public actor ARWorldMapBlobStore {
+    private struct VersionProbe: Decodable { let version: Int }
     struct Envelope: Codable, Sendable {
         let magic: String
         let version: Int
@@ -148,10 +149,13 @@ public actor ARWorldMapBlobStore {
         }
 
         let destination = fileURL(for: id)
+        try SpatialStorageDirectory.validatePath(at: destination, fileManager: fileManager)
         guard !fileManager.fileExists(atPath: destination.path) else {
             throw WorldMapBlobStoreError.blobAlreadyExists
         }
-        try publish(encoded, to: destination, id: id)
+        try SpatialStorageDirectory.withWriteBudget(bytes: encoded.count, at: directoryURL, fileManager: fileManager) {
+            try publish(encoded, to: destination, id: id)
+        }
 
         do {
             let verified = try loadEnvelope(at: destination, expectedID: id)
@@ -179,6 +183,7 @@ public actor ARWorldMapBlobStore {
 
     public func loadArchive(id: WorldMapBlobID) throws -> Data {
         let source = fileURL(for: id)
+        try SpatialStorageDirectory.validatePath(at: source, fileManager: fileManager)
         guard fileManager.fileExists(atPath: source.path) else {
             throw WorldMapBlobStoreError.blobNotFound
         }
@@ -188,7 +193,8 @@ public actor ARWorldMapBlobStore {
     }
 
     public func contains(id: WorldMapBlobID) -> Bool {
-        fileManager.fileExists(atPath: fileURL(for: id).path)
+        guard (try? SpatialStorageDirectory.validatePath(at: fileURL(for: id), fileManager: fileManager)) != nil else { return false }
+        return fileManager.fileExists(atPath: fileURL(for: id).path)
     }
 
     /// Enumerates only typed checkpoint files in the dedicated world-map
@@ -217,6 +223,7 @@ public actor ARWorldMapBlobStore {
                 else {
                     return nil
                 }
+                try SpatialStorageDirectory.validateRegularFile(at: url, fileManager: fileManager)
                 return WorldMapBlobID(rawValue: rawValue)
             }
     }
@@ -226,12 +233,33 @@ public actor ARWorldMapBlobStore {
     /// `quarantine` instead and are never deleted through this path.
     public func removeSupersededArchive(id: WorldMapBlobID) throws {
         let source = fileURL(for: id)
+        try SpatialStorageDirectory.validatePath(at: source, fileManager: fileManager)
         guard fileManager.fileExists(atPath: source.path) else {
             return
         }
         let envelope = try loadEnvelope(at: source, expectedID: id)
         try archiveValidator(envelope.archive)
         try fileManager.removeItem(at: source)
+    }
+
+    /// Explicit user deletion is allowed to remove corrupt bytes, unlike
+    /// automatic checkpoint pruning. Also removes this ID's quarantine files.
+    public func deleteArchive(id: WorldMapBlobID) throws {
+        let source = fileURL(for: id)
+        try SpatialStorageDirectory.validatePath(at: source, fileManager: fileManager)
+        if fileManager.fileExists(atPath: source.path) {
+            try SpatialStorageDirectory.validateRegularFile(at: source, fileManager: fileManager)
+            try fileManager.removeItem(at: source)
+        }
+        let quarantine = directoryURL.appendingPathComponent("Quarantine")
+        try SpatialStorageDirectory.validatePath(at: quarantine, fileManager: fileManager)
+        if fileManager.fileExists(atPath: quarantine.path) {
+            for url in try fileManager.contentsOfDirectory(at: quarantine, includingPropertiesForKeys: nil)
+            where url.lastPathComponent.hasPrefix(id.rawValue.uuidString.lowercased() + ".") {
+                try SpatialStorageDirectory.validateRegularFile(at: url, fileManager: fileManager)
+                try fileManager.removeItem(at: url)
+            }
+        }
     }
 
     /// Moves one exact invalid blob into a protected quarantine directory and
@@ -244,9 +272,16 @@ public actor ARWorldMapBlobStore {
         quarantinedAt: Date = Date()
     ) throws -> WorldMapQuarantineRecord {
         let source = fileURL(for: id)
+        try SpatialStorageDirectory.validatePath(at: source, fileManager: fileManager)
         guard fileManager.fileExists(atPath: source.path) else {
             throw WorldMapBlobStoreError.blobNotFound
         }
+        try SpatialStorageDirectory.validateRegularFile(at: source, fileManager: fileManager)
+        // Compatibility is not corruption, including for a detached blob.
+        let encoded = try readEncodedBlob(at: source)
+        if let probe = try? PropertyListDecoder().decode(VersionProbe.self, from: encoded),
+            probe.version != Self.version
+        { throw WorldMapBlobStoreError.unsupportedEnvelopeVersion(probe.version) }
         try prepareDirectory()
 
         let quarantineDirectory = directoryURL.appendingPathComponent(
@@ -283,10 +318,12 @@ public actor ARWorldMapBlobStore {
 
         do {
             try fileManager.moveItem(at: source, to: destination)
+            try? fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: destination.path)
         } catch {
             try? fileManager.removeItem(at: reasonURL)
             throw error
         }
+        try? SpatialStorageDirectory.maintainArtifacts(at: directoryURL, fileManager: fileManager)
 
         return WorldMapQuarantineRecord(
             id: id,
@@ -349,6 +386,9 @@ public actor ARWorldMapBlobStore {
             )
         }
 
+        if let probe = try? PropertyListDecoder().decode(VersionProbe.self, from: encoded),
+            probe.version != Self.version
+        { throw WorldMapBlobStoreError.unsupportedEnvelopeVersion(probe.version) }
         let envelope: Envelope
         do {
             envelope = try PropertyListDecoder().decode(Envelope.self, from: encoded)
@@ -388,6 +428,7 @@ public actor ARWorldMapBlobStore {
             fileManager: fileManager,
             createIfMissing: false
         )
+        try SpatialStorageDirectory.validateRegularFile(at: fileURL, fileManager: fileManager)
         let handle = try FileHandle(forReadingFrom: fileURL)
         defer { try? handle.close() }
 

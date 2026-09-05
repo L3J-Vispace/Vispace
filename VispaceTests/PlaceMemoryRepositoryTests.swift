@@ -5,6 +5,52 @@ import XCTest
 @testable import Vispace
 
 final class PlaceMemoryRepositoryTests: XCTestCase {
+    func testAcknowledgedMutationsRetireDurablyWithoutPermittingStaleReplay() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = PlaceMemoryRepository(directoryURL: root, maximumAssociationStates: 1)
+        let completed = try PlaceAssociationStateRecord(
+            context: PlaceAssociationContext(sourceMapID: nil, sourceCoordinateFrameID: coordinateFrameID(1)),
+            observations: [observation(index: 0), observation(index: 1)],
+            createdAt: 1, updatedAt: 3
+        )
+        XCTAssertEqual(completed.latestDecision.mutation, .createNewMap)
+        try await repository.upsertAssociationState(completed)
+        let incoming = try deferredState(index: 2, createdAt: 20, count: 1)
+        await assertThrowsPlaceMemoryError(
+            { try await repository.upsertAssociationState(incoming, retention: .retireCompletedAttempts) },
+            equals: .associationStateCapacityReached(maximum: 1)
+        )
+        await assertThrowsPlaceMemoryError(
+            { try await repository.acknowledgeAssociationMutation(id: completed.id, revision: completed.revision - 1) },
+            equals: .invalidMutationAcknowledgement(id: completed.id)
+        )
+        try await repository.acknowledgeAssociationMutation(id: completed.id, revision: completed.revision)
+        try await repository.acknowledgeAssociationMutation(id: completed.id, revision: completed.revision)
+        let restarted = PlaceMemoryRepository(directoryURL: root, maximumAssociationStates: 1)
+        try await restarted.upsertAssociationState(incoming, retention: .retireCompletedAttempts)
+        let catalog = try await restarted.catalogSnapshot()
+        XCTAssertEqual(catalog.associationStates, [incoming])
+        XCTAssertTrue(catalog.acknowledgedMutationRevisions.isEmpty)
+        await assertThrowsPlaceMemoryError(
+            { try await restarted.upsertAssociationState(completed, retention: .retireCompletedAttempts) },
+            equals: .retiredAssociationState(id: completed.id)
+        )
+    }
+
+    func testDeletingOnePlaceFreesFingerprintCapacityAndPreservesOtherPlace() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = PlaceMemoryRepository(directoryURL: root, maximumFingerprints: 2)
+        let first = try fingerprintRecord(index: 1, updatedAt: 2)
+        let second = try fingerprintRecord(index: 2, updatedAt: 3)
+        try await repository.upsertFingerprint(first)
+        try await repository.upsertFingerprint(second)
+        try await repository.deleteMap(mapID: first.mapID)
+        let records = try await repository.listFingerprints()
+        XCTAssertEqual(records, [second])
+        try await repository.upsertFingerprint(fingerprintRecord(index: 3, updatedAt: 4))
+    }
     func testFingerprintRoundTripIsDeterministicAndPrivacyBounded() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

@@ -335,17 +335,27 @@ public actor SceneGraphRepository {
         return .applied(record)
     }
 
+    public func deleteMap(mapID: MapID) async throws {
+        try Task.checkCancellation()
+        var catalog = try loadRecoveringInvalidData()
+        catalog.records.removeAll { $0.mapID == mapID }
+        try Task.checkCancellation()
+        try commit(catalog, reclaiming: true)
+    }
+
     private func loadRecoveringInvalidData() throws -> SceneGraphCatalogSnapshot {
         try SpatialStorageDirectory.prepare(
             at: directoryURL,
             fileManager: fileManager,
             createIfMissing: false
         )
+        try SpatialStorageDirectory.validatePath(at: catalogURL, fileManager: fileManager)
         guard fileManager.fileExists(atPath: catalogURL.path) else {
             return try SceneGraphCatalogSnapshot()
         }
         do {
             let data = try readBounded()
+            try SpatialStorageDirectory.validateJSONSchemas(data)
             return try JSONDecoder().decode(SceneGraphCatalogSnapshot.self, from: data)
         } catch let error as SceneGraphRepositoryError {
             guard case .catalogTooLarge = error else {
@@ -360,6 +370,7 @@ public actor SceneGraphRepository {
     }
 
     private func readBounded() throws -> Data {
+        try SpatialStorageDirectory.validateRegularFile(at: catalogURL, fileManager: fileManager)
         let handle = try FileHandle(forReadingFrom: catalogURL)
         defer { try? handle.close() }
         var data = Data()
@@ -384,7 +395,7 @@ public actor SceneGraphRepository {
         }
     }
 
-    private func commit(_ catalog: SceneGraphCatalogSnapshot) throws {
+    private func commit(_ catalog: SceneGraphCatalogSnapshot, reclaiming: Bool = false) throws {
         try validateConfiguredCapacity(catalog)
         try prepareDirectory()
         let encoder = JSONEncoder()
@@ -396,13 +407,13 @@ public actor SceneGraphRepository {
                 maximum: Self.maximumCatalogBytes
             )
         }
-        try data.write(
-            to: catalogURL,
-            options: [.atomic, .completeFileProtectionUnlessOpen]
+        try SpatialStorageDirectory.atomicWrite(
+            data, to: catalogURL, directory: directoryURL, fileManager: fileManager, reclaiming: reclaiming
         )
     }
 
     private func quarantine(reason: String) throws {
+        try SpatialStorageDirectory.validatePath(at: catalogURL, fileManager: fileManager)
         guard fileManager.fileExists(atPath: catalogURL.path) else {
             return
         }
@@ -417,12 +428,14 @@ public actor SceneGraphRepository {
             "scene-graphs-v1.\(nonce).json.quarantined"
         )
         try fileManager.moveItem(at: catalogURL, to: destination)
+        try? fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: destination.path)
         try Data(String(reason.prefix(2_048)).utf8).write(
             to: quarantine.appendingPathComponent(
                 "scene-graphs-v1.\(nonce).reason.txt"
             ),
             options: [.atomic, .completeFileProtectionUnlessOpen]
         )
+        try? SpatialStorageDirectory.maintainArtifacts(at: directoryURL, fileManager: fileManager)
     }
 
     private func prepareDirectory() throws {

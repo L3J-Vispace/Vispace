@@ -5,6 +5,61 @@ import XCTest
 @testable import Vispace
 
 final class WorldMapCheckpointRepositoryTests: XCTestCase {
+    func testFutureWorldMapEnvelopeIsNotQuarantinedOrUnpublished() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = makeRepository(root: root)
+        let metadata = try await repository.saveCheckpoint(archive: Data("first".utf8), captureIdentity: ARCaptureIdentity(status: .confirmed))
+        let url = root.appendingPathComponent("WorldMaps/\(metadata.worldMapBlobID.uuidString.lowercased()).vispacemap")
+        let original = try PropertyListDecoder().decode(ARWorldMapBlobStore.Envelope.self, from: Data(contentsOf: url))
+        let future = ARWorldMapBlobStore.Envelope(
+            magic: original.magic, version: original.version + 1, id: original.id,
+            createdAt: original.createdAt, archive: original.archive, sha256: original.sha256
+        )
+        let bytes = try PropertyListEncoder().encode(future)
+        try bytes.write(to: url)
+        await assertThrowsErrorAsync { try await repository.loadLatestValidCheckpoint() } verify: { error in
+            XCTAssertEqual(error as? WorldMapBlobStoreError, .unsupportedEnvelopeVersion(future.version))
+        }
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        let catalog = try await repository.metadataSnapshot()
+        XCTAssertEqual(catalog.maps.first?.availability, .active)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("WorldMaps/Quarantine").path))
+    }
+    func testCorruptCatalogRecoversVerifiedPreviousRevision() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = makeRepository(root: root)
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let first = try await repository.saveCheckpoint(archive: Data("first".utf8), captureIdentity: identity)
+        _ = try await repository.saveCheckpoint(archive: Data("second".utf8), captureIdentity: ARCaptureIdentity(
+            coordinateFrameID: identity.coordinateFrameID, segmentID: identity.segmentID,
+            mapID: first.mapID, status: .confirmed
+        ))
+        try Data("corrupt".utf8).write(to: root.appendingPathComponent("spatial-metadata-v1.json"))
+        let recovered = try await makeRepository(root: root).loadLatestValidCheckpoint()
+        XCTAssertEqual(recovered?.metadata, first)
+        XCTAssertEqual(recovered?.archive, Data("first".utf8))
+    }
+
+    func testDeletePlaceUpdatesRecoveryCopyAndAllowsSelectingAnotherPlace() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = makeRepository(root: root)
+        let first = try await repository.saveCheckpoint(archive: Data("first".utf8), captureIdentity: ARCaptureIdentity(status: .confirmed))
+        let second = try await repository.saveCheckpoint(archive: Data("second".utf8), captureIdentity: ARCaptureIdentity(status: .confirmed))
+        let selected = try await repository.loadLatestValidCheckpoint(mapID: first.mapID)
+        XCTAssertEqual(selected?.metadata.mapID, first.mapID)
+        try await repository.deleteMap(mapID: first.mapID)
+        let missing = try await repository.loadLatestValidCheckpoint(mapID: first.mapID)
+        XCTAssertNil(missing)
+        let backup = try SpatialMetadataMigrator.decodeAndMigrate(Data(contentsOf: root.appendingPathComponent("spatial-metadata-v1.previous.json")))
+        XCTAssertFalse(backup.maps.contains { $0.mapID == first.mapID })
+        try Data("corrupt".utf8).write(to: root.appendingPathComponent("spatial-metadata-v1.json"))
+        let recovered = try await makeRepository(root: root).loadLatestValidCheckpoint()
+        XCTAssertEqual(recovered?.metadata.mapID, second.mapID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("WorldMaps/\(first.worldMapBlobID.uuidString.lowercased()).vispacemap").path))
+    }
     func testCheckpointIsRestoredWithCoordinateIdentity() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

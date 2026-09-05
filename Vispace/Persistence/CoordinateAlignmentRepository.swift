@@ -603,6 +603,14 @@ public actor CoordinateAlignmentRepository {
         }
     }
 
+    public func deleteMap(mapID: MapID) async throws {
+        try Task.checkCancellation()
+        var catalog = try loadCatalogRecoveringInvalidData()
+        catalog.alignments.removeAll { $0.sourceMapID == mapID || $0.targetMapID == mapID }
+        try Task.checkCancellation()
+        try commit(catalog, reclaiming: true)
+    }
+
     private func loadCatalogRecoveringInvalidData() throws
         -> CoordinateAlignmentCatalogSnapshot
     {
@@ -611,6 +619,7 @@ public actor CoordinateAlignmentRepository {
             fileManager: fileManager,
             createIfMissing: false
         )
+        try SpatialStorageDirectory.validatePath(at: catalogURL, fileManager: fileManager)
         guard fileManager.fileExists(atPath: catalogURL.path) else {
             return try CoordinateAlignmentCatalogSnapshot()
         }
@@ -631,12 +640,15 @@ public actor CoordinateAlignmentRepository {
         }
 
         do {
+            try SpatialStorageDirectory.validateJSONSchemas(data)
             let catalog = try JSONDecoder().decode(
                 CoordinateAlignmentCatalogSnapshot.self,
                 from: data
             )
             try validateGraphConsistency(catalog.alignments)
             return catalog
+        } catch let error as SpatialStorageError {
+            throw error
         } catch {
             try quarantineCatalog(reason: String(describing: error))
             return try CoordinateAlignmentCatalogSnapshot()
@@ -644,6 +656,7 @@ public actor CoordinateAlignmentRepository {
     }
 
     private func readBoundedCatalog() throws -> Data {
+        try SpatialStorageDirectory.validateRegularFile(at: catalogURL, fileManager: fileManager)
         let handle = try FileHandle(forReadingFrom: catalogURL)
         defer { try? handle.close() }
 
@@ -678,7 +691,7 @@ public actor CoordinateAlignmentRepository {
         }
     }
 
-    private func commit(_ catalog: CoordinateAlignmentCatalogSnapshot) throws {
+    private func commit(_ catalog: CoordinateAlignmentCatalogSnapshot, reclaiming: Bool = false) throws {
         try validateConfiguredCapacity(catalog)
         try prepareDirectory()
         let encoder = JSONEncoder()
@@ -690,13 +703,13 @@ public actor CoordinateAlignmentRepository {
                 maximum: Self.maximumCatalogBytes
             )
         }
-        try data.write(
-            to: catalogURL,
-            options: [.atomic, .completeFileProtectionUnlessOpen]
+        try SpatialStorageDirectory.atomicWrite(
+            data, to: catalogURL, directory: directoryURL, fileManager: fileManager, reclaiming: reclaiming
         )
     }
 
     private func quarantineCatalog(reason: String) throws {
+        try SpatialStorageDirectory.validatePath(at: catalogURL, fileManager: fileManager)
         guard fileManager.fileExists(atPath: catalogURL.path) else {
             return
         }
@@ -724,10 +737,12 @@ public actor CoordinateAlignmentRepository {
         )
         do {
             try fileManager.moveItem(at: catalogURL, to: destination)
+            try? fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: destination.path)
         } catch {
             try? fileManager.removeItem(at: reasonURL)
             throw error
         }
+        try? SpatialStorageDirectory.maintainArtifacts(at: directoryURL, fileManager: fileManager)
     }
 
     private func prepareDirectory() throws {
