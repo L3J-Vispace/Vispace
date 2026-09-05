@@ -6,6 +6,95 @@ import simd
 
 @MainActor
 final class PlaceRecognitionControllerTests: XCTestCase {
+    func testVerifiedRoomAliasesDoNotCompeteDuringThirdAndFourthVisits() async throws {
+        let maps = (0..<4).map { _ in MapID() }
+        let frames = (0..<4).map { _ in CoordinateFrameID() }
+        let labels = ["chair", "lamp", "table"]
+        let positions = [
+            try Vec3(x: 0, y: 0.4, z: 0), try Vec3(x: 1.2, y: 0.4, z: 0.2),
+            try Vec3(x: 0.1, y: 0.4, z: 1.4),
+        ]
+        let objectSets = try (0..<4).map { index in
+            try zip(labels, positions).map { label, position in
+                try makeObject(label: label, position: position, frameID: frames[index], mapID: maps[index])
+            }
+        }
+        let allObjects = objectSets.flatMap { $0 }
+        // The fixture establishes the same physical object at each index;
+        // class similarity is not the identity authority in this test.
+        let verifiedPairs = Dictionary(
+            uniqueKeysWithValues: objectSets.flatMap { objects in
+                objects.enumerated().map { index, object in
+                    (object.object.id, Set(objectSets.map { $0[index].object.id }))
+                }
+            })
+        let resolver = PlaceCoordinateAlignmentResolver(identityVerifier: {
+            verifiedPairs[$0.source.objectID]?.contains($0.target.objectID) == true
+        })
+        let records = try (0..<2).map { index in
+            try PlaceFingerprintRecord(
+                mapID: maps[index], coordinateFrameID: frames[index],
+                fingerprint: ARPlaceFingerprintBuilder().makeFingerprint(
+                    from: makeSnapshot(frameID: frames[index], mapID: maps[index], revision: 1),
+                    objects: objectSets[index]), createdAt: 1, updatedAt: 1)
+        }
+        let initial = resolver.resolve(
+            current: makeSnapshot(frameID: frames[0], mapID: maps[0], revision: 1),
+            candidate: records[1], objects: allObjects)
+        let initialAlignment = try XCTUnwrap(initial.validatedAlignment)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let alignments = CoordinateAlignmentRepository(directoryURL: directory)
+        try await alignments.commitIfAbsent(
+            CoordinateAlignmentRecord(
+                sourceMapID: maps[0], sourceCoordinateFrameID: frames[0], targetMapID: maps[1],
+                targetCoordinateFrameID: frames[1], result: initialAlignment, createdAt: 1, updatedAt: 1))
+        let store = try RecordingPlaceStore(fingerprints: records)
+        let merges = LogicalMergeRecorder()
+        for visit in 2..<4 {
+            let channel = LatestValueChannel<ARSurfaceStateSnapshot>()
+            let controller = PlaceRecognitionController(
+                surfaces: channel.stream, objectMetadataProvider: { allObjects },
+                catalogProvider: { try await store.catalog() },
+                verifiedAlignmentCatalogProvider: { try await alignments.catalogSnapshot() },
+                fingerprintWriter: { await store.writeFingerprint($0) },
+                associationWriter: { await store.writeAssociation($0) },
+                coordinateCompatibilityProvider: { snapshot, candidate, objects in
+                    resolver.resolve(current: snapshot, candidate: candidate, objects: objects)
+                },
+                logicalMergeWriter: { commit in
+                    let alignment = try XCTUnwrap(commit.validatedAlignment)
+                    try await alignments.commitIfAbsent(
+                        CoordinateAlignmentRecord(
+                            sourceMapID: commit.sourceMapID,
+                            sourceCoordinateFrameID: commit.sourceCoordinateFrameID,
+                            targetMapID: commit.targetMapID,
+                            targetCoordinateFrameID: commit.targetCoordinateFrameID,
+                            result: alignment, createdAt: 2, updatedAt: 2))
+                    await merges.write(commit)
+                }, checkpointRequester: {})
+            controller.activate()
+            let segment = CaptureSegmentID()
+            for revision in 1...3 {
+                channel.send(
+                    makeSnapshot(
+                        frameID: frames[visit], segmentID: segment, mapID: maps[visit],
+                        revision: UInt64(revision)))
+                try await waitForIdle(
+                    controller, persistedAssociations: UInt64(revision),
+                    receivedSnapshots: UInt64(revision))
+            }
+            XCTAssertEqual(
+                controller.metrics.logicalMergesCommitted, 1,
+                "Verified aliases must produce one room candidate on visit \(visit + 1)")
+            controller.deactivate()
+        }
+        let commits = await merges.snapshot()
+        XCTAssertEqual(Set(commits.map(\.sourceMapID)), Set([maps[2], maps[3]]))
+        let finalCatalog = try await alignments.catalogSnapshot()
+        XCTAssertEqual(finalCatalog.alignments.count, 3)
+    }
+
     func testMappedPlacePersistsFingerprintOnceAndPublishesKnown() async throws {
         let channel = LatestValueChannel<ARSurfaceStateSnapshot>()
         let store = try RecordingPlaceStore()

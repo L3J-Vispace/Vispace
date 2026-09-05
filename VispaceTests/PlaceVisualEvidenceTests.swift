@@ -99,6 +99,61 @@ final class PlaceVisualEvidenceTests: XCTestCase {
         XCTAssertTrue(matches.isEmpty)
     }
 
+    func testVerifiedRoomAliasesSurviveRepeatedVisitsButDifferentRoomStillCompetes() async throws {
+        let fixture = try VisualFixture()
+        let aliasMap = MapID()
+        let aliasFrame = CoordinateFrameID()
+        let alias = fixture.target.map {
+            $0.replacing(mapID: aliasMap, frame: aliasFrame, objectID: ObjectID())
+        }
+        let thirdMap = MapID()
+        let thirdFrame = CoordinateFrameID()
+        let third = fixture.target.map {
+            $0.replacing(mapID: thirdMap, frame: thirdFrame, objectID: ObjectID())
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = CoordinateAlignmentRepository(directoryURL: directory)
+        try await repository.commitIfAbsent(visualAlignment(from: fixture.target, to: alias))
+        try await repository.commitIfAbsent(visualAlignment(from: alias, to: third))
+        let restarted = CoordinateAlignmentRepository(directoryURL: directory)
+        let catalog = try await restarted.catalogSnapshot()
+        let durable = fixture.target + alias + third
+        let objects = try fixture.objects + (alias + third).map(VisualFixture.metadata)
+        let matcher = PlaceVisualCorrespondenceMatcher()
+        func match(
+            _ records: [PlaceVisualLandmark], _ objects: [SpatialObjectMetadata],
+            _ catalog: CoordinateAlignmentCatalogSnapshot?
+        ) throws -> [CoordinateFrameAlignmentCorrespondence] {
+            try matcher.correspondences(
+                current: fixture.surface(), candidate: fixture.candidate,
+                live: fixture.source, durable: records, objects: objects, verifiedAlignments: catalog)
+        }
+        XCTAssertEqual(try match(durable, objects, catalog).count, 3)
+        XCTAssertTrue(try match(durable, objects, nil).isEmpty)
+        let unrelatedMap = MapID()
+        let unrelated = fixture.target.map { $0.replacing(mapID: unrelatedMap, objectID: ObjectID()) }
+        XCTAssertTrue(
+            try match(durable + unrelated, objects + unrelated.map(VisualFixture.metadata), catalog).isEmpty)
+        let repeated = fixture.target.map { $0.replacing(appearance: VisualFixture.descriptor(0)) }
+        XCTAssertTrue(try match(repeated + alias + third, objects, catalog).isEmpty)
+        let wrongFrame = alias.map { $0.replacing(frame: CoordinateFrameID()) }
+        XCTAssertTrue(
+            try match(
+                fixture.target + wrongFrame,
+                fixture.objects + wrongFrame.map(VisualFixture.metadata), catalog
+            ).isEmpty)
+        // Deleting a bridge retires its graph edges. A disconnected map must
+        // become a competitor again, even if an older matcher used the group.
+        try await restarted.deleteMap(mapID: aliasMap)
+        let afterDeletion = try await restarted.catalogSnapshot()
+        XCTAssertTrue(
+            try match(
+                fixture.target + third,
+                fixture.objects + third.map(VisualFixture.metadata), afterDeletion
+            ).isEmpty)
+    }
+
     func testOldWrongSegmentSingleCaptureAndRemovedEvidenceFailClosed() throws {
         let fixture = try VisualFixture()
         XCTAssertTrue(try fixture.match(surface: fixture.surface(timestamp: 20)).isEmpty)
@@ -188,6 +243,28 @@ final class PlaceVisualEvidenceTests: XCTestCase {
         let catalog = try JSONDecoder().decode(Catalog.self, from: Data(contentsOf: url))
         XCTAssertEqual(catalog.landmarks.count, 3)
         XCTAssertTrue(catalog.landmarks.allSatisfy { $0.mapID == fixture.sourceMap })
+    }
+
+    private func visualAlignment(
+        from source: [PlaceVisualLandmark], to target: [PlaceVisualLandmark]
+    ) throws -> CoordinateAlignmentRecord {
+        let correspondences = try zip(source, target).map { source, target in
+            try CoordinateFrameAlignmentCorrespondence(
+                source: CoordinateFrameAlignmentSourcePoint(
+                    objectID: source.objectID,
+                    coordinateFrameID: source.coordinateFrameID, semanticLabel: source.semanticLabel,
+                    position: source.position),
+                target: CoordinateFrameAlignmentTargetPoint(
+                    objectID: target.objectID,
+                    coordinateFrameID: target.coordinateFrameID, semanticLabel: target.semanticLabel,
+                    position: target.position),
+                identityConfidence: .one)
+        }
+        let result = try CoordinateFrameAlignmentEstimator().estimate(correspondences: correspondences)
+        return try CoordinateAlignmentRecord(
+            sourceMapID: source[0].mapID, sourceCoordinateFrameID: source[0].coordinateFrameID,
+            targetMapID: target[0].mapID, targetCoordinateFrameID: target[0].coordinateFrameID,
+            result: result, createdAt: 1, updatedAt: 1)
     }
 
     private func cameraFrame(uniform: Bool = false) throws -> ARFrameSnapshot {

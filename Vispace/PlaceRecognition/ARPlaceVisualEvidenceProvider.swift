@@ -114,20 +114,27 @@ struct PlaceVisualCorrespondenceMatcher: Sendable {
     func correspondences(
         current: ARSurfaceStateSnapshot, candidate: PlaceFingerprintRecord,
         live: [PlaceVisualLandmark], durable: [PlaceVisualLandmark],
-        objects: [SpatialObjectMetadata]
+        objects: [SpatialObjectMetadata],
+        verifiedAlignments: CoordinateAlignmentCatalogSnapshot? = nil
     ) throws -> [CoordinateFrameAlignmentCorrespondence] {
         let source = live.filter { record in
             record.isValid && PlaceVisualLandmark.admitsLabel(record.semanticLabel)
                 && record.supportingCaptureCount >= 2 && record.isFresh(for: current)
                 && objects.contains { record.matches($0) && $0.object.presence == .visible }
         }
-        // Include every other map in the runner-up test. A cloned appearance
-        // in two saved rooms must not be decided by catalog ordering.
+        let groups = VerifiedPlaceMapGroups(catalog: verifiedAlignments, objects: objects)
+        // Candidate-map landmarks still compete with one another. Only maps
+        // connected by accepted, frame-bound alignments are aliases; every
+        // other saved room remains an independent appearance competitor.
         let targets = durable.filter { record in
             record.isValid && PlaceVisualLandmark.admitsLabel(record.semanticLabel)
                 && record.supportingCaptureCount >= 2
                 && record.coordinateFrameID != current.coordinateFrameID
                 && objects.contains(where: record.matches)
+                && (record.mapID == candidate.mapID
+                    || !groups.contains(
+                        mapID: record.mapID, frameID: record.coordinateFrameID,
+                        inRoomOf: candidate.mapID, frameID: candidate.coordinateFrameID))
         }
         guard source.count >= 3, targets.count >= 3,
             Set(source.map(\.objectID)).count == source.count,
@@ -172,6 +179,58 @@ struct PlaceVisualCorrespondenceMatcher: Sendable {
         guard distances.count >= 2, let best = distances.first, best <= 0.12 else { return false }
         return distances[1] - best >= 0.10 && best <= distances[1] * 0.60
     }
+
+}
+
+/// Shared by appearance matching and the final map-association candidate list.
+/// Class labels or fingerprint similarity never create equivalence edges.
+struct VerifiedPlaceMapGroups: Sendable {
+    private var neighbors: [PlaceMapFrame: Set<PlaceMapFrame>] = [:]
+
+    init(catalog: CoordinateAlignmentCatalogSnapshot?, objects: [SpatialObjectMetadata]) {
+        guard let catalog else { return }
+        let activeFrames = Set(
+            objects.filter { $0.object.presence != .removed }.map {
+                PlaceMapFrame(mapID: $0.mapID, frameID: $0.position.coordinateFrameID)
+            })
+        for alignment in catalog.alignments {
+            let source = PlaceMapFrame(
+                mapID: alignment.sourceMapID, frameID: alignment.sourceCoordinateFrameID)
+            let target = PlaceMapFrame(
+                mapID: alignment.targetMapID, frameID: alignment.targetCoordinateFrameID)
+            guard activeFrames.contains(source), activeFrames.contains(target) else { continue }
+            neighbors[source, default: []].insert(target)
+            neighbors[target, default: []].insert(source)
+        }
+    }
+
+    func representative(mapID: MapID, frameID: CoordinateFrameID) -> MapID {
+        room(containing: PlaceMapFrame(mapID: mapID, frameID: frameID)).map(\.mapID).min() ?? mapID
+    }
+
+    func contains(
+        mapID: MapID, frameID: CoordinateFrameID,
+        inRoomOf originMapID: MapID, frameID originFrameID: CoordinateFrameID
+    ) -> Bool {
+        room(containing: PlaceMapFrame(mapID: originMapID, frameID: originFrameID))
+            .contains(PlaceMapFrame(mapID: mapID, frameID: frameID))
+    }
+
+    private func room(containing origin: PlaceMapFrame) -> Set<PlaceMapFrame> {
+        var room: Set<PlaceMapFrame> = [origin]
+        var pending = [origin]
+        while let current = pending.popLast() {
+            for next in neighbors[current, default: []] where room.insert(next).inserted {
+                pending.append(next)
+            }
+        }
+        return room
+    }
+}
+
+private struct PlaceMapFrame: Hashable, Sendable {
+    let mapID: MapID
+    let frameID: CoordinateFrameID
 }
 
 private struct LandmarkKey: Hashable {
@@ -317,7 +376,8 @@ public actor ARPlaceVisualEvidenceProvider {
 
     public func resolve(
         current snapshot: ARSurfaceStateSnapshot, candidate: PlaceFingerprintRecord,
-        objects: [SpatialObjectMetadata]
+        objects: [SpatialObjectMetadata],
+        verifiedAlignments: CoordinateAlignmentCatalogSnapshot? = nil
     ) throws -> PlaceCoordinateAlignmentResolution {
         try Task.checkCancellation()
         let now = Date().timeIntervalSince1970
@@ -326,7 +386,7 @@ public actor ARPlaceVisualEvidenceProvider {
             live: live.values.filter {
                 now - $0.capturedAt >= -0.25 && now - $0.capturedAt <= 3
             },
-            durable: load().landmarks, objects: objects
+            durable: load().landmarks, objects: objects, verifiedAlignments: verifiedAlignments
         )
         return PlaceCoordinateAlignmentResolver().resolve(
             current: snapshot, candidate: candidate, verifiedVisualCorrespondences: matches

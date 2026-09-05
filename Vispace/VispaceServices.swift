@@ -132,6 +132,7 @@ final class VispaceServices: ObservableObject {
                 try await placeMemoryRepository.catalogSnapshot()
             },
             visualHistogramProvider: { await placeVisualEvidence.visualHistogram(matching: $0) },
+            verifiedAlignmentCatalogProvider: { try await coordinateAlignmentRepository.catalogSnapshot() },
             fingerprintWriter: { record in
                 try await placeMemoryRepository.upsertFingerprint(record)
             },
@@ -145,11 +146,21 @@ final class VispaceServices: ObservableObject {
                 try await placeMemoryRepository.acknowledgeAssociationMutation(id: id, revision: revision)
             },
             coordinateCompatibilityProvider: { snapshot, candidate, objects in
-                try await placeVisualEvidence.resolve(
+                let alignments = try await coordinateAlignmentRepository.catalogSnapshot()
+                let resolution = try await placeVisualEvidence.resolve(
                     current: snapshot,
                     candidate: candidate,
-                    objects: objects
+                    objects: objects,
+                    verifiedAlignments: alignments
                 )
+                guard try await coordinateAlignmentRepository.catalogSnapshot() == alignments else {
+                    return try PlaceCoordinateAlignmentResolution(
+                        sourceMapID: snapshot.mapID, targetMapID: candidate.mapID,
+                        sourceCoordinateFrameID: snapshot.coordinateFrameID,
+                        targetCoordinateFrameID: candidate.coordinateFrameID,
+                        evidence: .unresolved, validatedAlignment: nil)
+                }
+                return resolution
             },
             existingMapAssociator: { mapID, coordinateFrameID in
                 sessionController.associateCurrentCapture(

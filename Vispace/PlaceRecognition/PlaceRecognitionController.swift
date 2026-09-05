@@ -95,6 +95,8 @@ public final class PlaceRecognitionController: ObservableObject {
         @MainActor @Sendable () -> AsyncStream<ARSurfaceStateSnapshot>
     public typealias ObjectMetadataProvider = @Sendable () async throws -> [SpatialObjectMetadata]
     public typealias CatalogProvider = @Sendable () async throws -> PlaceMemoryCatalogSnapshot
+    public typealias VerifiedAlignmentCatalogProvider =
+        @Sendable () async throws -> CoordinateAlignmentCatalogSnapshot
     public typealias VisualHistogramProvider =
         @Sendable (ARSurfaceStateSnapshot) async throws -> NormalizedPlaceHistogram?
     public typealias FingerprintWriter = @Sendable (PlaceFingerprintRecord) async throws -> Void
@@ -150,6 +152,7 @@ public final class PlaceRecognitionController: ObservableObject {
     private let objectMetadataProvider: ObjectMetadataProvider
     private let catalogProvider: CatalogProvider
     private let visualHistogramProvider: VisualHistogramProvider
+    private let verifiedAlignmentCatalogProvider: VerifiedAlignmentCatalogProvider
     private let fingerprintWriter: FingerprintWriter
     private let associationWriter: AssociationWriter
     private let mutationAcknowledger: MutationAcknowledger
@@ -189,6 +192,7 @@ public final class PlaceRecognitionController: ObservableObject {
         objectMetadataProvider: @escaping ObjectMetadataProvider,
         catalogProvider: @escaping CatalogProvider,
         visualHistogramProvider: @escaping VisualHistogramProvider = { _ in nil },
+        verifiedAlignmentCatalogProvider: @escaping VerifiedAlignmentCatalogProvider = { try .init() },
         fingerprintWriter: @escaping FingerprintWriter,
         associationWriter: @escaping AssociationWriter,
         mutationAcknowledger: @escaping MutationAcknowledger = { _, _ in },
@@ -218,6 +222,7 @@ public final class PlaceRecognitionController: ObservableObject {
             objectMetadataProvider: objectMetadataProvider,
             catalogProvider: catalogProvider,
             visualHistogramProvider: visualHistogramProvider,
+            verifiedAlignmentCatalogProvider: verifiedAlignmentCatalogProvider,
             fingerprintWriter: fingerprintWriter,
             associationWriter: associationWriter,
             mutationAcknowledger: mutationAcknowledger,
@@ -238,6 +243,7 @@ public final class PlaceRecognitionController: ObservableObject {
         objectMetadataProvider: @escaping ObjectMetadataProvider,
         catalogProvider: @escaping CatalogProvider,
         visualHistogramProvider: @escaping VisualHistogramProvider = { _ in nil },
+        verifiedAlignmentCatalogProvider: @escaping VerifiedAlignmentCatalogProvider = { try .init() },
         fingerprintWriter: @escaping FingerprintWriter,
         associationWriter: @escaping AssociationWriter,
         mutationAcknowledger: @escaping MutationAcknowledger = { _, _ in },
@@ -267,6 +273,7 @@ public final class PlaceRecognitionController: ObservableObject {
             objectMetadataProvider: objectMetadataProvider,
             catalogProvider: catalogProvider,
             visualHistogramProvider: visualHistogramProvider,
+            verifiedAlignmentCatalogProvider: verifiedAlignmentCatalogProvider,
             fingerprintWriter: fingerprintWriter,
             associationWriter: associationWriter,
             mutationAcknowledger: mutationAcknowledger,
@@ -288,6 +295,7 @@ public final class PlaceRecognitionController: ObservableObject {
         objectMetadataProvider: @escaping ObjectMetadataProvider,
         catalogProvider: @escaping CatalogProvider,
         visualHistogramProvider: @escaping VisualHistogramProvider = { _ in nil },
+        verifiedAlignmentCatalogProvider: @escaping VerifiedAlignmentCatalogProvider,
         fingerprintWriter: @escaping FingerprintWriter,
         associationWriter: @escaping AssociationWriter,
         mutationAcknowledger: @escaping MutationAcknowledger = { _, _ in },
@@ -306,6 +314,7 @@ public final class PlaceRecognitionController: ObservableObject {
         self.objectMetadataProvider = objectMetadataProvider
         self.catalogProvider = catalogProvider
         self.visualHistogramProvider = visualHistogramProvider
+        self.verifiedAlignmentCatalogProvider = verifiedAlignmentCatalogProvider
         self.fingerprintWriter = fingerprintWriter
         self.associationWriter = associationWriter
         self.mutationAcknowledger = mutationAcknowledger
@@ -812,6 +821,10 @@ public final class PlaceRecognitionController: ObservableObject {
         excluding excludedMapID: MapID?,
         generation: UInt64
     ) async throws -> [ScoredCandidate] {
+        let verifiedAlignments = try await verifiedAlignmentCatalogProvider()
+        try Task.checkCancellation()
+        guard isCurrent(snapshot, generation: generation) else { throw CancellationError() }
+        let groups = VerifiedPlaceMapGroups(catalog: verifiedAlignments, objects: objects)
         var candidates: [ScoredCandidate] = []
         candidates.reserveCapacity(catalog.fingerprints.count)
         for record in catalog.fingerprints where record.mapID != excludedMapID {
@@ -872,7 +885,27 @@ public final class PlaceRecognitionController: ObservableObject {
             }
             return lhs.evidence.mapID < rhs.evidence.mapID
         }
-        return Array(candidates.prefix(associationPolicy.maximumTrackedCandidates))
+        let latestAlignments = try await verifiedAlignmentCatalogProvider()
+        try Task.checkCancellation()
+        guard latestAlignments == verifiedAlignments, isCurrent(snapshot, generation: generation) else {
+            throw CancellationError()
+        }
+        var representatives: [MapID: ScoredCandidate] = [:]
+        for candidate in candidates {
+            let group = groups.representative(
+                mapID: candidate.evidence.mapID,
+                frameID: candidate.evidence.coordinateFrameID)
+            if let existing = representatives[group] {
+                if case .aligned = existing.evidence.coordinateCompatibility { continue }
+                guard case .aligned = candidate.evidence.coordinateCompatibility else { continue }
+            }
+            representatives[group] = candidate
+        }
+        let ranked = representatives.values.sorted {
+            if $0.score != $1.score { return $0.score > $1.score }
+            return $0.evidence.mapID < $1.evidence.mapID
+        }
+        return Array(ranked.prefix(associationPolicy.maximumTrackedCandidates))
     }
 
     private func restoredOrNewAttempt(
