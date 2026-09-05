@@ -33,6 +33,8 @@ public struct ARFurniturePlacementEvidenceBuilderPolicy: Hashable, Sendable {
     public let maximumCandidatePoseAge: TimeInterval
     public let maximumSurfacePoseAge: TimeInterval
     public let conservativePlaneScale: Double
+    /// Minimum collection extent; actual furniture and passage regions may
+    /// expand it. This is never a maximum measurable furniture size.
     public let localEvidenceRadius: Double
     public let minimumLocalClassifiedTriangleCount: Int
     public let minimumMeshCoverageMargin: Double
@@ -376,13 +378,33 @@ public struct ARFurniturePlacementEvidenceBuilder: Sendable {
             }
         }
 
+        // Collect every surface that can affect the rotated furniture, its
+        // required clearance, or a passage we may publish below. A fixed local
+        // radius alone can exclude an obstacle inside a large product.
+        let evidenceMargin = max(coverageMargin, policy.requiredPassageWidth)
+        guard
+            let candidateEvidenceRegion = try? PlacementHorizontalRegion(
+                center: candidate.position,
+                width: dimensions.width + 2 * evidenceMargin,
+                depth: dimensions.depth + 2 * evidenceMargin,
+                yawRadians: candidate.yawRadians
+            )
+        else { return .insufficient(.invalidSurfaceGeometry) }
+        var evidenceBounds = HorizontalEvidenceBounds(
+            center: candidate.position, minimumRadius: policy.localEvidenceRadius
+        )
+        evidenceBounds.include(candidateEvidenceRegion)
+        for observation in observations {
+            evidenceBounds.include(observation.region)
+        }
+
         let mesh: MeshEvidence
         if capabilities.supportsMeshReconstruction
             && capabilities.supportsMeshClassification
         {
             let meshOutcome = meshEvidence(
                 meshes: surface.meshes.values.sorted(by: Self.meshOrder),
-                around: candidatePosition.value,
+                within: evidenceBounds,
                 requiredRegion: requiredRegion
             )
             switch meshOutcome {
@@ -410,7 +432,7 @@ public struct ARFurniturePlacementEvidenceBuilder: Sendable {
             objects,
             mapID: currentMapID,
             coordinateFrameID: pose.coordinateFrameID,
-            around: candidatePosition.value,
+            within: evidenceBounds,
             meshObstacles: ceilingObstacles + mesh.obstacles
         )
         let objectEvidence: ObjectEvidence
@@ -642,7 +664,7 @@ public struct ARFurniturePlacementEvidenceBuilder: Sendable {
 
     private func meshEvidence(
         meshes: [ARMeshObservationSnapshot],
-        around candidate: Vec3,
+        within evidenceBounds: HorizontalEvidenceBounds,
         requiredRegion: PlacementHorizontalRegion
     ) -> Result<MeshEvidence, ARFurniturePlacementEvidenceIssue> {
         var walls: [PlacementWallEvidence] = []
@@ -707,10 +729,10 @@ public struct ARFurniturePlacementEvidenceBuilder: Sendable {
                 let maximumX = points.map(\.x).max() ?? -.infinity
                 let minimumZ = points.map(\.z).min() ?? .infinity
                 let maximumZ = points.map(\.z).max() ?? -.infinity
-                guard maximumX >= candidate.x - policy.localEvidenceRadius,
-                    minimumX <= candidate.x + policy.localEvidenceRadius,
-                    maximumZ >= candidate.z - policy.localEvidenceRadius,
-                    minimumZ <= candidate.z + policy.localEvidenceRadius
+                guard
+                    evidenceBounds.overlaps(
+                        minX: minimumX, maxX: maximumX, minZ: minimumZ, maxZ: maximumZ
+                    )
                 else {
                     continue
                 }
@@ -882,7 +904,7 @@ public struct ARFurniturePlacementEvidenceBuilder: Sendable {
         _ objects: [SpatialObjectMetadata],
         mapID: MapID,
         coordinateFrameID: CoordinateFrameID,
-        around candidate: Vec3,
+        within evidenceBounds: HorizontalEvidenceBounds,
         meshObstacles: [PlacementObstacleEvidence]
     ) -> Result<ObjectEvidence, ARFurniturePlacementEvidenceIssue> {
         let currentMapObjects = objects.filter { $0.mapID == mapID }
@@ -904,13 +926,15 @@ public struct ARFurniturePlacementEvidenceBuilder: Sendable {
             }
             let nearby: Bool
             if let bounds = object.bounds {
-                nearby =
-                    bounds.max.x >= candidate.x - policy.localEvidenceRadius
-                    && bounds.min.x <= candidate.x + policy.localEvidenceRadius
-                    && bounds.max.z >= candidate.z - policy.localEvidenceRadius
-                    && bounds.min.z <= candidate.z + policy.localEvidenceRadius
+                nearby = evidenceBounds.overlaps(
+                    minX: bounds.min.x, maxX: bounds.max.x,
+                    minZ: bounds.min.z, maxZ: bounds.max.z
+                )
             } else {
-                nearby = horizontalDistance(object.position, candidate) <= policy.localEvidenceRadius
+                nearby = evidenceBounds.overlaps(
+                    minX: object.position.x, maxX: object.position.x,
+                    minZ: object.position.z, maxZ: object.position.z
+                )
             }
             guard nearby else {
                 continue
@@ -1040,10 +1064,6 @@ public struct ARFurniturePlacementEvidenceBuilder: Sendable {
         return best
     }
 
-    private func horizontalDistance(_ lhs: Vec3, _ rhs: Vec3) -> Double {
-        hypot(lhs.x - rhs.x, lhs.z - rhs.z)
-    }
-
     private static func planeOrder(
         _ lhs: ARPlaneObservationSnapshot,
         _ rhs: ARPlaneObservationSnapshot
@@ -1063,6 +1083,38 @@ public struct ARFurniturePlacementEvidenceBuilder: Sendable {
         _ rhs: SpatialObjectMetadata
     ) -> Bool {
         lhs.object.id < rhs.object.id
+    }
+}
+
+private struct HorizontalEvidenceBounds {
+    var minX: Double
+    var maxX: Double
+    var minZ: Double
+    var maxZ: Double
+
+    init(center: Vec3, minimumRadius: Double) {
+        minX = center.x - minimumRadius
+        maxX = center.x + minimumRadius
+        minZ = center.z - minimumRadius
+        maxZ = center.z + minimumRadius
+    }
+
+    mutating func include(_ region: PlacementHorizontalRegion) {
+        let cosine = abs(cos(region.yawRadians))
+        let sine = abs(sin(region.yawRadians))
+        let halfX = (cosine * region.width + sine * region.depth) / 2
+        let halfZ = (sine * region.width + cosine * region.depth) / 2
+        minX = min(minX, region.center.x - halfX)
+        maxX = max(maxX, region.center.x + halfX)
+        minZ = min(minZ, region.center.z - halfZ)
+        maxZ = max(maxZ, region.center.z + halfZ)
+    }
+
+    func overlaps(minX: Double, maxX: Double, minZ: Double, maxZ: Double) -> Bool {
+        // Include contact at the edge: the evaluator decides whether the
+        // measured clearance is enough; collection must not discard it.
+        maxX >= self.minX && minX <= self.maxX
+            && maxZ >= self.minZ && minZ <= self.maxZ
     }
 }
 

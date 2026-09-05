@@ -87,6 +87,162 @@ final class FurniturePlacementControllerTests: XCTestCase {
                 )), .trackingUnstable)
     }
 
+    func testTenMeterFurnitureIncludesDistantObjectAndMeshCollisionEvidence() throws {
+        for yaw in [0.0, Double.pi / 2, Double.pi / 4] {
+            // At 45 degrees, this corner lies beyond x=4 even though it is
+            // inside the product. Other cases exercise both world axes.
+            let localX = 4.5
+            let localZ = yaw == .pi / 4 ? -1.75 : 0
+            let x = cos(yaw) * localX - sin(yaw) * localZ
+            let z = sin(yaw) * localX + cos(yaw) * localZ
+            for useMesh in [false, true] {
+                let seat =
+                    useMesh
+                    ? rectangleVertices(
+                        minX: Float(x - 0.1), minZ: Float(z - 0.1),
+                        maxX: Float(x + 0.1), maxZ: Float(z + 0.1), elevation: 0.5
+                    ) : []
+                let context = largeFurnitureContext(
+                    yaw: yaw, extraVertices: seat,
+                    extraClassifications: useMesh ? [.seat, .seat] : [])
+                let objects =
+                    useMesh
+                    ? []
+                    : [
+                        try metadata(
+                            id: objectID(91), mapID: context.mapID, frameID: context.frameID,
+                            label: "chair", position: vec(x, 0.5, z),
+                            bounds: AABB(min: vec(x - 0.1, 0.1, z - 0.1), max: vec(x + 0.1, 0.8, z + 0.1))
+                        )
+                    ]
+                let prepared = try unwrapReady(
+                    ARFurniturePlacementEvidenceBuilder().build(
+                        kind: .desk,
+                        candidatePosition: framedPosition(frameID: context.frameID, value: .zero),
+                        surface: context.surface, pose: context.pose,
+                        capabilities: fullCapabilities(), objects: objects,
+                        furnitureDimensions: FurnitureDimensions(kind: .desk, width: 10, depth: 4, height: 1)
+                    ))
+                XCTAssertTrue(prepared.summary.lidarEvidenceComplete)
+                XCTAssertEqual(prepared.summary.obstacleCount, 1)
+                let result = FurniturePlacementEvaluator().evaluate(
+                    candidate: prepared.candidate, evidence: prepared.evidence
+                )
+                XCTAssertEqual(result.disposition, .rejected)
+                XCTAssertTrue(result.reasons.contains { $0.code == .collidesWithExistingObject })
+            }
+        }
+    }
+
+    func testLargeFurnitureBoundaryContactIsRetainedForClearanceEvaluation() throws {
+        let context = largeFurnitureContext()
+        let touching = try metadata(
+            id: objectID(92), mapID: context.mapID, frameID: context.frameID,
+            label: "chair", position: vec(5.1, 0.5, 0),
+            bounds: AABB(min: vec(5, 0.1, -0.1), max: vec(5.2, 0.8, 0.1))
+        )
+        let prepared = try unwrapReady(
+            ARFurniturePlacementEvidenceBuilder().build(
+                kind: .desk,
+                candidatePosition: framedPosition(frameID: context.frameID, value: .zero),
+                surface: context.surface, pose: context.pose,
+                capabilities: fullCapabilities(), objects: [touching],
+                furnitureDimensions: FurnitureDimensions(kind: .desk, width: 10, depth: 1, height: 1)
+            ))
+        XCTAssertEqual(prepared.summary.obstacleCount, 1)
+        let result = FurniturePlacementEvaluator().evaluate(
+            candidate: prepared.candidate, evidence: prepared.evidence
+        )
+        XCTAssertEqual(result.disposition, .rejected)
+        XCTAssertTrue(result.reasons.contains { $0.code == .objectClearanceTooSmall })
+    }
+
+    func testLargeFurnitureWithoutBoundsOrFullMeshCoverageRemainsInsufficient() throws {
+        for missingBounds in [false, true] {
+            let context = largeFurnitureContext(floorMeshHalfExtent: missingBounds ? 8 : 4)
+            let objects =
+                missingBounds
+                ? [
+                    try metadata(
+                        id: objectID(93), mapID: context.mapID, frameID: context.frameID,
+                        label: "chair", position: vec(4.5, 0.5, 0), bounds: nil
+                    )
+                ] : []
+            let prepared = try unwrapReady(
+                ARFurniturePlacementEvidenceBuilder().build(
+                    kind: .desk,
+                    candidatePosition: framedPosition(frameID: context.frameID, value: .zero),
+                    surface: context.surface, pose: context.pose,
+                    capabilities: fullCapabilities(), objects: objects,
+                    furnitureDimensions: FurnitureDimensions(kind: .desk, width: 10, depth: 1, height: 1)
+                ))
+            XCTAssertEqual(prepared.summary.lidarEvidenceComplete, missingBounds)
+            let result = FurniturePlacementEvaluator().evaluate(
+                candidate: prepared.candidate, evidence: prepared.evidence
+            )
+            XCTAssertEqual(result.disposition, .insufficientEvidence)
+            XCTAssertTrue(result.reasons.contains { $0.code == .obstacleEvidenceIncomplete })
+        }
+    }
+
+    func testCompleteLargeFurnitureAreaWithoutObstaclesRemainsFeasible() throws {
+        let context = largeFurnitureContext(yaw: .pi / 4)
+        let prepared = try unwrapReady(
+            ARFurniturePlacementEvidenceBuilder().build(
+                kind: .desk,
+                candidatePosition: framedPosition(frameID: context.frameID, value: .zero),
+                surface: context.surface, pose: context.pose,
+                capabilities: fullCapabilities(), objects: [],
+                furnitureDimensions: FurnitureDimensions(kind: .desk, width: 10, depth: 4, height: 1)
+            ))
+        XCTAssertTrue(prepared.summary.lidarEvidenceComplete)
+        XCTAssertEqual(
+            FurniturePlacementEvaluator().evaluate(
+                candidate: prepared.candidate, evidence: prepared.evidence
+            ).disposition, .feasible)
+    }
+
+    func testUnknownMeshInsideLargeFurnitureCannotBeCulledIntoAnApproval() throws {
+        let unknown = rectangleVertices(minX: 4.3, minZ: -0.1, maxX: 4.7, maxZ: 0.1, elevation: 0.5)
+        let context = largeFurnitureContext(
+            extraVertices: unknown, extraClassifications: [.unknown, .unknown])
+        let prepared = try unwrapReady(
+            ARFurniturePlacementEvidenceBuilder().build(
+                kind: .desk,
+                candidatePosition: framedPosition(frameID: context.frameID, value: .zero),
+                surface: context.surface, pose: context.pose,
+                capabilities: fullCapabilities(), objects: [],
+                furnitureDimensions: FurnitureDimensions(kind: .desk, width: 10, depth: 1, height: 1)
+            ))
+        XCTAssertFalse(prepared.summary.lidarEvidenceComplete)
+        XCTAssertEqual(
+            FurniturePlacementEvaluator().evaluate(
+                candidate: prepared.candidate, evidence: prepared.evidence
+            ).disposition, .insufficientEvidence)
+    }
+
+    func testObstacleBoundsTouchingPublishedPassageBoundaryAreCollected() throws {
+        let context = largeFurnitureContext()
+        // The candidate is much smaller than the observed floor. Its published
+        // passage spans +/-6.8m; the obstacle's center is outside that area,
+        // but its measured bounds touch the passage and must remain evidence.
+        let edge = try metadata(
+            id: objectID(94), mapID: context.mapID, frameID: context.frameID,
+            label: "chair", position: vec(7, 0.5, 0),
+            bounds: AABB(min: vec(6.8, 0.1, -0.1), max: vec(7.2, 0.8, 0.1))
+        )
+        let prepared = try unwrapReady(
+            ARFurniturePlacementEvidenceBuilder().build(
+                kind: .desk,
+                candidatePosition: framedPosition(frameID: context.frameID, value: .zero),
+                surface: context.surface, pose: context.pose,
+                capabilities: fullCapabilities(), objects: [edge]
+            ))
+        XCTAssertTrue(prepared.summary.lidarEvidenceComplete)
+        XCTAssertEqual(prepared.evidence.passages.first?.region.width, 13.6)
+        XCTAssertEqual(prepared.evidence.obstacles.map(\.objectID), [edge.object.id])
+    }
+
     func testFloorPlaneBecomesConservativelyInsetFloorAndObservationRegions() throws {
         let context = spatialContext(
             floorTransform: translationMatrix(x: 2, y: 0.25, z: -3),
@@ -1639,6 +1795,31 @@ final class FurniturePlacementControllerTests: XCTestCase {
         let heading = simd_float4x4(simd_quatf(angle: Float(-yaw), axis: SIMD3<Float>(0, 1, 0)))
         let tilt = simd_float4x4(simd_quatf(angle: Float(pitch), axis: SIMD3<Float>(1, 0, 0)))
         return heading * tilt * portrait
+    }
+
+    private func largeFurnitureContext(
+        yaw: Double = 0,
+        floorMeshHalfExtent: Float = 8,
+        extraVertices: [SIMD3<Float>] = [],
+        extraClassifications: [ARMeshClassificationSnapshot] = []
+    ) -> PlacementSpatialContext {
+        var floorVertices: [SIMD3<Float>] = []
+        let step = floorMeshHalfExtent / 8
+        for row in 0..<16 {
+            for column in 0..<16 {
+                let x = -floorMeshHalfExtent + Float(column) * step
+                let z = -floorMeshHalfExtent + Float(row) * step
+                floorVertices += rectangleVertices(minX: x, minZ: z, maxX: x + step, maxZ: z + step)
+            }
+        }
+        return spatialContext(
+            cameraTransform: portraitCamera(yaw: yaw), floorExtent: SIMD3<Float>(16, 0, 16),
+            mesh: mesh(
+                id: uuid(91_001), vertices: floorVertices + extraVertices,
+                classifications: Array(repeating: .floor, count: floorVertices.count / 3)
+                    + extraClassifications
+            )
+        )
     }
 
     private func mapID(_ value: Int) -> MapID {
