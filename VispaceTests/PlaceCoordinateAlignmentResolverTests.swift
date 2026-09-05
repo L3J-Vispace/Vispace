@@ -4,6 +4,15 @@ import XCTest
 @testable import Vispace
 
 final class PlaceCoordinateAlignmentResolverTests: XCTestCase {
+    func testMatchingRoomLayoutWithoutIndependentIdentityCannotMerge() throws {
+        let fixture = Fixture()
+        let points = try [Vec3(x: 0, y: 0, z: 0), Vec3(x: 2, y: 0, z: 0), Vec3(x: 0, y: 0, z: 2)]
+        let result = PlaceCoordinateAlignmentResolver().resolve(
+            current: fixture.snapshot(), candidate: try fixture.candidate(),
+            objects: try fixture.pairedObjects(sourcePoints: points, targetPoints: points)
+        )
+        assertUnresolved(result)
+    }
     func testCrossFrameAlignmentRunsFromCurrentCaptureIntoCandidateFrame() throws {
         let fixture = Fixture()
         let sourcePoints = try [
@@ -297,7 +306,8 @@ private struct Fixture {
     let targetMapID = Fixture.mapID(2)
     let sourceFrameID = Fixture.frameID(1)
     let targetFrameID = Fixture.frameID(2)
-    let resolver = PlaceCoordinateAlignmentResolver()
+    // These paired synthetic landmarks have ground-truth physical identity.
+    let resolver = PlaceCoordinateAlignmentResolver(identityVerifier: { _ in true })
 
     func snapshot(
         includesMap: Bool = true,

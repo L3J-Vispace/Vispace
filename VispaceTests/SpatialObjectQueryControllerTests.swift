@@ -6,6 +6,27 @@ import XCTest
 
 @MainActor
 final class SpatialObjectQueryControllerTests: XCTestCase {
+    func testSearchFindsAnObjectBeyondTheFormer512RecordLimit() async throws {
+        let map = mapID(990)
+        let frame = frameID(990)
+        let current = identity(mapID: map, frameID: frame)
+        var objects = try (0..<520).map { index in
+            try metadata(id: objectID(index), mapID: map, frameID: frame, label: "chair", lastSeenAt: 100)
+        }
+        let target = try metadata(id: objectID(600), mapID: map, frameID: frame, label: "laptop", lastSeenAt: 99)
+        objects.append(target)
+        let allObjects = objects
+        let repository = SpatialObjectQueryRepository(
+            metadataProvider: { SpatialMetadataDocument(objects: allObjects) },
+            alignmentCatalogProvider: { try CoordinateAlignmentCatalogSnapshot() }
+        )
+        let controller = SpatialObjectQueryController(repository: repository, currentIdentityProvider: { current })
+        controller.submit("노트북 어디 있어", now: 101)
+        let deadline = Date().addingTimeInterval(5)
+        while controller.isProcessingForTesting, Date() < deadline { await Task.yield() }
+        XCTAssertFalse(controller.isProcessingForTesting)
+        XCTAssertEqual(controller.latestPresentation?.result.selectedCandidate?.record.metadata.object.id, target.object.id)
+    }
     func testAliasCatalogIsSymmetricSanitizedAndBounded() {
         let defaults = SpatialObjectAliasCatalog.koreanEnglishDefaults
         XCTAssertTrue(defaults.aliases(for: " laptop ").contains("노트북"))
@@ -84,7 +105,7 @@ final class SpatialObjectQueryControllerTests: XCTestCase {
         XCTAssertTrue(snapshot.records[0].semanticAliases.contains("노트북"))
     }
 
-    func testRepositoryRecordLimitUsesDeterministicCurrentFirstOrdering() async throws {
+    func testRepositoryNeverTruncatesHistoricalRecordsBeforeSearch() async throws {
         let currentMap = mapID(10)
         let currentFrame = frameID(10)
         let other = try metadata(
@@ -107,13 +128,12 @@ final class SpatialObjectQueryControllerTests: XCTestCase {
             },
             alignmentCatalogProvider: {
                 try CoordinateAlignmentCatalogSnapshot()
-            },
-            maximumRecordCount: 1
+            }
         )
 
         let snapshot = try await repository.loadSnapshot(currentMapID: currentMap)
 
-        XCTAssertEqual(snapshot.records.map(\.metadata.object.id), [current.object.id])
+        XCTAssertEqual(snapshot.records.map(\.metadata.object.id), [current.object.id, other.object.id])
     }
 
     func testExactCurrentFrameReturnsPersistedPositionWithoutAlignment() throws {

@@ -108,11 +108,9 @@ public struct SpatialObjectQueryRepositorySnapshot: Hashable, Sendable {
 }
 
 /// App-layer read model joining durable object metadata with validated map
-/// alignments. Reads are bounded and never mutate either source repository.
+/// alignments. Every persisted record participates in search; result limits
+/// belong after semantic matching, never before it.
 public actor SpatialObjectQueryRepository {
-    public static let defaultMaximumRecordCount = 512
-    public static let absoluteMaximumRecordCount = 2_048
-
     public typealias MetadataProvider = @Sendable () async throws -> SpatialMetadataDocument
     public typealias AlignmentCatalogProvider =
         @Sendable () async throws ->
@@ -121,28 +119,21 @@ public actor SpatialObjectQueryRepository {
     private let metadataProvider: MetadataProvider
     private let alignmentCatalogProvider: AlignmentCatalogProvider
     private let aliasCatalog: SpatialObjectAliasCatalog
-    private let maximumRecordCount: Int
 
     public init(
         metadataProvider: @escaping MetadataProvider,
         alignmentCatalogProvider: @escaping AlignmentCatalogProvider,
-        aliasCatalog: SpatialObjectAliasCatalog = .koreanEnglishDefaults,
-        maximumRecordCount: Int = SpatialObjectQueryRepository.defaultMaximumRecordCount
+        aliasCatalog: SpatialObjectAliasCatalog = .koreanEnglishDefaults
     ) {
         self.metadataProvider = metadataProvider
         self.alignmentCatalogProvider = alignmentCatalogProvider
         self.aliasCatalog = aliasCatalog
-        self.maximumRecordCount = min(
-            max(1, maximumRecordCount),
-            Self.absoluteMaximumRecordCount
-        )
     }
 
     public init(
         worldMapRepository: WorldMapCheckpointRepository,
         coordinateAlignmentRepository: CoordinateAlignmentRepository,
-        aliasCatalog: SpatialObjectAliasCatalog = .koreanEnglishDefaults,
-        maximumRecordCount: Int = SpatialObjectQueryRepository.defaultMaximumRecordCount
+        aliasCatalog: SpatialObjectAliasCatalog = .koreanEnglishDefaults
     ) {
         metadataProvider = {
             try await worldMapRepository.metadataSnapshot()
@@ -151,10 +142,6 @@ public actor SpatialObjectQueryRepository {
             try await coordinateAlignmentRepository.catalogSnapshot()
         }
         self.aliasCatalog = aliasCatalog
-        self.maximumRecordCount = min(
-            max(1, maximumRecordCount),
-            Self.absoluteMaximumRecordCount
-        )
     }
 
     public func loadSnapshot(
@@ -167,7 +154,6 @@ public actor SpatialObjectQueryRepository {
 
         let records = document.objects
             .sorted { Self.ranksBefore($0, $1, currentMapID: currentMapID) }
-            .prefix(maximumRecordCount)
             .map { metadata in
                 StoredSpatialObjectRecord(
                     metadata: metadata,

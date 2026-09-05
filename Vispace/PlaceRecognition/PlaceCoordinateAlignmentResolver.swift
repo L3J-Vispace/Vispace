@@ -88,13 +88,18 @@ public struct PlaceCoordinateAlignmentResolution: Hashable, Sendable {
 public struct PlaceCoordinateAlignmentResolver: Sendable {
     public let correspondenceBuilder: SemanticObjectCorrespondenceBuilder
     public let estimator: CoordinateFrameAlignmentEstimator
+    /// Must be backed by independent physical identity evidence (for example
+    /// a verified appearance match). Shared class labels are not identity.
+    private let identityVerifier: @Sendable (CoordinateFrameAlignmentCorrespondence) -> Bool
 
     public init(
         correspondenceBuilder: SemanticObjectCorrespondenceBuilder = .init(),
-        estimator: CoordinateFrameAlignmentEstimator = .init()
+        estimator: CoordinateFrameAlignmentEstimator = .init(),
+        identityVerifier: @escaping @Sendable (CoordinateFrameAlignmentCorrespondence) -> Bool = { _ in false }
     ) {
         self.correspondenceBuilder = correspondenceBuilder
         self.estimator = estimator
+        self.identityVerifier = identityVerifier
     }
 
     public func resolve(
@@ -149,6 +154,7 @@ public struct PlaceCoordinateAlignmentResolver: Sendable {
                 ),
                 from: alignmentObjects
             )
+            guard correspondences.allSatisfy(identityVerifier) else { return unresolved }
             let alignment = try estimator.estimate(correspondences: correspondences)
             return try PlaceCoordinateAlignmentResolution(
                 sourceMapID: sourceMapID,
