@@ -87,6 +87,9 @@ Long-gap object identity uses explicit user confirmation; classification correct
 is a separate action from naming. Cross-map appearance matching and observed
 door passage have conservative admission rules that still require device calibration.
 
+The seven boundary-condition and concurrency findings at `94e744c`, their fixes,
+and fresh validation results are tracked in the [whole-code audit follow-up](docs/AUDIT_FIXES_2026-09-05.md).
+
 ## Privacy and retention
 
 - Raw camera frames and raw camera video are processed ephemerally. They are neither persisted nor transmitted by Vispace.
