@@ -1,11 +1,18 @@
 name: iOS CI
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
+  # Core CI runs automatically. iOS validation uses a hosted Mac by default;
+  # the owner's MacBook is used only by an explicit self-hosted dispatch.
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Where to run Xcode validation
+        type: choice
+        required: true
+        default: github-hosted
+        options:
+          - github-hosted
+          - self-hosted
 
 permissions:
   contents: read
@@ -17,16 +24,11 @@ concurrency:
 jobs:
   build-test-analyze:
     name: Build, test, and analyze
-    # This private repository's MacBook accepts only same-repository PRs.
-    # Never run fork-provided code on the owner's persistent machine.
-    if: >-
-      github.repository == 'L3J-Vispace/Vispace' &&
-      (github.event_name != 'pull_request' ||
-       github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: [self-hosted, macOS, ARM64, vispace-ios]
-    timeout-minutes: 45
+    if: github.repository == 'L3J-Vispace/Vispace'
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJSON('["self-hosted", "macOS", "ARM64", "vispace-ios"]') || 'macos-26' }}
+    timeout-minutes: 60
     env:
-      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+      DEVELOPER_DIR: ${{ inputs.runner == 'self-hosted' && '/Applications/Xcode.app/Contents/Developer' || '/Applications/Xcode_26.6.app/Contents/Developer' }}
       REQUIRED_XCODE_VERSION: 26.6
       XCODEGEN_VERSION: 2.46.0
       XCODEGEN_SHA256: 4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
@@ -263,7 +265,7 @@ jobs:
             analyze
 
       - name: Preserve failed test diagnostics on the MacBook
-        if: failure()
+        if: failure() && inputs.runner == 'self-hosted'
         run: |
           set -euo pipefail
           evidence="${HOME}/GitHubActions/vispace-evidence/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -277,3 +279,14 @@ jobs:
             fi
           done
           echo "Failed test diagnostics saved on the MacBook: ${evidence}"
+
+      - name: Upload test diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-test-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/VispaceTests.xcresult
+            ${{ runner.temp }}/VispacePlaceHistoryTests.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
