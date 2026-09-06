@@ -11,6 +11,7 @@ import VispaceCore
 struct CameraScreen: View {
     @ObservedObject var sessionController: ARSessionController
     @ObservedObject var perceptionController: SpatialPerceptionController
+    @ObservedObject var registrationController: UserObjectRegistrationController
     @ObservedObject var queryController: SpatialObjectQueryController
     @ObservedObject var relationQueryController: SpatialRelationQueryController
     @ObservedObject var guidanceController: ARGuidanceController
@@ -19,6 +20,7 @@ struct CameraScreen: View {
     @ObservedObject var dataManagementController: SpatialDataManagementController
     @ObservedObject var lifecycle: SpatialApplicationLifecycle
     @State private var showsDataManagement = false
+    @State private var registrationName: String?
 
     private var recoveryMode: CameraRecoveryMode? {
         if lifecycle.state == .storageUnavailable { return .storageUnavailable }
@@ -66,6 +68,8 @@ struct CameraScreen: View {
                 )
             } else {
                 ARGuidanceOverlay(controller: guidanceController)
+                LiveObjectSearchOverlay(perceptionController: perceptionController,
+                                        queryController: queryController)
                 SpatialQueryPanel(
                     perceptionController: perceptionController,
                     queryController: queryController,
@@ -82,8 +86,15 @@ struct CameraScreen: View {
                             hypot(position.x - Double(camera.x), position.y - Double(camera.y)),
                             position.z - Double(camera.z))
                         return "카메라에서 약 \(distance.formatted(.number.precision(.fractionLength(1))))m"
+                    },
+                    onRegisterObject: { name in
+                        registrationController.cancel()
+                        registrationName = name
                     }
                 )
+                .opacity(registrationName == nil ? 1 : 0)
+                .allowsHitTesting(registrationName == nil)
+                .accessibilityHidden(registrationName != nil)
                 if sessionController.persistenceFailureMessage != nil
                     || perceptionController.persistenceFailureMessage != nil {
                     VStack {
@@ -124,11 +135,31 @@ struct CameraScreen: View {
                     .padding(.horizontal, 14)
                     .padding(.top, 14)
                 }
+                if let registrationName {
+                    UserObjectRegistrationOverlay(
+                        controller: registrationController, initialName: registrationName,
+                        onClose: {
+                            registrationController.cancel()
+                            self.registrationName = nil
+                        },
+                        onSearch: { name in
+                            registrationController.cancel()
+                            self.registrationName = nil
+                            queryController.submit(name)
+                        }
+                    )
+                }
             }
         }
         .background(Color.black)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+        .onChange(of: lifecycle.state) { _, state in
+            if state != .active {
+                registrationController.cancel()
+                registrationName = nil
+            }
+        }
         .onChange(of: queryController.latestGroundedTarget) { _, target in
             bridgeGroundedTarget(target)
         }

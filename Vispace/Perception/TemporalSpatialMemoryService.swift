@@ -531,8 +531,21 @@ public actor TemporalSpatialMemoryService {
             .filter {
                 $0.mapID == mapID
                     && $0.position.coordinateFrameID == coordinateFrameID
+                    && !Self.isUserRegisteredPoint($0)
             }
             .sorted { $0.object.id < $1.object.id }
+    }
+
+    /// Explicitly named points are durable annotations, outside the automatic
+    /// observation journal. Keep them in the repository for search/export and
+    /// capacity accounting, but never seed or reconcile them as detector IDs.
+    /// All other untracked durable objects still fail the journal invariant.
+    private static func isUserRegisteredPoint(_ metadata: SpatialObjectMetadata) -> Bool {
+        let object = metadata.object
+        return object.semanticLabel == UserObjectRegistrationAccumulator.semanticLabel
+            && object.displayName != nil && object.detectorSemanticLabel == nil
+            && object.bounds == nil && object.presence == .lastSeen
+            && object.temporalRevision == nil
     }
 
     private func reconcile(

@@ -73,7 +73,7 @@ struct ARGuidanceOverlay: View {
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(target.semanticLabel)
+                Text(ARGuidancePresentation.displayLabel(for: target))
                     .font(.headline)
                     .lineLimit(1)
                 Text(distanceText(projection.distanceMeters))
@@ -133,12 +133,12 @@ struct ARGuidanceOverlay: View {
         if projection.hasArrived {
             return String(
                 format: String(localized: "guidance.accessibility.arrived.format"),
-                target.semanticLabel
+                ARGuidancePresentation.displayLabel(for: target)
             )
         }
         return String(
             format: String(localized: "guidance.accessibility.direction.format"),
-            target.semanticLabel,
+            ARGuidancePresentation.displayLabel(for: target),
             localizedDirection(projection.direction),
             distanceText(projection.distanceMeters)
         )
@@ -146,5 +146,22 @@ struct ARGuidanceOverlay: View {
 
     private func localizedDirection(_ direction: ARGuidanceDirection) -> String {
         String(localized: String.LocalizationValue("guidance.direction.\(direction.rawValue)"))
+    }
+}
+
+/// Names belong to presentation; the target's semantic label remains unchanged
+/// for source-record validation, identity matching, and navigation evidence.
+enum ARGuidancePresentation {
+    static func displayLabel(for target: ARGuidanceTarget) -> String {
+        if let source = target.sourceMetadata,
+            source.object.id == target.objectID,
+            source.object.semanticLabel == target.semanticLabel,
+            let displayName = source.object.displayName {
+            return displayName
+        }
+        if target.semanticLabel == UserObjectRegistrationAccumulator.semanticLabel {
+            return "직접 등록한 물체"
+        }
+        return ObjectSemanticCatalog.default.displayName(for: target.semanticLabel)
     }
 }

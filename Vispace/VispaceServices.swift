@@ -8,6 +8,7 @@ import VispaceCore
 final class VispaceServices: ObservableObject {
     let sessionController: ARSessionController
     let perceptionController: SpatialPerceptionController
+    let registrationController: UserObjectRegistrationController
     let placeRecognitionController: PlaceRecognitionController
     let queryController: SpatialObjectQueryController
     let relationQueryController: SpatialRelationQueryController
@@ -123,6 +124,11 @@ final class VispaceServices: ObservableObject {
                 try await placeVisualEvidence.ingest(frame: frame, detections: detections, objects: objects)
             }
         )
+        let registrationController = UserObjectRegistrationController(
+            frameStreamProvider: { sessionController.frames },
+            confirmedIdentityProvider: { sessionController.confirmedCaptureIdentity(for: $0) },
+            metadataWriter: durableMetadataWriter
+        )
         let placeRecognitionController = PlaceRecognitionController(
             surfaceStreamProvider: { sessionController.surfaces },
             objectMetadataProvider: {
@@ -196,11 +202,18 @@ final class VispaceServices: ObservableObject {
                 sessionController.captureIdentity
             },
             renameProvider: { expected, displayName in
+                if expected.object.semanticLabel == UserObjectRegistrationAccumulator.semanticLabel,
+                    displayName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
+                    throw SpatialObjectError.invalidDisplayName
+                }
                 objectMutationFence.begin()
                 defer { objectMutationFence.end() }
                 return try await repository.renameObject(expected: expected, displayName: displayName)
             },
             classificationCorrectionProvider: { expected, label in
+                guard expected.object.semanticLabel != UserObjectRegistrationAccumulator.semanticLabel else {
+                    throw TemporalSpatialMemoryError.staleClassificationCorrection(expected.object.id)
+                }
                 guard let frame = await sessionController.latestDepthFrame,
                     frame.pose.mapID == expected.mapID,
                     frame.pose.coordinateFrameID == expected.position.coordinateFrameID
@@ -384,10 +397,11 @@ final class VispaceServices: ObservableObject {
                 try SpatialStorageDirectory.prepare(at: spatialCaptureDirectory)
             },
             start: {
-                sessionController.setFrameSnapshotsEnabled(perceptionController.isDetectorAvailable)
+                sessionController.setFrameSnapshotsEnabled(true)
                 sessionController.setSurfaceSnapshotsEnabled(true)
                 sessionController.activate()
                 perceptionController.activate()
+                registrationController.activate()
                 placeRecognitionController.activate()
                 guidanceController.activate()
                 navigationDepthHistory.activate()
@@ -403,6 +417,7 @@ final class VispaceServices: ObservableObject {
                 guidanceController.deactivate()
                 placeRecognitionController.deactivate()
                 perceptionController.deactivate()
+                registrationController.deactivate()
                 sessionController.setFrameSnapshotsEnabled(false)
                 sessionController.setSurfaceSnapshotsEnabled(false)
                 if saveCheckpoint { sessionController.enterBackground() }
@@ -418,6 +433,7 @@ final class VispaceServices: ObservableObject {
                 sessionController.setSurfaceSnapshotsEnabled(false)
                 await sessionController.prepareForSpatialDataDeletion()
                 await perceptionController.deactivateAndWaitForPendingWork()
+                await registrationController.cancelAndWait()
                 await placeVisualEvidence.reset()
                 await placeRecognitionController.deactivateAndWaitForPendingWork()
             },
@@ -495,6 +511,7 @@ final class VispaceServices: ObservableObject {
         }
         self.sessionController = sessionController
         self.perceptionController = perceptionController
+        self.registrationController = registrationController
         self.placeRecognitionController = placeRecognitionController
         self.queryController = queryController
         self.relationQueryController = relationQueryController
@@ -518,9 +535,11 @@ final class VispaceServices: ObservableObject {
         var lastIdentity = sessionController.captureIdentity
         sessionController.onCaptureIdentityChange = {
             [weak queryController, weak relationQueryController, weak guidanceController,
-                weak navigationController, weak placementController] identity in
+                weak navigationController, weak placementController,
+                weak registrationController] identity in
             guard identity != lastIdentity else { return }
             lastIdentity = identity
+            registrationController?.cancel()
             queryController?.invalidateForCaptureTransition()
             relationQueryController?.invalidateForCaptureTransition()
             guidanceController?.clear()

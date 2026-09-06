@@ -652,13 +652,13 @@
       "en": {
         "stringUnit": {
           "state": "translated",
-          "value": "Detection supports model classes such as chairs, sofas, beds, desks, bottles and laptops. Keys and wallets are not supported."
+          "value": "Automatic detection supports 80 model classes, including keyboards, mice, monitors, tables and chairs. Each class has Korean and English search names. For other objects, such as keys, wallets and speakers, point at the object and register its name and last-seen location. Register the new location again after moving it."
         }
       },
       "ko": {
         "stringUnit": {
           "state": "translated",
-          "value": "의자, 소파, 침대, 책상, 병, 노트북 등 모델에 포함된 종류를 인식합니다. 열쇠와 지갑은 지원하지 않습니다."
+          "value": "키보드, 마우스, 모니터, 테이블, 의자 등 모델의 80개 종류를 자동 인식하며 한국어와 영어로 검색할 수 있습니다. 열쇠, 지갑, 스피커 등 그 외 물체는 직접 비춘 뒤 이름과 마지막 확인 위치를 등록할 수 있습니다. 옮긴 뒤에는 새 위치를 다시 등록해 주세요."
         }
       }
     }

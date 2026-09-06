@@ -15,6 +15,7 @@ struct VispaceApp: App {
                     CameraScreen(
                         sessionController: services.sessionController,
                         perceptionController: services.perceptionController,
+                        registrationController: services.registrationController,
                         queryController: services.queryController,
                         relationQueryController: services.relationQueryController,
                         guidanceController: services.guidanceController,

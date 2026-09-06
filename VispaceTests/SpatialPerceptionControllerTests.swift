@@ -7,6 +7,32 @@ import simd
 
 @MainActor
 final class SpatialPerceptionControllerTests: XCTestCase {
+    func testUnlocalizedKeyboardRemainsVisibleToLiveSearchWithoutCreatingStoredIdentity() async throws {
+        let channel = LatestValueChannel<ARFrameSnapshot>()
+        let detection = DetectedObject(label: "keyboard", confidence: 0.6,
+            boundingBox: NormalizedBoundingBox(x: 0.1, y: 0.1, width: 0.8, height: 0.8))
+        let detector = RecordingObjectDetector(detections: [detection])
+        let identity = ARCaptureIdentity(mapID: MapID(), status: .confirmed)
+        let controller = SpatialPerceptionController(
+            frames: channel.stream,
+            detectorResolution: ObjectDetectorResolution(detector: detector, availability: .available),
+            confirmedIdentityProvider: { _ in identity },
+            metadataWriter: { _ in XCTFail("An image-only detection must not be persisted") })
+        controller.activate()
+        let frame = try makeSnapshot(identity: identity, runGeneration: 1)
+        channel.send(frame)
+        try await waitForDetector(detector, expectedCount: 1)
+        try await waitForIdle(controller)
+        let snapshot = try XCTUnwrap(controller.liveSearchSnapshot)
+        XCTAssertEqual(snapshot.matches(labels: ["키보드"], now: frame.pose.timestamp), [detection])
+        XCTAssertFalse(snapshot.hasDepth)
+        XCTAssertEqual(controller.metrics.promotedObjects, 0)
+        XCTAssertEqual(controller.metrics.depthFailures, 1)
+        controller.deactivate()
+        XCTAssertNil(controller.liveSearchSnapshot)
+        XCTAssertTrue(controller.latestDetections.isEmpty)
+    }
+
     func testResourceBudgetThrottlesInferencePausesAtCriticalAndRecovers() async throws {
         let channel = LatestValueChannel<ARFrameSnapshot>()
         let detector = RecordingObjectDetector()

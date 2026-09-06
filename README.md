@@ -38,6 +38,12 @@ The runtime uses Apple frameworks only. The bundled object detector executes loc
 5. Move slowly while covering the floor, walls, surrounding objects, and the intended route or placement area from more than one angle.
 6. Use the bottom query field for object, last-seen, relation, or navigation requests. Use the furniture menu for a sofa, bed, or desk placement check.
 7. Open spatial-data settings to review local storage behavior or delete all stored Vispace spatial data.
+8. For an unsupported object, use **물체 위치 직접 등록** in the bottom menu, center the reticle on its surface, and enter a name. A stable measured depth point is saved as a manually registered last-seen location; moved objects must be registered again.
+
+All 80 bundled detector classes have Korean/English search names. A visible
+candidate can be highlighted before its durable 3D location is confirmed; it
+does not authorize AR guidance. Recognition changes and device checks are
+documented in [the object recognition fix record](docs/OBJECT_RECOGNITION_FIXES_2026-09-07.md).
 
 The Simulator is useful for compilation, lifecycle, UI-contract, and non-AR tests. Real depth, mesh reconstruction, relocalization, placement accuracy, and route safety require a physical LiDAR iPhone and a mapped indoor space.
 

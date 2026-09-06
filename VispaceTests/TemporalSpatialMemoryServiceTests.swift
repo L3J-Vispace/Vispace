@@ -4,6 +4,110 @@ import XCTest
 @testable import Vispace
 
 final class TemporalSpatialMemoryServiceTests: XCTestCase {
+    func testManualRegistrationAfterJournalCommitSurvivesRestartAndAutomaticProjection() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(111), frameID = temporalTestFrameID(111)
+        let automaticID = temporalTestObjectID(111), nextAutomaticID = temporalTestObjectID(112)
+        let manualID = temporalTestObjectID(113)
+        let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)]))
+        let repository = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let service = makeService(repository: repository, store: store)
+        _ = try await service.process(
+            TemporalSpatialRecognitionBatch(sequence: 1,
+                observations: [temporalTestNewObservation(
+                    mapID: mapID, coordinateFrameID: frameID, objectID: automaticID, at: 100)],
+                expectedVisibleObjectIDs: []),
+            pose: temporalTestPose(mapID: mapID, coordinateFrameID: frameID,
+                capturedAt: 100, sessionTimestamp: 1, sequence: 1))
+        let manual = try manualMetadata(mapID: mapID, frameID: frameID, objectID: manualID)
+        try await store.upsert(manual)
+
+        let batches = TemporalBatchProjectionRecorder()
+        let restarted = TemporalSpatialMemoryService(
+            journalRepository: repository, policy: temporalTestPolicy(),
+            metadataProvider: { try await store.snapshot() },
+            metadataWriter: { try await store.upsert($0) },
+            metadataBatchWriter: { objects in
+                for object in objects { try await store.upsert(object) }
+                await batches.record(objects)
+            })
+        let recovered = try await restarted.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertNotNil(recovered.metadata(for: automaticID))
+        XCTAssertNil(recovered.metadata(for: manualID))
+        let projectedIDs = await batches.objectIDs
+        XCTAssertEqual(projectedIDs, [[automaticID]], "Automatic recovery must never project the manual annotation")
+        _ = try await restarted.process(
+            TemporalSpatialRecognitionBatch(sequence: 2,
+                observations: [temporalTestNewObservation(
+                    mapID: mapID, coordinateFrameID: frameID, objectID: nextAutomaticID, at: 102)],
+                expectedVisibleObjectIDs: []),
+            pose: temporalTestPose(mapID: mapID, coordinateFrameID: frameID,
+                capturedAt: 102, sessionTimestamp: 3, sequence: 3))
+        let durableManual = await store.metadata(for: manualID)
+        XCTAssertEqual(durableManual, manual, "Full automatic replay and new observations must preserve the point verbatim")
+        let allObjects = await store.allObjects()
+        XCTAssertEqual(allObjects.count, 3, "Manual records stay in the shared durable catalog")
+        let durableJournal = try await repository.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertNil(durableJournal?.snapshot.metadata(for: manualID))
+        XCTAssertNotNil(durableJournal?.snapshot.metadata(for: nextAutomaticID))
+    }
+
+    func testManualOnlyMetadataDoesNotSeedAutomaticJournal() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(114), frameID = temporalTestFrameID(114)
+        let manual = try manualMetadata(mapID: mapID, frameID: frameID, objectID: temporalTestObjectID(114))
+        let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)], objects: [manual]))
+        let repository = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let service = makeService(repository: repository, store: store)
+        let snapshot = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertTrue(snapshot.objects.isEmpty)
+        let writes = await store.writeAttemptCount()
+        XCTAssertEqual(writes, 0)
+        let durableObjects = await store.allObjects()
+        XCTAssertEqual(durableObjects, [manual])
+    }
+
+    func testUntrackedAutomaticObjectStillFailsAfterManualDomainSeparation() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(115), frameID = temporalTestFrameID(115)
+        let automaticID = temporalTestObjectID(115), untrackedID = temporalTestObjectID(116)
+        let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)]))
+        let repository = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let service = makeService(repository: repository, store: store)
+        _ = try await service.process(
+            TemporalSpatialRecognitionBatch(sequence: 1,
+                observations: [temporalTestNewObservation(
+                    mapID: mapID, coordinateFrameID: frameID, objectID: automaticID, at: 100)],
+                expectedVisibleObjectIDs: []),
+            pose: temporalTestPose(mapID: mapID, coordinateFrameID: frameID,
+                capturedAt: 100, sessionTimestamp: 1, sequence: 1))
+        try await store.upsert(temporalTestMetadata(
+            mapID: mapID, coordinateFrameID: frameID, objectID: untrackedID, at: 101))
+        let restarted = makeService(repository: repository, store: store)
+        await assertThrowsServiceError({
+            try await restarted.recover(mapID: mapID, coordinateFrameID: frameID)
+        }, equals: .untrackedDurableObject(untrackedID))
+    }
+
+    private func manualMetadata(mapID: MapID, frameID: CoordinateFrameID,
+                                objectID: ObjectID) throws -> SpatialObjectMetadata {
+        let position = try FramedPosition(coordinateFrameID: frameID, value: .zero,
+            observedAt: 101, trackingQuality: .normal, uncertainty: .highConfidenceDepth)
+        let object = try SpatialObject(id: objectID,
+            semanticLabel: UserObjectRegistrationAccumulator.semanticLabel,
+            position: .zero, bounds: nil, certainty: .confirmed, presence: .lastSeen,
+            confidence: ConfidenceVector(semantic: .one, geometry: .one, tracking: .one,
+                place: .one, identity: .one, objectState: .one),
+            firstSeenAt: 101, lastSeenAt: 101, displayName: "내 스피커")
+        return try SpatialObjectMetadata(mapID: mapID, object: object, position: position)
+    }
+
     func testColdRecoverySerializesCorrectionAndRecognitionWithoutRegressingCache() async throws {
         executionTimeAllowance = 60
         let root = temporaryDirectory()

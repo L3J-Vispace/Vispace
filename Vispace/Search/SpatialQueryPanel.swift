@@ -9,6 +9,7 @@ struct SpatialQueryPanel: View {
     @ObservedObject var navigationController: IndoorNavigationController
     let onManageData: () -> Void
     let distanceDescription: (Vec3) -> String
+    var onRegisterObject: (String) -> Void = { _ in }
     @FocusState private var queryIsFocused: Bool
     @State private var query = ""
     @State private var rejection: SpatialCommandRejection?
@@ -16,6 +17,7 @@ struct SpatialQueryPanel: View {
     @State private var selectedFurniture: FurnitureKind = .sofa
     @State private var editsObjectName = false
     @State private var objectNameDraft = ""
+    @State private var requiresObjectName = false
     @State private var editsClassification = false
     @State private var classificationDraft = ""
     @State private var classificationTarget: SpatialObjectMetadata?
@@ -125,6 +127,12 @@ struct SpatialQueryPanel: View {
                 }
 
                 Menu {
+                    Button("물체 위치 직접 등록") {
+                        queryIsFocused = false
+                        dismissAll()
+                        onRegisterObject("")
+                    }
+                    Divider()
                     placementButton(title: "소파", kind: .sofa)
                     placementButton(title: "침대", kind: .bed)
                     placementButton(title: "책상", kind: .desk)
@@ -132,7 +140,7 @@ struct SpatialQueryPanel: View {
                     Image(systemName: "square.grid.2x2.fill")
                         .font(.title3)
                 }
-                .accessibilityLabel("가구 배치 확인")
+                .accessibilityLabel("물체 등록 및 가구 배치")
                 .accessibilityIdentifier("vispace.placement.menu")
 
                 if isSearching {
@@ -162,6 +170,9 @@ struct SpatialQueryPanel: View {
         .padding(.horizontal, 14)
         .padding(.bottom, 10)
         .animation(.easeOut(duration: 0.2), value: queryController.latestPresentation)
+        .onChange(of: perceptionController.metrics.promotedObjects) { _, _ in
+            queryController.refreshUnresolvedQueryAfterObservation()
+        }
         .sheet(isPresented: $editsFurniture) {
             FurnitureDimensionEditor(kind: selectedFurniture) { dimensions in
                 dismissAll()
@@ -169,7 +180,7 @@ struct SpatialQueryPanel: View {
             }
         }
         .sheet(isPresented: $editsObjectName) {
-            ObjectNameEditor(name: objectNameDraft) { name in
+            ObjectNameEditor(name: objectNameDraft, requiresName: requiresObjectName) { name in
                 navigationController.clearRoute()
                 queryController.renameSelectedObject(name)
             }
@@ -226,6 +237,7 @@ struct SpatialQueryPanel: View {
 
     private func submit() {
         queryIsFocused = false
+        perceptionController.requestFreshRecognition()
         let command = SpatialCommandParser().parse(query)
         if case .placement(let kind) = command {
             dismissAll()
@@ -269,10 +281,29 @@ struct SpatialQueryPanel: View {
             Date(timeIntervalSince1970: $0).formatted(date: .abbreviated, time: .shortened)
         }
         return VStack(alignment: .leading, spacing: 8) {
-            messageCard(
-                message: presentation.message + (dateText.map { "\n마지막 관측: \($0)" } ?? ""),
-                systemImage: presentation.canStartARGuidance ? "location.fill" : "info.circle.fill"
-            )
+            TimelineView(.periodic(from: .now, by: 0.25)) { _ in
+                let snapshot = perceptionController.liveSearchSnapshot
+                let live = [.notFound, .lowConfidence].contains(presentation.result.status)
+                    ? snapshot?.matches(labels: presentation.result.matchedSemanticLabels,
+                                        now: ProcessInfo.processInfo.systemUptime).first : nil
+                messageCard(
+                    message: live.flatMap { snapshot?.message(for: $0) }
+                        ?? (presentation.message + (dateText.map { "\n마지막 관측: \($0)" } ?? "")),
+                    systemImage: presentation.canStartARGuidance ? "location.fill" : "info.circle.fill"
+                )
+            }
+            if presentation.result.status == .notFound || presentation.result.status == .lowConfidence {
+                Button("이 물체 위치 직접 기억") {
+                    let label = presentation.result.matchedSemanticLabels.first.map {
+                        ObjectSemanticCatalog.default.displayName(for: $0)
+                    } ?? ""
+                    queryIsFocused = false
+                    dismissAll()
+                    onRegisterObject(label)
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("vispace.object.register")
+            }
             if presentation.result.candidates.count > 1 {
                 ScrollView {
                     VStack(spacing: 6) {
@@ -283,7 +314,7 @@ struct SpatialQueryPanel: View {
                                     mapID: candidate.record.metadata.mapID)
                             } label: {
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text("\(candidate.record.metadata.object.displayLabel) · 후보 \(index + 1)")
+                                    Text("\(candidate.record.metadata.object.displayName ?? ObjectSemanticCatalog.default.displayName(for: candidate.record.metadata.object.semanticLabel)) · 후보 \(index + 1)")
                                         .font(.subheadline.weight(.semibold))
                                     Text(candidateDescription(candidate))
                                         .font(.caption)
@@ -305,12 +336,15 @@ struct SpatialQueryPanel: View {
                     if queryController.canRenameObjects && selected.record.metadata.object.presence != .removed {
                         Button(selected.record.metadata.object.displayName == nil ? "이름 지정" : "이름 변경") {
                             objectNameDraft = selected.record.metadata.object.displayName ?? ""
+                            requiresObjectName = selected.record.metadata.object.semanticLabel
+                                == UserObjectRegistrationAccumulator.semanticLabel
                             editsObjectName = true
                         }
                         .accessibilityIdentifier("vispace.query.rename")
                     }
                     if queryController.canCorrectClassification && selected.matchesCurrentMap == true
                         && selected.record.metadata.object.presence != .removed
+                        && selected.record.metadata.object.semanticLabel != "user_registered_object"
                     {
                         Button("종류 정정") {
                             classificationDraft = selected.record.metadata.object.semanticLabel
@@ -321,7 +355,10 @@ struct SpatialQueryPanel: View {
                     }
                     Spacer()
                     Button("다른 후보 다시 보기") {
-                        query = selected.record.metadata.object.semanticLabel
+                        let object = selected.record.metadata.object
+                        query = object.semanticLabel == "user_registered_object"
+                            ? (object.displayName ?? "직접 등록한 물체")
+                            : ObjectSemanticCatalog.default.displayName(for: object.semanticLabel)
                         navigationController.clearRoute()
                         queryController.submit(query)
                     }
@@ -376,11 +413,12 @@ struct SpatialQueryPanel: View {
 private struct ObjectNameEditor: View {
     @Environment(\.dismiss) private var dismiss
     @State var name: String
+    var requiresName = false
     let onSave: (String) -> Void
 
     private var isValid: Bool {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty || (trimmed.count <= SpatialObject.maximumDisplayNameLength
+        return (trimmed.isEmpty && !requiresName) || (!trimmed.isEmpty && trimmed.count <= SpatialObject.maximumDisplayNameLength
             && trimmed.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
             && trimmed.unicodeScalars.contains(where: CharacterSet.alphanumerics.contains))
     }
@@ -390,7 +428,9 @@ private struct ObjectNameEditor: View {
             Form {
                 TextField("예: 창가 의자", text: $name)
                     .accessibilityIdentifier("vispace.query.name.field")
-                Text("이름은 선택한 물체에만 저장돼요. 빈칸으로 저장하면 지정한 이름을 지워요. 자동 인식 종류는 유지됩니다.")
+                Text(requiresName
+                     ? "직접 등록한 물체는 이 이름으로 검색해요. 이름을 비워 둘 수는 없어요."
+                     : "이름은 선택한 물체에만 저장돼요. 빈칸으로 저장하면 지정한 이름을 지워요. 자동 인식 종류는 유지됩니다.")
                     .font(.footnote)
                 if !isValid { Text("줄바꿈 없이 64자 이내의 이름을 입력해 주세요.").foregroundStyle(.red) }
             }

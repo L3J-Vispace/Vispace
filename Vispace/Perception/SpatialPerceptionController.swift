@@ -99,6 +99,7 @@ public final class SpatialPerceptionController: ObservableObject {
     @Published public private(set) var identityConfirmationCandidates: [ObjectIdentityConfirmationCandidate] =
         []
     @Published public private(set) var latestDetections: [DetectedObject] = []
+    @Published public private(set) var liveSearchSnapshot: LiveObjectSearchSnapshot?
     @Published public private(set) var metrics = SpatialPerceptionMetrics()
     /// Persists across ordinary scanning state changes until a durable write succeeds.
     @Published public private(set) var persistenceFailureMessage: String?
@@ -107,6 +108,11 @@ public final class SpatialPerceptionController: ObservableObject {
 
     public var isDetectorAvailable: Bool {
         detectorResolution.availability == .available
+    }
+
+    /// A search requests a new detector pass instead of waiting on an old track.
+    public func requestFreshRecognition() {
+        lastDetectorTimestamp = nil
     }
 
     var isProcessingForTesting: Bool {
@@ -357,6 +363,8 @@ public final class SpatialPerceptionController: ObservableObject {
         }
         processingBudget = nextBudget
         guard let identity = confirmedIdentityProvider(frame) else {
+            liveSearchSnapshot = nil
+            latestDetections = []
             state = .waitingForStableTracking
             return
         }
@@ -475,6 +483,11 @@ public final class SpatialPerceptionController: ObservableObject {
                 }
 
                 self.latestDetections = frameObservations.observations.map(\.detection)
+                self.liveSearchSnapshot = LiveObjectSearchSnapshot(
+                    detections: self.latestDetections, identity: identity,
+                    timestamp: frame.pose.timestamp, orientation: frame.imageOrientation,
+                    displayTransform: frame.displayTransform,
+                    hasDepth: frame.sceneDepth != nil || frame.smoothedSceneDepth != nil)
                 await self.consume(
                     frameObservations,
                     frame: frame,
@@ -571,6 +584,7 @@ public final class SpatialPerceptionController: ObservableObject {
             located = result
         case .unavailable:
             metrics.depthFailures &+= 1
+            liveSearchSnapshot?.recordDepthFailure(for: detection)
             return
         }
 
@@ -890,6 +904,7 @@ public final class SpatialPerceptionController: ObservableObject {
             located = result
         case .unavailable:
             metrics.depthFailures &+= 1
+            liveSearchSnapshot?.recordDepthFailure(for: detection)
             return nil
         }
 
@@ -1681,6 +1696,8 @@ public final class SpatialPerceptionController: ObservableObject {
         lastDetectorTimestamp = nil
         lastResourceAcceptedTimestamp = nil
         lastCalendarSample = nil
+        liveSearchSnapshot = nil
+        latestDetections = []
     }
 
     private func cancelProcessingTasks() {
