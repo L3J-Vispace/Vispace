@@ -107,7 +107,7 @@ final class SpatialObjectQuerySearchTests: XCTestCase {
         XCTAssertEqual(result.status, .found)
     }
 
-    func testUnknownSemanticTargetIsExplicitlyNotFound() throws {
+    func testKnownUnsupportedSemanticTargetDoesNotBecomeLanguageFailure() throws {
         let laptop = try makeMetadata(
             id: objectID(50_104),
             mapID: currentMapID,
@@ -121,9 +121,106 @@ final class SpatialObjectQuerySearchTests: XCTestCase {
         )
 
         XCTAssertEqual(result.status, .notFound)
-        XCTAssertEqual(result.issues, [.noSemanticTarget])
+        XCTAssertEqual(result.issues, [.automaticDetectionUnsupported])
         XCTAssertTrue(result.candidates.isEmpty)
         XCTAssertNil(result.groundedPosition)
+    }
+
+    func testScreenshotAndUnspacedKeyboardRequestsAreUnderstoodWithoutRecords() throws {
+        for utterance in ["키보드 어디있어?", "키보드어디있어?", "키보드가어디있어?",
+                          "내키보드어딨어?", "키보드찾아줘", "키보드"] {
+            let result = DeterministicSpatialObjectSearchEngine().search(
+                utterance: utterance, records: [], context: try context())
+            XCTAssertEqual(result.route.kind, .searchObject, utterance)
+            XCTAssertEqual(result.matchedSemanticLabels, ["keyboard"], utterance)
+            XCTAssertEqual(result.issues, [.objectNotYetObserved], utterance)
+            XCTAssertEqual(result.status, .notFound, utterance)
+            XCTAssertTrue(result.candidates.isEmpty, utterance)
+            XCTAssertNil(result.groundedPosition, utterance)
+        }
+    }
+
+    func testEveryBundledClassKoreanNameFindsItsActualStoredModelLabel() throws {
+        for (index, entry) in ObjectSemanticCatalog.default.entries.filter(\.supportsAutomaticDetection).enumerated() {
+            let stored = try makeMetadata(id: objectID(70_000 + index), mapID: currentMapID,
+                frameID: currentFrameID, label: entry.canonicalLabel)
+            let result = DeterministicSpatialObjectSearchEngine().search(
+                utterance: "\(entry.koreanName) 어디 있어?", records: [record(stored)], context: try context())
+            XCTAssertEqual(result.status, .found, entry.canonicalLabel)
+            XCTAssertEqual(result.selectedCandidate?.record.metadata.object.id, stored.object.id, entry.canonicalLabel)
+            XCTAssertEqual(result.groundedPosition, stored.position, entry.canonicalLabel)
+        }
+    }
+
+    func testLegacyModelLabelsAndModernSynonymsResolveTheSameStoredObject() throws {
+        for (index, pair) in [("tvmonitor", "모니터"), ("tvmonitor", "television"),
+                             ("diningtable", "식탁"), ("dining table", "탁자"),
+                             ("pottedplant", "화분"), ("potted plant", "식물"),
+                             ("sofa", "소파"), ("couch", "쇼파")].enumerated() {
+            let stored = try makeMetadata(id: objectID(71_000 + index), mapID: currentMapID,
+                frameID: currentFrameID, label: pair.0)
+            let result = DeterministicSpatialObjectSearchEngine().search(
+                utterance: "\(pair.1) 찾아줘", records: [record(stored)], context: try context())
+            XCTAssertEqual(result.status, .found, pair.0)
+            XCTAssertEqual(result.groundedPosition, stored.position)
+        }
+    }
+
+    func testKnownManualClassCanFindRealRecordAndNeverInventsOne() throws {
+        for (index, pair) in [("key", "열쇠"), ("wallet", "지갑"), ("speaker", "스피커"),
+                             ("desktop computer", "본체"), ("cable", "케이블"), ("desk", "책상")].enumerated() {
+            let stored = try makeMetadata(id: objectID(72_000 + index), mapID: currentMapID,
+                frameID: currentFrameID, label: pair.0)
+            let engine = DeterministicSpatialObjectSearchEngine()
+            let missing = engine.search(utterance: "\(pair.1) 찾아줘", records: [], context: try context())
+            XCTAssertEqual(missing.issues, [.automaticDetectionUnsupported], pair.0)
+            XCTAssertNil(missing.groundedPosition)
+            let found = engine.search(utterance: "\(pair.1) 찾아줘", records: [record(stored)], context: try context())
+            XCTAssertEqual(found.status, .found, pair.0)
+            XCTAssertEqual(found.groundedPosition, stored.position)
+        }
+    }
+
+    func testObjectNamesInsideOtherNounsDoNotMatchAndUnknownTextStaysUnknown() throws {
+        let keyboard = try makeMetadata(id: objectID(73_001), mapID: currentMapID,
+            frameID: currentFrameID, label: "keyboard")
+        let mouse = try makeMetadata(id: objectID(73_002), mapID: currentMapID,
+            frameID: currentFrameID, label: "mouse")
+        let engine = DeterministicSpatialObjectSearchEngine()
+        for utterance in ["키보드케이스어디있어", "마우스패드 찾아줘"] {
+            let result = engine.search(utterance: utterance,
+                records: [record(keyboard), record(mouse)], context: try context())
+            XCTAssertEqual(result.issues, [.automaticDetectionUnsupported], utterance)
+            XCTAssertTrue(result.candidates.isEmpty)
+            XCTAssertNil(result.groundedPosition)
+        }
+        for utterance in ["키보드장식어디있어", "마우스피스 찾아줘", "flibbertigibbet 찾아줘"] {
+            let result = engine.search(utterance: utterance,
+                records: [record(keyboard), record(mouse)], context: try context())
+            XCTAssertEqual(result.issues, [.noSemanticTarget], utterance)
+            XCTAssertNil(result.groundedPosition)
+        }
+    }
+
+    func testMissingSecondTargetPreventsSingleObjectGuidance() throws {
+        let keyboard = try makeMetadata(id: objectID(74_001), mapID: currentMapID,
+            frameID: currentFrameID, label: "keyboard")
+        let result = DeterministicSpatialObjectSearchEngine().search(
+            utterance: "키보드랑 지갑 어디 있어?", records: [record(keyboard)], context: try context())
+        XCTAssertEqual(result.status, .ambiguous)
+        XCTAssertEqual(result.issues, [.multipleSemanticTargets])
+        XCTAssertNil(result.selectedCandidate)
+        XCTAssertNil(result.groundedPosition)
+    }
+
+    func testCustomSavedNameTakesPrecedenceOverVocabularyAndSurvivesUnspacedQuery() throws {
+        let custom = try makeMetadata(id: objectID(74_002), mapID: currentMapID,
+            frameID: currentFrameID, label: "custom device", displayName: "내 작업 키보드")
+        let result = DeterministicSpatialObjectSearchEngine().search(
+            utterance: "내 작업 키보드어디있어?", records: [record(custom)], context: try context())
+        XCTAssertEqual(result.status, .found)
+        XCTAssertEqual(result.matchedSemanticLabels, ["custom device"])
+        XCTAssertEqual(result.groundedPosition, custom.position)
     }
 
     func testComplexPlacementRequestNeverLeaksSearchCoordinate() throws {
@@ -611,7 +708,8 @@ final class SpatialObjectQuerySearchTests: XCTestCase {
         confidence: ConfidenceVector = vector(),
         lastSeenAt: TimeInterval = 100,
         trackingQuality: SpatialTrackingQuality = .normal,
-        uncertainty: SpatialPositionUncertainty = .unknown
+        uncertainty: SpatialPositionUncertainty = .unknown,
+        displayName: String? = nil
     ) throws -> SpatialObjectMetadata {
         let object = try SpatialObject(
             id: id,
@@ -621,7 +719,8 @@ final class SpatialObjectQuerySearchTests: XCTestCase {
             presence: presence,
             confidence: confidence,
             firstSeenAt: 1,
-            lastSeenAt: lastSeenAt
+            lastSeenAt: lastSeenAt,
+            displayName: displayName
         )
         let framedPosition = try FramedPosition(
             coordinateFrameID: frameID,

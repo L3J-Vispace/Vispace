@@ -4,7 +4,7 @@ import VispaceCore
 /// A deterministic, bounded alias table used only to match persisted semantic
 /// labels. It never supplies an object identity or a coordinate.
 public struct SpatialObjectAliasCatalog: Hashable, Sendable {
-    public static let maximumCanonicalLabelCount = 128
+    public static let maximumCanonicalLabelCount = 512
     public static let maximumAliasesPerLabel = 12
     public static let maximumTermLength = 64
 
@@ -54,33 +54,9 @@ public struct SpatialObjectAliasCatalog: Hashable, Sendable {
         aliasesByCanonicalLabel.count
     }
 
-    public static let koreanEnglishDefaults = Self(semanticGroups: [
-        ["chair", "의자"],
-        ["table", "dining table", "테이블", "탁자"],
-        ["sofa", "couch", "소파"],
-        ["bed", "침대"],
-        ["desk", "책상"],
-        ["laptop", "notebook computer", "노트북"],
-        ["phone", "cell phone", "smartphone", "휴대폰", "핸드폰", "스마트폰"],
-        ["key", "keys", "열쇠", "키"],
-        ["wallet", "지갑"],
-        ["bag", "handbag", "가방"],
-        ["backpack", "백팩", "배낭"],
-        ["remote", "remote control", "리모컨"],
-        ["bottle", "water bottle", "병", "물병"],
-        ["printer", "프린터"],
-        ["television", "tv", "텔레비전", "티비"],
-        ["refrigerator", "fridge", "냉장고"],
-        ["microwave", "전자레인지"],
-        ["book", "책"],
-        ["cup", "mug", "컵", "잔"],
-        ["camera", "카메라"],
-        ["speaker", "스피커"],
-        ["monitor", "모니터"],
-        ["mouse", "마우스"],
-        ["keyboard", "키보드"],
-        ["plant", "potted plant", "화분", "식물"],
-    ])
+    public static let koreanEnglishDefaults = Self(
+        semanticGroups: ObjectSemanticCatalog.default.entries.map(\.searchTerms)
+    )
 
     private static func normalizedTerm(_ value: String) -> String? {
         let normalized =

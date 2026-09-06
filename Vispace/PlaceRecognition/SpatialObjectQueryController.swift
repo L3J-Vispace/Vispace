@@ -641,7 +641,8 @@ public final class SpatialObjectQueryController: ObservableObject {
             ?? result.matchedSemanticLabels.first
             ?? result.candidates.first?.record.metadata.object.semanticLabel
             ?? "물체"
-        let label = String(rawLabel.prefix(64))
+        let label = String((result.selectedCandidate?.record.metadata.object.displayName
+            ?? ObjectSemanticCatalog.default.displayName(for: rawLabel)).prefix(64))
 
         switch result.status {
         case .found:
@@ -665,10 +666,19 @@ public final class SpatialObjectQueryController: ObservableObject {
                 return "‘\(label)’ 기록은 찾았지만 안내 좌표를 확정하지 못했어요."
             }
         case .ambiguous:
+            if result.issues.contains(.multipleSemanticTargets) {
+                return "여러 종류의 물체가 포함되어 있어요. 찾을 물체를 하나씩 말해 주세요."
+            }
             return "‘\(label)’ 후보가 여러 개예요. 찾으려는 물체를 선택해 주세요."
         case .notFound:
             if result.issues.contains(.noSemanticTarget) {
-                return "찾을 물체를 이해하지 못했어요. 물체 이름과 함께 다시 말해 주세요."
+                return "‘키보드 찾아줘’처럼 물체 이름을 말하거나, 저장한 물체의 이름으로 검색해 주세요."
+            }
+            if result.issues.contains(.automaticDetectionUnsupported) {
+                return "‘\(label)’은 현재 자동 인식 모델이 지원하지 않는 종류예요. 물체를 직접 지정해 위치를 저장한 뒤 검색할 수 있어요."
+            }
+            if result.issues.contains(.objectNotYetObserved) {
+                return "‘\(label)’을 찾고 있어요. 아직 저장된 위치가 없으니 카메라로 물체 전체를 잠시 비춰 주세요."
             }
             return "‘\(label)’의 저장된 위치가 없어요. 자동 인식이 지원되는 물체 종류를 확인하거나, 저장된 물체에 붙인 이름으로 검색해 주세요."
         case .lowConfidence:

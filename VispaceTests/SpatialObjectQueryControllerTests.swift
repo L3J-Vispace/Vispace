@@ -253,6 +253,66 @@ final class SpatialObjectQueryControllerTests: XCTestCase {
         XCTAssertTrue(bounded.aliases(for: "label-999").isEmpty)
     }
 
+    func testRepositoryAliasCatalogCoversEveryModelClassAndLegacySynonym() {
+        let aliases = SpatialObjectAliasCatalog.koreanEnglishDefaults
+        for entry in ObjectSemanticCatalog.default.entries {
+            for term in entry.searchTerms {
+                if term != entry.koreanName {
+                    XCTAssertTrue(aliases.aliases(for: term).contains(entry.koreanName), term)
+                }
+                if term != entry.canonicalLabel {
+                    XCTAssertTrue(aliases.aliases(for: term).contains(entry.canonicalLabel), term)
+                }
+            }
+        }
+        XCTAssertTrue(aliases.aliases(for: "tvmonitor").contains("모니터"))
+        XCTAssertTrue(aliases.aliases(for: "diningtable").contains("식탁"))
+        XCTAssertTrue(aliases.aliases(for: "pottedplant").contains("화분"))
+    }
+
+    func testScreenshotQueryExplainsUnseenObjectWithoutLanguageFailureOrGuidance() async throws {
+        let box = QueryIdentityBox(identity(mapID: mapID(78), frameID: frameID(78)))
+        let subject = controller(identityBox: box, records: [])
+        subject.submit("키보드 어디있어?", now: 100)
+        try await waitForIdle(subject)
+        let presentation = try XCTUnwrap(subject.latestPresentation)
+        XCTAssertEqual(presentation.result.issues, [.objectNotYetObserved])
+        XCTAssertTrue(presentation.message.contains("키보드"))
+        XCTAssertTrue(presentation.message.contains("아직 저장된 위치가 없"))
+        XCTAssertFalse(presentation.message.contains("이해하지 못"))
+        XCTAssertNil(subject.latestGroundedTarget)
+        XCTAssertFalse(presentation.canStartARGuidance)
+    }
+
+    func testUnsupportedClassExplainsManualRegistrationWithoutInventingLocation() async throws {
+        let box = QueryIdentityBox(identity(mapID: mapID(79), frameID: frameID(79)))
+        let subject = controller(identityBox: box, records: [])
+        subject.submit("스피커어디있어?", now: 100)
+        try await waitForIdle(subject)
+        let presentation = try XCTUnwrap(subject.latestPresentation)
+        XCTAssertEqual(presentation.result.issues, [.automaticDetectionUnsupported])
+        XCTAssertTrue(presentation.message.contains("자동 인식 모델이 지원하지 않는"))
+        XCTAssertTrue(presentation.message.contains("직접 지정"))
+        XCTAssertTrue(presentation.result.candidates.isEmpty)
+        XCTAssertNil(subject.latestGroundedTarget)
+    }
+
+    func testRepositoryAndControllerFindActualLegacyMonitorLabelInKorean() async throws {
+        let map = mapID(80)
+        let frame = frameID(80)
+        let stored = try metadata(id: objectID(80), mapID: map, frameID: frame, label: "tvmonitor")
+        let repository = SpatialObjectQueryRepository(
+            metadataProvider: { SpatialMetadataDocument(objects: [stored]) },
+            alignmentCatalogProvider: { try CoordinateAlignmentCatalogSnapshot() })
+        let current = identity(mapID: map, frameID: frame)
+        let subject = SpatialObjectQueryController(repository: repository, currentIdentityProvider: { current })
+        subject.submit("모니터어디있어?", now: 100)
+        try await waitForIdle(subject)
+        XCTAssertEqual(subject.latestPresentation?.result.status, .found)
+        XCTAssertEqual(subject.latestGroundedTarget?.objectID, stored.object.id)
+        XCTAssertTrue(subject.latestPresentation?.message.contains("모니터") == true)
+    }
+
     func testRepositoryMapsCurrentVisibleLocalAndHistoricalObjectsToMemoryTiers() async throws {
         let currentMap = mapID(1)
         let currentFrame = frameID(1)

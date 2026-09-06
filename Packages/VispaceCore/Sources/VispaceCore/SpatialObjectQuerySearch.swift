@@ -102,6 +102,10 @@ public enum SpatialObjectSearchStatus: String, Codable, Hashable, Sendable {
 
 public enum SpatialObjectSearchIssue: String, Codable, Hashable, Sendable {
     case noSemanticTarget
+    /// The requested class is understood but has no stored observation yet.
+    case objectNotYetObserved
+    /// The bundled model has no class for this object; a real manual record is needed.
+    case automaticDetectionUnsupported
     case noEligibleStoredObject
     case multipleSemanticTargets
     case multiplePlausibleObjects
@@ -238,7 +242,7 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
             )
         }
 
-        let matchingIDs = Set(termMatches.map(\.objectID))
+        let matchingIDs = Set(termMatches.compactMap(\.objectID))
         let matchingRecords = records.filter { record in
             matchingIDs.contains(record.metadata.object.id)
                 && record.metadata.object.certainty == .confirmed
@@ -249,16 +253,6 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
         ranked = deduplicatingObjectIDs(ranked)
         let candidates = Array(ranked.prefix(policy.maximumResultCount).map(\.candidate))
 
-        guard !candidates.isEmpty else {
-            return SpatialObjectSearchResult(
-                route: route,
-                status: .notFound,
-                matchedSemanticLabels: canonicalLabels,
-                candidates: [],
-                issues: [.noEligibleStoredObject]
-            )
-        }
-
         if canonicalLabels.count > 1 {
             return SpatialObjectSearchResult(
                 route: route,
@@ -266,6 +260,26 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
                 matchedSemanticLabels: canonicalLabels,
                 candidates: candidates,
                 issues: [.multipleSemanticTargets]
+            )
+        }
+
+        guard !candidates.isEmpty else {
+            let issue: SpatialObjectSearchIssue
+            if !matchingIDs.isEmpty {
+                issue = .noEligibleStoredObject
+            } else if canonicalLabels.contains(where: {
+                ObjectSemanticCatalog.default.entry(for: $0)?.supportsAutomaticDetection == false
+            }) {
+                issue = .automaticDetectionUnsupported
+            } else {
+                issue = .objectNotYetObserved
+            }
+            return SpatialObjectSearchResult(
+                route: route,
+                status: .notFound,
+                matchedSemanticLabels: canonicalLabels,
+                candidates: [],
+                issues: [issue]
             )
         }
 
@@ -529,6 +543,7 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
         for record in records {
             let canonicalLabel = normalizeLabel(record.metadata.object.semanticLabel)
             let terms = [record.metadata.object.semanticLabel] + record.semanticAliases
+                + ObjectSemanticCatalog.default.aliases(for: record.metadata.object.semanticLabel)
                 + [record.metadata.object.displayName].compactMap { $0 }
             for term in Set(terms.map(normalizeLabel)).sorted() {
                 let termTokens = lexicalTokens(term)
@@ -548,6 +563,26 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
                             specificity: termTokens.count
                         )
                     )
+                }
+            }
+        }
+
+        // Understanding an object name must not depend on having seen it before.
+        // Vocabulary matches deliberately carry no object identity or coordinate.
+        // A stored custom name wins over a dictionary term at the same range.
+        let storedMatches = matches
+        for entry in ObjectSemanticCatalog.default.entries {
+            for term in Set(entry.searchTerms.map(normalizeLabel)).sorted() {
+                let termTokens = lexicalTokens(term)
+                guard !termTokens.isEmpty, termTokens.count <= queryTokens.count else { continue }
+                for start in 0...(queryTokens.count - termTokens.count) {
+                    let range = start..<(start + termTokens.count)
+                    guard tokensMatch(query: Array(queryTokens[range]), term: termTokens),
+                        !storedMatches.contains(where: { $0.range == range })
+                    else { continue }
+                    matches.append(SemanticTermMatch(
+                        canonicalLabel: entry.canonicalLabel, objectID: nil,
+                        range: range, specificity: termTokens.count))
                 }
             }
         }
@@ -583,12 +618,24 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
                 continue
             }
             guard index == term.indices.last,
-                strippedKoreanParticle(from: query[index]) == term[index]
+                koreanTokenMatches(query[index], term: term[index])
             else {
                 return false
             }
         }
         return true
+    }
+
+    private func koreanTokenMatches(_ query: String, term: String) -> Bool {
+        let possessives = ["내", "제", "나의", "저의"]
+        if possessives.contains(where: { query == $0 + term }) { return true }
+        let stripped = strippedKoreanParticle(from: query)
+        if stripped == term { return true }
+        guard term.unicodeScalars.contains(where: { (0xAC00...0xD7A3).contains(Int($0.value)) })
+        else { return false }
+        // Only whole possessive + object + particle forms are accepted. A class
+        // name inside another noun (e.g. 키보드케이스) must not match 키보드.
+        return possessives.contains { stripped == $0 + term }
     }
 
     private func strippedKoreanParticle(from token: String) -> String {
@@ -608,7 +655,23 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
     }
 
     private func lexicalTokens(_ value: String) -> [String] {
-        normalizeText(value).split(separator: " ").map(String.init)
+        normalizeText(value).split(separator: " ").flatMap { raw -> [String] in
+            let token = String(raw)
+            // Korean users often omit the space before a search request. Split
+            // only complete, explicit terminal request forms, never arbitrary
+            // substrings inside an object name.
+            let requests = [
+                "위치를알려주세요", "위치알려주세요", "위치를알려줘", "위치알려줘",
+                "어디에있나요", "어디에있어요", "어디에있어", "어디있나요", "어디있어요",
+                "어디있니", "어디있어", "어디인가요", "어디야", "어딨어", "어딨니",
+                "안내해주세요", "안내해줘", "마지막위치알려줘", "마지막위치",
+                "찾아주세요", "찾아줘", "찾아봐", "찾아", "어디",
+            ]
+            if let request = requests.first(where: { token.count > $0.count && token.hasSuffix($0) }) {
+                return [String(token.dropLast(request.count)), request]
+            }
+            return [token]
+        }
     }
 
     private func normalizeLabel(_ value: String) -> String {
@@ -641,7 +704,7 @@ private struct RankedCandidate: Sendable {
 
 private struct SemanticTermMatch: Hashable, Sendable {
     let canonicalLabel: String
-    let objectID: ObjectID
+    let objectID: ObjectID?
     let range: Range<Int>
     let specificity: Int
 }
