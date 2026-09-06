@@ -128,7 +128,8 @@ final class SpatialObjectQuerySearchTests: XCTestCase {
 
     func testScreenshotAndUnspacedKeyboardRequestsAreUnderstoodWithoutRecords() throws {
         for utterance in ["키보드 어디있어?", "키보드어디있어?", "키보드가어디있어?",
-                          "내키보드어딨어?", "키보드찾아줘", "키보드"] {
+                          "내키보드어딨어?", "키보드어딨지?", "키보드어딨어요?", "키보드찾아줘",
+                          "키보드위치알려줘", "키보드 위치 알려줘", "키보드"] {
             let result = DeterministicSpatialObjectSearchEngine().search(
                 utterance: utterance, records: [], context: try context())
             XCTAssertEqual(result.route.kind, .searchObject, utterance)
@@ -137,6 +138,19 @@ final class SpatialObjectQuerySearchTests: XCTestCase {
             XCTAssertEqual(result.status, .notFound, utterance)
             XCTAssertTrue(result.candidates.isEmpty, utterance)
             XCTAssertNil(result.groundedPosition, utterance)
+        }
+    }
+
+    func testUnspacedHistoryAndPossessiveNounsUseWholeRequestSuffix() throws {
+        let engine = DeterministicSpatialObjectSearchEngine()
+        let history = engine.search(utterance: "키보드마지막위치알려줘", records: [], context: try context())
+        XCTAssertEqual(history.route.kind, .lastSeen)
+        XCTAssertEqual(history.matchedSemanticLabels, ["keyboard"])
+        XCTAssertNil(history.groundedPosition)
+        for utterance in ["내사과어디있어", "제고양이찾아줘"] {
+            let result = engine.search(utterance: utterance, records: [], context: try context())
+            XCTAssertEqual(result.issues, [.objectNotYetObserved], utterance)
+            XCTAssertEqual(result.matchedSemanticLabels.count, 1, utterance)
         }
     }
 

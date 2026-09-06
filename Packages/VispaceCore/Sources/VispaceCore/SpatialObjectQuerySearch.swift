@@ -199,6 +199,13 @@ public struct SpatialObjectSearchResult: Hashable, Sendable {
 public struct DeterministicSpatialObjectSearchEngine: Sendable {
     public let policy: SpatialObjectSearchPolicy
     private let intentRouter: DeterministicIntentRouter
+    private static let koreanRequestSuffixes = [
+        "위치를알려주세요", "위치알려주세요", "위치를알려줘", "위치알려줘",
+        "어디에있나요", "어디에있어요", "어디에있어", "어디있나요", "어디있어요",
+        "어디있니", "어디있어", "어디인가요", "어디야", "어딨어", "어딨어요",
+        "어딨니", "어딨지", "어딨나요", "안내해주세요", "안내해줘",
+        "마지막위치알려줘", "마지막위치", "찾아주세요", "찾아줘", "찾아봐", "찾아", "어디",
+    ].sorted { $0.count > $1.count }
 
     public init(
         policy: SpatialObjectSearchPolicy = .default,
@@ -660,14 +667,7 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
             // Korean users often omit the space before a search request. Split
             // only complete, explicit terminal request forms, never arbitrary
             // substrings inside an object name.
-            let requests = [
-                "위치를알려주세요", "위치알려주세요", "위치를알려줘", "위치알려줘",
-                "어디에있나요", "어디에있어요", "어디에있어", "어디있나요", "어디있어요",
-                "어디있니", "어디있어", "어디인가요", "어디야", "어딨어", "어딨니",
-                "안내해주세요", "안내해줘", "마지막위치알려줘", "마지막위치",
-                "찾아주세요", "찾아줘", "찾아봐", "찾아", "어디",
-            ]
-            if let request = requests.first(where: { token.count > $0.count && token.hasSuffix($0) }) {
+            if let request = Self.koreanRequestSuffixes.first(where: { token.count > $0.count && token.hasSuffix($0) }) {
                 return [String(token.dropLast(request.count)), request]
             }
             return [token]

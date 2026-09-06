@@ -60,7 +60,8 @@ public struct DeterministicIntentRouter: Sendable {
         Rule(
             kind: .searchObject,
             priority: 200,
-            signals: ["어디", "어딨어", "어딨", "찾아", "찾아줘", "where is", "find"]
+            signals: ["어디", "어딨어", "어딨", "찾아", "찾아줘", "위치 알려", "위치를 알려",
+                      "위치알려", "위치를알려", "where is", "find"]
         ),
     ]
 
