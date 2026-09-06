@@ -154,6 +154,8 @@ public final class SpatialObjectQueryController: ObservableObject {
     private var latestSubmittedQuery = ""
     private var latestSubmittedFloor: SpatialNodeID?
     private var presentedIdentity: ARCaptureIdentity?
+    private var allowsObservationRefresh = false
+    private var pendingObservationRefreshAt: TimeInterval?
 
     private var queryTask: Task<Void, Never>?
     private var trackedQueryTasks: [UUID: Task<Void, Never>] = [:]
@@ -210,9 +212,31 @@ public final class SpatialObjectQueryController: ObservableObject {
         currentFloorNodeID: SpatialNodeID? = nil,
         now: TimeInterval = Date().timeIntervalSince1970
     ) {
+        pendingObservationRefreshAt = nil
+        allowsObservationRefresh = true
         latestSubmittedQuery = utterance
         latestSubmittedFloor = currentFloorNodeID
         startQuery(utterance, currentFloorNodeID: currentFloorNodeID, now: now)
+    }
+
+    /// Rechecks the submitted request after real observations have been saved.
+    /// Editable UI text is intentionally not accepted. At most one refresh waits
+    /// behind an in-flight read, and a successful/explicit selection ends retries.
+    public func refreshUnresolvedQueryAfterObservation(now: TimeInterval = Date().timeIntervalSince1970) {
+        guard now.isFinite, now >= 0, allowsObservationRefresh, !latestSubmittedQuery.isEmpty else { return }
+        if queryTask != nil {
+            pendingObservationRefreshAt = now
+            return
+        }
+        guard let presentation = latestPresentation,
+            presentedIdentity == currentIdentityProvider(),
+            Self.canRefreshAfterObservation(presentation.result) else { return }
+        startQuery(latestSubmittedQuery, currentFloorNodeID: latestSubmittedFloor, now: now)
+    }
+
+    private static func canRefreshAfterObservation(_ result: SpatialObjectSearchResult) -> Bool {
+        result.status == .lowConfidence || (result.status == .notFound
+            && (result.issues.contains(.objectNotYetObserved) || result.issues.contains(.noEligibleStoredObject)))
     }
 
     public func selectCandidate(objectID: ObjectID, mapID: MapID,
@@ -370,6 +394,10 @@ public final class SpatialObjectQueryController: ObservableObject {
 
     private func startQuery(_ utterance: String, currentFloorNodeID: SpatialNodeID?, now: TimeInterval,
                             selection: SpatialObjectMetadata? = nil, selectedRoute: IntentRoute? = nil) {
+        if selection != nil {
+            allowsObservationRefresh = false
+            pendingObservationRefreshAt = nil
+        }
         guard now.isFinite, now >= 0 else {
             cancelCurrentQuery(resetToIdle: false)
             publishFailure()
@@ -492,6 +520,8 @@ public final class SpatialObjectQueryController: ObservableObject {
     }
 
     public func cancelCurrentQuery(resetToIdle: Bool = true) {
+        pendingObservationRefreshAt = nil
+        allowsObservationRefresh = false
         guard queryTask != nil else {
             if resetToIdle {
                 state = .idle
@@ -545,6 +575,8 @@ public final class SpatialObjectQueryController: ObservableObject {
     private func rejectStaleResult(requestID: UInt64) {
         metrics.staleResultsRejected &+= 1
         if requestID == latestRequestID {
+            pendingObservationRefreshAt = nil
+            allowsObservationRefresh = false
             state = .idle
             latestPresentation = nil
             latestGroundedTarget = nil
@@ -556,6 +588,10 @@ public final class SpatialObjectQueryController: ObservableObject {
             return
         }
         queryTask = nil
+        if let refreshAt = pendingObservationRefreshAt {
+            pendingObservationRefreshAt = nil
+            refreshUnresolvedQueryAfterObservation(now: refreshAt)
+        }
     }
 
     private func publishFailure(message: String = "저장된 공간 정보를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.") {

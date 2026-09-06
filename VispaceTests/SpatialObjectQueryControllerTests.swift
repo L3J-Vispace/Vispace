@@ -878,6 +878,90 @@ final class SpatialObjectQueryControllerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(controller.metrics.staleResultsRejected, 1)
     }
 
+    func testObservationRefreshCoalescesAndRetriesOnlyTheSubmittedQuery() async throws {
+        let map = mapID(132)
+        let frame = frameID(132)
+        let keyboard = try metadata(id: objectID(132), mapID: map, frameID: frame, label: "keyboard")
+        let provider = SuspendedQuerySnapshotProvider()
+        let box = QueryIdentityBox(identity(mapID: map, frameID: frame))
+        let subject = SpatialObjectQueryController(
+            snapshotProvider: { try await provider.load(currentMapID: $0) },
+            currentIdentityProvider: { box.value })
+        subject.submit("키보드 어디있어?", now: 100)
+        try await waitForRequestCount(provider, 1)
+        subject.refreshUnresolvedQueryAfterObservation(now: 101)
+        subject.refreshUnresolvedQueryAfterObservation(now: 102)
+        subject.refreshUnresolvedQueryAfterObservation(now: 103)
+        await provider.resume(requestIndex: 0, with: snapshot(records: []))
+        try await waitForRequestCount(provider, 2)
+        await provider.resume(requestIndex: 1, with: snapshot(records: [record(keyboard)]))
+        try await waitForIdle(subject)
+        XCTAssertEqual(subject.latestGroundedTarget?.objectID, keyboard.object.id)
+        XCTAssertEqual(subject.metrics.requestsStarted, 2)
+        subject.refreshUnresolvedQueryAfterObservation(now: 104)
+        XCTAssertEqual(subject.metrics.requestsStarted, 2)
+    }
+
+    func testNewExplicitQueryClearsPendingObservationRefresh() async throws {
+        let provider = SuspendedQuerySnapshotProvider()
+        let box = QueryIdentityBox(identity(mapID: mapID(133), frameID: frameID(133)))
+        let subject = SpatialObjectQueryController(
+            snapshotProvider: { try await provider.load(currentMapID: $0) },
+            currentIdentityProvider: { box.value })
+        subject.submit("키보드 찾아줘", now: 100)
+        try await waitForRequestCount(provider, 1)
+        subject.refreshUnresolvedQueryAfterObservation(now: 101)
+        subject.submit("마우스 찾아줘", now: 102)
+        try await waitForRequestCount(provider, 2)
+        await provider.resume(requestIndex: 0, with: snapshot(records: []))
+        await provider.resume(requestIndex: 1, with: snapshot(records: []))
+        try await waitForIdle(subject)
+        XCTAssertEqual(subject.metrics.requestsStarted, 2)
+        XCTAssertEqual(subject.latestPresentation?.result.matchedSemanticLabels, ["mouse"])
+    }
+
+    func testCancelledOrUnsupportedQueryDoesNotRefreshAfterObservation() async throws {
+        let provider = SuspendedQuerySnapshotProvider()
+        let box = QueryIdentityBox(identity(mapID: mapID(134), frameID: frameID(134)))
+        let subject = SpatialObjectQueryController(
+            snapshotProvider: { try await provider.load(currentMapID: $0) },
+            currentIdentityProvider: { box.value })
+        subject.submit("키보드 찾아줘", now: 100)
+        try await waitForRequestCount(provider, 1)
+        subject.refreshUnresolvedQueryAfterObservation(now: 101)
+        subject.invalidateForCaptureTransition()
+        await provider.resume(requestIndex: 0, with: snapshot(records: []))
+        await subject.invalidateAndWaitForPendingWork()
+        subject.refreshUnresolvedQueryAfterObservation(now: 102)
+        XCTAssertEqual(subject.metrics.requestsStarted, 1)
+        XCTAssertNil(subject.latestPresentation)
+
+        subject.submit("스피커 찾아줘", now: 103)
+        try await waitForRequestCount(provider, 2)
+        subject.refreshUnresolvedQueryAfterObservation(now: 104)
+        await provider.resume(requestIndex: 1, with: snapshot(records: []))
+        try await waitForIdle(subject)
+        XCTAssertEqual(subject.latestPresentation?.result.issues, [.automaticDetectionUnsupported])
+        XCTAssertEqual(subject.metrics.requestsStarted, 2)
+    }
+
+    func testExplicitCandidateSelectionCannotBeReplacedByObservationRefresh() async throws {
+        let map = mapID(135)
+        let frame = frameID(135)
+        let objects = try (0..<2).map {
+            record(try metadata(id: objectID(135 + $0), mapID: map, frameID: frame, label: "chair"))
+        }
+        let subject = controller(identityBox: QueryIdentityBox(identity(mapID: map, frameID: frame)), records: objects)
+        subject.submit("의자 찾아줘", now: 100)
+        try await waitForIdle(subject)
+        XCTAssertEqual(subject.latestPresentation?.result.status, .ambiguous)
+        subject.selectCandidate(objectID: objects[1].metadata.object.id, mapID: map, now: 101)
+        subject.refreshUnresolvedQueryAfterObservation(now: 102)
+        try await waitForIdle(subject)
+        XCTAssertEqual(subject.latestGroundedTarget?.objectID, objects[1].metadata.object.id)
+        XCTAssertEqual(subject.metrics.requestsStarted, 2)
+    }
+
     func testCancellationAndCaptureIdentityChangeRejectLateResults() async throws {
         let map = mapID(140)
         let frame = frameID(140)
