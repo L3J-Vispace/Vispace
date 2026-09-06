@@ -22,3 +22,4 @@ if [[ "$actual_detector_sha256" != "$detector_sha256" ]]; then
 fi
 
 printf 'Bundled detector model SHA-256 verified.\n'
+python3 "$repo_root/Scripts/verify-model.py"

@@ -21,3 +21,43 @@ engineering default, not an accuracy claim. Before a public release, its
 precision, recall, latency, thermal behavior, and duplicate-instance behavior
 must be measured on the approved Vispace physical-device dataset. A release
 build must fail if this file's digest differs from the value above.
+
+## Runtime detection contract
+
+The model file is unchanged. Its embedded non-maximum-suppression defaults are
+confidence `0.30`, IoU `0.10`, and suppression within each class. The application
+supplies `confidenceThreshold = 0.30` and `iouThreshold = 0.45` through
+`VNCoreMLModel.featureProvider`. This admits more provisional visual candidates
+and avoids suppressing separate same-class boxes after only 10% overlap. These
+values are engineering starting points pending physical-device precision/recall
+measurements, not calibrated probabilities or an accuracy guarantee. The model's
+objectness and label confidence are still multiplied as Vision specifies;
+confidence is never inflated to bypass durable spatial-evidence requirements.
+
+Before inference, Core Image applies the camera's EXIF orientation and fits the
+full image into the model's input dimensions with black padding, preserving the
+aspect ratio. Vision receives that exact-size canvas with `.scaleFill` and `.up`.
+The app removes the known padding and scale from every returned box before depth
+sampling and tracking use the original oriented camera coordinates. Partially
+visible boxes are clipped to the camera image; padding-only boxes are rejected.
+The raw camera image and fitted canvas remain in memory for the request only.
+
+The supported class catalog is verified against the actual bundled model,
+including legacy labels such as `tvmonitor`, `diningtable`, and `pottedplant`.
+`keyboard` and `mouse` are supported. A user-defined name for an unsupported
+class does not add a new automatically detectable model class.
+
+Run `python Scripts/verify-model.py` on Windows, or `python3 Scripts/verify-model.py`
+on macOS/Linux, to validate the digest, input dimensions, optional threshold
+inputs and all 80 catalog labels without executing Core ML. Add `--json` to
+inspect the verified metadata. `Scripts/verify-model.sh` also runs this contract
+check in CI. Geometry tests run in `VispaceCore`; Apple-runtime tests additionally
+check EXIF preprocessing, threshold features, result conversion and a CPU-only
+blank-image Vision inference. A successful blank-image inference is not a
+positive-object recognition benchmark.
+
+Apple API references:
+
+- [Threshold providers for Vision object detection](https://developer.apple.com/documentation/coreml/understanding-a-dice-roll-with-vision-and-object-detection)
+- [Vision recognized-object confidence](https://developer.apple.com/documentation/vision/vnrecognizedobjectobservation)
+- [Core ML non-maximum-suppression format](https://apple.github.io/coremltools/mlmodel/Format/NonMaximumSuppression.html)
