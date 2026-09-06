@@ -154,5 +154,6 @@ public struct ObjectSemanticCatalog: Hashable, Sendable {
         manual("pen", "펜", "볼펜"),
         manual("pencil", "연필"),
         manual("watch", "손목시계", "스마트워치"),
+        manual("user_registered_object", "직접 등록한 물체", "user registered object", "직접등록한물체"),
     ])
 }

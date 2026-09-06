@@ -257,6 +257,12 @@ public final class SpatialObjectQueryController: ObservableObject {
             let selected = presentation.result.selectedCandidate,
             presentedIdentity == currentIdentityProvider() else { return }
         let original = selected.record.metadata
+        if original.object.semanticLabel == UserObjectRegistrationAccumulator.semanticLabel,
+            displayName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            // The explicit name is this manual record's only searchable identity.
+            // Keep the selected record intact when a caller attempts to erase it.
+            return
+        }
         var validation = original.object
         do { try validation.setDisplayName(displayName) } catch {
             publishFailure(message: "이름은 줄바꿈 없이 64자 이내로 입력해 주세요.")
@@ -318,6 +324,9 @@ public final class SpatialObjectQueryController: ObservableObject {
             presentedIdentity == currentIdentityProvider()
         else { return }
         let original = selected.record.metadata
+        // A named, measured surface point must not become an automatic class or
+        // feed detector re-identification through the classification editor.
+        guard original.object.semanticLabel != UserObjectRegistrationAccumulator.semanticLabel else { return }
         if let expected {
             guard expected.object.id == original.object.id, expected.mapID == original.mapID,
                 expected.position.coordinateFrameID == original.position.coordinateFrameID,

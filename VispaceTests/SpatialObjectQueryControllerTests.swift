@@ -69,6 +69,34 @@ final class SpatialObjectQueryControllerTests: XCTestCase {
         if case .failed = controller.state {} else { XCTFail("Changed selection requires another review") }
     }
 
+    func testManualRegistrationCannotBeReclassifiedOrLoseItsOnlyName() async throws {
+        let map = mapID(997), frame = frameID(997)
+        let current = identity(mapID: map, frameID: frame)
+        let initial = try metadata(id: objectID(997), mapID: map, frameID: frame,
+            label: UserObjectRegistrationAccumulator.semanticLabel, presence: .lastSeen)
+        let store = QueryAnnotationTestStore(objects: [initial])
+        let manual = try await store.rename(initial, name: "내 스피커")
+        let subject = SpatialObjectQueryController(
+            snapshotProvider: { _ in try await store.snapshot() },
+            currentIdentityProvider: { current },
+            renameProvider: { expected, name in try await store.rename(expected, name: name) },
+            classificationCorrectionProvider: { expected, label in try await store.correct(expected, label: label) })
+        subject.submit("내 스피커 찾아줘", now: 100)
+        try await waitForIdle(subject)
+        let requests = subject.metrics.requestsStarted
+        subject.correctSelectedClassification("speaker", now: 101)
+        subject.renameSelectedObject(nil, now: 101)
+        subject.renameSelectedObject("  ", now: 101)
+        try await waitForIdle(subject)
+        let persisted = try await store.snapshot()
+        XCTAssertEqual(persisted.records.map(\.metadata), [manual])
+        XCTAssertEqual(subject.latestPresentation?.result.selectedCandidate?.record.metadata, manual)
+        XCTAssertEqual(subject.metrics.requestsStarted, requests)
+        let calls = await store.mutationCounts()
+        XCTAssertEqual(calls.corrections, 0)
+        XCTAssertEqual(calls.renames, 1) // Only the initial test fixture name.
+    }
+
     func testFutureStateTimeKeepsOriginalDateButCannotPublishGuidance() async throws {
         let map = mapID(970), frame = frameID(970)
         let original = try metadata(id: objectID(970), mapID: map, frameID: frame, label: "chair")
@@ -1292,13 +1320,17 @@ final class SpatialObjectQueryControllerTests: XCTestCase {
 
 private actor QueryAnnotationTestStore {
     var objects: [SpatialObjectMetadata]
+    private var correctionCalls = 0
+    private var renameCalls = 0
     init(objects: [SpatialObjectMetadata]) { self.objects = objects }
+    func mutationCounts() -> (corrections: Int, renames: Int) { (correctionCalls, renameCalls) }
     func snapshot() throws -> SpatialObjectQueryRepositorySnapshot {
         SpatialObjectQueryRepositorySnapshot(records: objects.map {
             StoredSpatialObjectRecord(metadata: $0, memoryTier: .localMap)
         }, alignmentCatalog: try CoordinateAlignmentCatalogSnapshot())
     }
     func correct(_ expected: SpatialObjectMetadata, label: String) throws -> SpatialObjectMetadata {
+        correctionCalls += 1
         let index = objects.firstIndex { $0.object.id == expected.object.id && $0.mapID == expected.mapID }!
         guard objects[index] == expected else { throw SpatialObjectError.invalidTimestamp }
         var object = objects[index].object
@@ -1310,6 +1342,7 @@ private actor QueryAnnotationTestStore {
         return corrected
     }
     func rename(_ expected: SpatialObjectMetadata, name: String?) throws -> SpatialObjectMetadata {
+        renameCalls += 1
         let index = objects.firstIndex { $0.object.id == expected.object.id && $0.mapID == expected.mapID }!
         var object = objects[index].object
         try object.setDisplayName(name)

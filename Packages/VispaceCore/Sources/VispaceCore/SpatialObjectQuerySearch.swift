@@ -338,7 +338,7 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
     /// still has to satisfy eligibility and the normal confidence floor.
     public func select(record: StoredSpatialObjectRecord, route: IntentRoute,
                        context: SpatialObjectSearchContext) -> SpatialObjectSearchResult {
-        let semanticLabel = ObjectSemanticCatalog.default.canonicalLabel(for: record.metadata.object.semanticLabel)
+        let semanticLabel = ObjectSemanticCatalog.default.canonicalLabel(for: searchLabel(for: record.metadata.object))
         guard supportsObjectLookup(route.kind) else {
             return SpatialObjectSearchResult(route: route, status: .unsupportedIntent,
                 matchedSemanticLabels: [], candidates: [], issues: [.unsupportedIntent])
@@ -549,9 +549,10 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
 
         var matches: [SemanticTermMatch] = []
         for record in records {
-            let canonicalLabel = normalizeLabel(record.metadata.object.semanticLabel)
-            let terms = [record.metadata.object.semanticLabel] + record.semanticAliases
-                + ObjectSemanticCatalog.default.aliases(for: record.metadata.object.semanticLabel)
+            let label = searchLabel(for: record.metadata.object)
+            let canonicalLabel = normalizeLabel(label)
+            let terms = [label] + record.semanticAliases
+                + ObjectSemanticCatalog.default.aliases(for: label)
                 + [record.metadata.object.displayName].compactMap { $0 }
             for term in Set(terms.map(normalizeLabel)).sorted() {
                 let termTokens = lexicalTokens(term)
@@ -615,6 +616,17 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
 
     private func canonicalLabels(from matches: [SemanticTermMatch]) -> [String] {
         Array(Set(matches.map { ObjectSemanticCatalog.default.canonicalLabel(for: $0.canonicalLabel) })).sorted()
+    }
+
+    private func searchLabel(for object: SpatialObject) -> String {
+        // A manual record's generic provenance marker is not its user-facing
+        // class. Search uses the explicit name without changing that provenance.
+        // Exact catalog names gain aliases; arbitrary custom names stay exact.
+        if object.semanticLabel == UserObjectRegistrationAccumulator.semanticLabel,
+            let name = object.displayName {
+            return name
+        }
+        return object.semanticLabel
     }
 
     private func tokensMatch(query: [String], term: [String]) -> Bool {

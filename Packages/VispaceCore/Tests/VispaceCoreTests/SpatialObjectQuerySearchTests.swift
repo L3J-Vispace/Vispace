@@ -251,6 +251,52 @@ final class SpatialObjectQuerySearchTests: XCTestCase {
         XCTAssertEqual(result.groundedPosition, custom.position)
     }
 
+    func testManualKnownNamesGainBilingualAliasesWithoutChangingProvenance() throws {
+        for (index, pair) in [("키보드", "keyboard"), ("스피커", "speaker"), ("모니터", "tvmonitor")].enumerated() {
+            let manual = try makeMetadata(id: objectID(75_000 + index), mapID: currentMapID,
+                frameID: currentFrameID, label: UserObjectRegistrationAccumulator.semanticLabel,
+                presence: .lastSeen, displayName: pair.0)
+            for term in [pair.0, pair.1] {
+                let result = DeterministicSpatialObjectSearchEngine().search(
+                    utterance: "\(term) 찾아줘", records: [record(manual)], context: try context())
+                XCTAssertEqual(result.status, .found, term)
+                XCTAssertEqual(result.selectedCandidate?.record.metadata, manual, term)
+                XCTAssertEqual(result.matchedSemanticLabels, [pair.1], term)
+                XCTAssertEqual(result.groundedPosition, manual.position, term)
+            }
+        }
+    }
+
+    func testDistinctManualNamesCannotCollapseIntoOneTargetDespiteConfidenceGap() throws {
+        let keyboard = try makeMetadata(id: objectID(75_101), mapID: currentMapID,
+            frameID: currentFrameID, label: UserObjectRegistrationAccumulator.semanticLabel,
+            presence: .lastSeen, uncertainty: .highConfidenceDepth, displayName: "키보드")
+        let speaker = try makeMetadata(id: objectID(75_102), mapID: currentMapID,
+            frameID: currentFrameID, label: UserObjectRegistrationAccumulator.semanticLabel,
+            presence: .lastSeen, confidence: vector(semantic: 0.65), displayName: "스피커")
+        let result = DeterministicSpatialObjectSearchEngine().search(
+            utterance: "키보드랑 스피커 찾아줘", records: [record(keyboard), record(speaker)], context: try context())
+        XCTAssertEqual(result.status, .ambiguous)
+        XCTAssertEqual(result.matchedSemanticLabels, ["keyboard", "speaker"])
+        XCTAssertEqual(result.issues, [.multipleSemanticTargets])
+        XCTAssertNil(result.groundedPosition)
+        XCTAssertEqual(Set(result.candidates.map { $0.record.metadata }), Set([keyboard, speaker]))
+    }
+
+    func testManualCustomNameDoesNotInferAnAutomaticClassFromOneWord() throws {
+        let manual = try makeMetadata(id: objectID(75_201), mapID: currentMapID,
+            frameID: currentFrameID, label: UserObjectRegistrationAccumulator.semanticLabel,
+            presence: .lastSeen, displayName: "엄마의 키보드")
+        let engine = DeterministicSpatialObjectSearchEngine()
+        let exact = engine.search(utterance: "엄마의 키보드 찾아줘", records: [record(manual)], context: try context())
+        XCTAssertEqual(exact.status, .found)
+        XCTAssertEqual(exact.matchedSemanticLabels, ["엄마의 키보드"])
+        XCTAssertEqual(exact.selectedCandidate?.record.metadata, manual)
+        let generic = engine.search(utterance: "keyboard 찾아줘", records: [record(manual)], context: try context())
+        XCTAssertEqual(generic.issues, [.objectNotYetObserved])
+        XCTAssertNil(generic.groundedPosition)
+    }
+
     func testComplexPlacementRequestNeverLeaksSearchCoordinate() throws {
         let sofa = try makeMetadata(
             id: objectID(50_105),
