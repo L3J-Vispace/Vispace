@@ -16,7 +16,7 @@ colors:
 
 Vispace keeps the observed world primary while exposing the minimum interface needed to search it, ask about it, test a furniture placement, navigate it, and manage stored spatial data. The camera is not decorative background: every visible control or AR element must correspond to a direct user action and verified spatial evidence.
 
-First-run guidance is an opaque, pre-permission explanation. It covers scanning behavior, spatial memory, available questions, placement and navigation, privacy, and local retention before the user agrees to start the camera. It is never mounted over capture.
+First-run guidance is an opaque, pre-permission explanation. It introduces the service, spatial memory, available questions, placement and navigation, and scanning behavior before the user agrees to start the camera. Data-retention explanations belong in spatial-data settings. Guidance is never mounted over capture.
 
 After onboarding, an edge-to-edge rear-camera surface carries the explicitly authorized spatial interface: a compact bottom query/placement control, temporary result messages, target guidance, a feasible furniture preview, a verified route, and access to spatial-data settings. These elements are state-bound and disappear when their evidence or coordinate identity is no longer valid.
 
@@ -44,8 +44,8 @@ World-space markers, placement volumes, and route segments must remain registere
 
 ### First-run guidance
 
-- **Visual:** Opaque system background, product name, direct title, concise feature/privacy rows, permission notice, and one prominent action.
-- **Content:** Explain slow multi-angle scanning, local spatial memory, example searches and relation questions, placement/navigation evidence requirements, ephemeral raw frames, and local retention until deletion.
+- **Visual:** Opaque system background, product name, direct title, concise feature and scanning rows, permission notice, and one prominent action.
+- **Content:** Introduce the service, local spatial memory, example searches and relation questions, placement/navigation evidence requirements, and slow multi-angle scanning. Keep data-retention explanations in spatial-data settings.
 - **Interaction:** **Agree and Start Camera** is the sole completion action. Camera creation and permission wait for it.
 - **Persistence:** Completion is stored locally with a versioned preference.
 - **Accessibility:** Semantic text styles and colors, heading trait, intentional VoiceOver order, decorative symbols hidden, scrollable AXXXL layout, and a minimum 44-point action.

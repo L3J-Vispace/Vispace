@@ -1111,12 +1111,6 @@
         "ko" : { "stringUnit" : { "state" : "translated", "value" : "공간에 질문하기" } }
       }
     },
-    "onboarding.data.title" : {
-      "localizations" : {
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "How your data is kept" } },
-        "ko" : { "stringUnit" : { "state" : "translated", "value" : "내 데이터는 이렇게 보관해요" } }
-      }
-    },
     "onboarding.features.title" : {
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "What you can do with Vispace" } },
@@ -1165,38 +1159,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "시작하면 기기 내 카메라 처리와 공간 데이터 저장에 동의하며, 이어서 카메라 접근 권한을 요청합니다."
-          }
-        }
-      }
-    },
-    "onboarding.privacy.detail" : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Camera frames are processed temporarily and are never saved or sent to a server."
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "카메라 프레임은 일시적으로만 처리하며 저장하거나 서버로 보내지 않습니다."
-          }
-        }
-      }
-    },
-    "onboarding.privacy.title" : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Original video is not saved"
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "원본 영상은 저장하지 않아요"
           }
         }
       }
@@ -1279,18 +1241,6 @@
             "value" : "Vispace는 iPhone 카메라로 확인한 실내 공간과 물건의 위치를 기억해, 물건 찾기와 공간 활용을 도와주는 서비스예요."
           }
         }
-      }
-    },
-    "onboarding.storage.detail" : {
-      "localizations" : {
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "Confirmed maps, object positions, and history stay only on this iPhone until you delete them from Data Settings." } },
-        "ko" : { "stringUnit" : { "state" : "translated", "value" : "확인된 지도·물체 위치·기록은 데이터 설정에서 지울 때까지 이 iPhone에만 보관됩니다." } }
-      }
-    },
-    "onboarding.storage.title" : {
-      "localizations" : {
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "Local until you delete it" } },
-        "ko" : { "stringUnit" : { "state" : "translated", "value" : "삭제 전까지 기기에만 보관해요" } }
       }
     },
     "onboarding.title" : {

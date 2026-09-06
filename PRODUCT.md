@@ -30,7 +30,7 @@ The app is used while a person moves slowly through indoor rooms and corridors w
 
 ## Implemented capabilities and constraints
 
-- First-run guidance explains scanning, spatial memory, search, placement, navigation, privacy, local retention, and the camera permission request before capture starts.
+- First-run guidance introduces the service, spatial memory, search, placement, navigation, scanning, and the camera permission request before capture starts. Data-retention explanations are available in spatial-data settings rather than the introduction.
 - The live camera is the primary surface. The bottom query field, results, relation answers, placement controls, AR target markers, furniture previews, navigation paths, and the spatial-data settings entry are explicitly authorized parts of the implemented user workflow.
 - On-device Vision/Core ML detection is throttled and depth-supported. A detection remains provisional until identity and confidence gates permit durable promotion.
 - Current, last-seen, moved, and removed states retain provenance. Explicit user classification correction has a separate journal event and preserves the object's ID, user name, and previous locations; changing a display name alone does not reclassify it.

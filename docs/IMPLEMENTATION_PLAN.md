@@ -2,7 +2,7 @@
 
 ## Delivery contract
 
-Vispace is no longer a camera-only milestone. On first run it shows one localized, pre-permission explanation of scanning, spatial memory, queries, placement, navigation, raw-frame privacy, and local retention. After agreement and camera permission, the live camera remains the primary surface while the explicitly authorized query, relation, placement, navigation, guidance, and spatial-data settings UI operates over or alongside it.
+Vispace is no longer a camera-only milestone. On first run it shows one localized, pre-permission introduction to the service, spatial memory, queries, placement, navigation, and scanning. Data-retention explanations are available in spatial-data settings. After agreement and camera permission, the live camera remains the primary surface while the explicitly authorized query, relation, placement, navigation, guidance, and spatial-data settings UI operates over or alongside it.
 
 Spatial output is evidence-gated:
 
@@ -72,7 +72,7 @@ named-entity grounding, and door-passage work and its latest execution status.
 
 ### Current status
 
-Implemented. First-run content now explains the complete available workflow, including local retention, before the user chooses **Agree and Start Camera**. Live capture can show the authorized spatial controls and outputs; the former zero-overlay contract has been retired.
+Implemented. First-run content introduces the service and available workflow before the user chooses **Agree and Start Camera**. Live capture can show the authorized spatial controls and outputs; the former zero-overlay contract has been retired.
 
 ### Physical acceptance
 

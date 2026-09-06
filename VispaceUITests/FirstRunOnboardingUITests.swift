@@ -28,8 +28,6 @@ final class FirstRunOnboardingUITests: XCTestCase {
         let memoryTitle = app.staticTexts["vispace.onboarding.memory.title"]
         let askTitle = app.staticTexts["vispace.onboarding.ask.title"]
         let guideTitle = app.staticTexts["vispace.onboarding.guide.title"]
-        let privacyTitle = app.staticTexts["vispace.onboarding.privacy.title"]
-        let storageTitle = app.staticTexts["vispace.onboarding.storage.title"]
         let permissionNotice = app.staticTexts["vispace.onboarding.permissionNotice"]
 
         XCTAssertTrue(window.waitForExistence(timeout: 5))
@@ -44,8 +42,6 @@ final class FirstRunOnboardingUITests: XCTestCase {
         XCTAssertEqual(memoryTitle.label, "물건 찾기와 위치 기억")
         XCTAssertEqual(askTitle.label, "공간에 질문하기")
         XCTAssertEqual(guideTitle.label, "가구 배치와 길 안내")
-        XCTAssertEqual(privacyTitle.label, "원본 영상은 저장하지 않아요")
-        XCTAssertEqual(storageTitle.label, "삭제 전까지 기기에만 보관해요")
         XCTAssertEqual(
             permissionNotice.label,
             "시작하면 기기 내 카메라 처리와 공간 데이터 저장에 동의하며, 이어서 카메라 접근 권한을 요청합니다."

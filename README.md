@@ -6,7 +6,7 @@ Vispace is an iPhone-first Spatial AI application that turns a live camera sessi
 
 The application currently connects these production-oriented paths end to end:
 
-- a localized English/Korean first-run explanation covering scanning, memory, search, placement, navigation, privacy, and local storage before camera permission;
+- a localized English/Korean first-run introduction covering the service, memory, search, placement, navigation, and scanning before camera permission;
 - an explicitly configured ARKit/RealityKit session with runtime depth and mesh capability gates;
 - a bundled Core ML object detector running through Vision, bounded frame scheduling, depth-supported 3D localization, provisional tracking, and confidence-gated promotion to durable object identity;
 - place recognition, protected and checksummed `ARWorldMap` checkpoints, relocalization gating, coordinate provenance, and recovery from interrupted or corrupt persistence;

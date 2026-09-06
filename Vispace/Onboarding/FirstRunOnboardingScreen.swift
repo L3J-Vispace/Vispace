@@ -74,26 +74,6 @@ struct FirstRunOnboardingScreen: View {
                         )
                     }
 
-                    VStack(alignment: .leading, spacing: 24) {
-                        Text("onboarding.data.title")
-                            .font(.title3.bold())
-                            .accessibilityAddTraits(.isHeader)
-
-                        GuidanceRow(
-                            symbol: "lock.shield",
-                            identifier: "vispace.onboarding.privacy.title",
-                            title: "onboarding.privacy.title",
-                            detail: "onboarding.privacy.detail"
-                        )
-
-                        GuidanceRow(
-                            symbol: "internaldrive",
-                            identifier: "vispace.onboarding.storage.title",
-                            title: "onboarding.storage.title",
-                            detail: "onboarding.storage.detail"
-                        )
-                    }
-
                     Label(
                         "onboarding.permissionNotice",
                         systemImage: "camera.fill"
