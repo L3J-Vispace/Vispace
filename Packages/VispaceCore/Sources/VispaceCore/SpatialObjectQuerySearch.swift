@@ -338,6 +338,7 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
     /// still has to satisfy eligibility and the normal confidence floor.
     public func select(record: StoredSpatialObjectRecord, route: IntentRoute,
                        context: SpatialObjectSearchContext) -> SpatialObjectSearchResult {
+        let semanticLabel = ObjectSemanticCatalog.default.canonicalLabel(for: record.metadata.object.semanticLabel)
         guard supportsObjectLookup(route.kind) else {
             return SpatialObjectSearchResult(route: route, status: .unsupportedIntent,
                 matchedSemanticLabels: [], candidates: [], issues: [.unsupportedIntent])
@@ -346,13 +347,13 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
             record.metadata.object.presence != .removed
                 || (route.kind == .lastSeen && context.includeRemoved) else {
             return SpatialObjectSearchResult(route: route, status: .notFound,
-                matchedSemanticLabels: [record.metadata.object.semanticLabel],
+                matchedSemanticLabels: [semanticLabel],
                 candidates: [], issues: [.noEligibleStoredObject])
         }
         let candidate = rankedCandidate(for: record, context: context).candidate
         let isLow = candidate.confidenceGrade == .low
         return SpatialObjectSearchResult(route: route, status: isLow ? .lowConfidence : .found,
-            matchedSemanticLabels: [record.metadata.object.semanticLabel], candidates: [candidate],
+            matchedSemanticLabels: [semanticLabel], candidates: [candidate],
             issues: candidate.hasFutureObservationTime
                 ? [.groundedPositionLowConfidence, .observationTimeInFuture]
                 : (isLow ? [.groundedPositionLowConfidence] : []))
@@ -613,7 +614,7 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
     }
 
     private func canonicalLabels(from matches: [SemanticTermMatch]) -> [String] {
-        Array(Set(matches.map(\.canonicalLabel))).sorted()
+        Array(Set(matches.map { ObjectSemanticCatalog.default.canonicalLabel(for: $0.canonicalLabel) })).sorted()
     }
 
     private func tokensMatch(query: [String], term: [String]) -> Bool {

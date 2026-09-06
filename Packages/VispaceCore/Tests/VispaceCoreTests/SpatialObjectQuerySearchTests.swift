@@ -50,7 +50,7 @@ final class SpatialObjectQuerySearchTests: XCTestCase {
         XCTAssertEqual(result.route.kind, .searchObject)
         XCTAssertFalse(result.requiresLLM)
         XCTAssertEqual(result.status, .found)
-        XCTAssertEqual(result.matchedSemanticLabels, ["노트북"])
+        XCTAssertEqual(result.matchedSemanticLabels, ["laptop"])
         XCTAssertEqual(result.selectedCandidate?.record.metadata, metadata)
         XCTAssertEqual(result.groundedPosition, metadata.position)
         XCTAssertEqual(result.groundedPosition?.value, metadata.object.position)
@@ -180,6 +180,20 @@ final class SpatialObjectQuerySearchTests: XCTestCase {
         }
     }
 
+    func testEquivalentSavedClassNamesAreObjectAmbiguityWithoutRewritingRecords() throws {
+        let first = try makeMetadata(id: objectID(71_101), mapID: currentMapID,
+            frameID: currentFrameID, label: "tvmonitor")
+        let second = try makeMetadata(id: objectID(71_102), mapID: currentMapID,
+            frameID: currentFrameID, label: "monitor")
+        let result = DeterministicSpatialObjectSearchEngine().search(
+            utterance: "모니터 찾아줘", records: [record(first), record(second)], context: try context())
+        XCTAssertEqual(result.status, .ambiguous)
+        XCTAssertEqual(result.matchedSemanticLabels, ["tvmonitor"])
+        XCTAssertEqual(result.issues, [.multiplePlausibleObjects])
+        XCTAssertEqual(Set(result.candidates.map { $0.record.metadata }), Set([first, second]))
+        XCTAssertNil(result.groundedPosition)
+    }
+
     func testKnownManualClassCanFindRealRecordAndNeverInventsOne() throws {
         for (index, pair) in [("key", "열쇠"), ("wallet", "지갑"), ("speaker", "스피커"),
                              ("desktop computer", "본체"), ("cable", "케이블"), ("desk", "책상")].enumerated() {
@@ -300,7 +314,7 @@ final class SpatialObjectQuerySearchTests: XCTestCase {
         )
 
         XCTAssertEqual(result.status, .ambiguous)
-        XCTAssertEqual(result.matchedSemanticLabels, ["가방", "노트북"])
+        XCTAssertEqual(result.matchedSemanticLabels, ["handbag", "laptop"])
         XCTAssertEqual(result.issues, [.multipleSemanticTargets])
         XCTAssertNil(result.groundedPosition)
     }
