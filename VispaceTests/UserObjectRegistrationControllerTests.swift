@@ -128,24 +128,41 @@ final class UserObjectRegistrationControllerTests: XCTestCase {
     }
 
     func testStaleAndFutureFramesCannotProduceARegistration() async throws {
-        let channel = LatestValueChannel<ARFrameSnapshot>()
+        // Preserve every frame and their order so a dropped invalid frame
+        // cannot make this freshness test pass without being examined.
+        let channel = AsyncStream<ARFrameSnapshot>.makeStream(bufferingPolicy: .unbounded)
         let identity = ARCaptureIdentity(mapID: MapID(), status: .confirmed)
         let writer = RegistrationWriter()
+        let controlFrame = try frame(identity: identity, offset: 0)
+        var identityCheckedFrameIDs: [ARFrameID] = []
         let controller = UserObjectRegistrationController(
-            frameStreamProvider: { channel.stream }, confirmedIdentityProvider: { _ in identity },
+            frameStreamProvider: { channel.stream },
+            confirmedIdentityProvider: {
+                identityCheckedFrameIDs.append($0.pose.id)
+                return identity
+            },
             metadataWriter: { try await writer.write($0) },
-            timeout: .milliseconds(100), monotonicNow: { 10.5 }
+            timeout: .seconds(30), monotonicNow: { 10.5 }
         )
+        defer { channel.continuation.finish(); controller.cancel() }
         controller.activate()
         controller.start(name: "스피커")
         for offset in [-2.0, -1.8, -1.6, 1.0, 1.2, 1.4] {
-            channel.send(try frame(identity: identity, offset: offset))
-            try await Task.sleep(for: .milliseconds(5))
+            channel.continuation.yield(try frame(identity: identity, offset: offset))
         }
-        XCTAssertEqual(controller.state, .collecting(name: "스피커", sampleCount: 0))
-        try await waitUntil { if case .unavailable = controller.state { return true }; return false }
+        channel.continuation.yield(controlFrame)
+        // Reaching this final fresh frame proves all six earlier frames were
+        // consumed. Also identify the control explicitly so an intermediate
+        // invalid sampleCount == 1 cannot accidentally satisfy the barrier.
+        try await waitUntil {
+            identityCheckedFrameIDs.contains(controlFrame.pose.id)
+                && controller.state == .collecting(name: "스피커", sampleCount: 1)
+        }
+        XCTAssertEqual(identityCheckedFrameIDs, [controlFrame.pose.id])
         let records = await writer.values()
         XCTAssertTrue(records.isEmpty)
+        channel.continuation.finish()
+        try await waitUntil { if case .unavailable = controller.state { return true }; return false }
         await controller.cancelAndWait()
     }
 
