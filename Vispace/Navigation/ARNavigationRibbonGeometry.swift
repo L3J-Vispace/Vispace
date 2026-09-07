@@ -11,11 +11,13 @@ enum ARNavigationRibbonGeometry {
         fileprivate mutating func appendQuad(_ points: [SIMD3<Double>]) {
             let base = UInt32(positions.count)
             positions.append(contentsOf: points.map { SIMD3<Float>($0) })
-            let first = points[1] - points[0]
-            let second = points[2] - points[0]
-            let facesUp = first.z * second.x - first.x * second.z >= 0
-            let indices: [UInt32] = facesUp ? [0, 1, 2, 0, 2, 3] : [0, 2, 1, 0, 3, 2]
-            triangleIndices.append(contentsOf: indices.map { base + $0 })
+            for indices in [[0, 1, 2], [0, 2, 3]] {
+                let first = points[indices[1]] - points[indices[0]]
+                let second = points[indices[2]] - points[indices[0]]
+                let facesUp = first.z * second.x - first.x * second.z >= 0
+                let order = facesUp ? indices : [indices[0], indices[2], indices[1]]
+                triangleIndices.append(contentsOf: order.map { base + UInt32($0) })
+            }
         }
     }
 

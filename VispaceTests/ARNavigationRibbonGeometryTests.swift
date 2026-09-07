@@ -26,6 +26,7 @@ final class ARNavigationRibbonGeometryTests: XCTestCase {
             [point(0, 0, 0), point(0, 0, 1), point(-1, 0, 1)],
             [point(0, 0, 0), point(0, 0, 1), point(0.02, 0, 0)],
             [point(0, 0, 0), point(0, 0, 1), point(0, 0, 0)],
+            [point(0, 0, 0), point(0, 0, 0.03), point(0.03, 0, 0.03), point(0.03, 0, 0.06)],
             [point(0, 0, 0), point(1, 0, 0), point(1, 0, 1), point(0, 0, 1), point(0, 0, 0)],
         ]
         for route in routes {

@@ -22,11 +22,10 @@ enum ARNavigationRibbonRendering {
         anchor.name = "vispace-navigation-route"
         var surface = UnlitMaterial(color: .systemCyan)
         surface.blending = .transparent(opacity: .init(floatLiteral: 0.24))
-        surface.faceCulling = .none
-        var white = UnlitMaterial(color: .white)
-        white.faceCulling = .none
-        var cyan = UnlitMaterial(color: .systemCyan)
-        cyan.faceCulling = .none
+        // Geometry faces up; keep iOS 17's default back-face culling instead
+        // of depending on the material culling override added in iOS 18.
+        let white = UnlitMaterial(color: .white)
+        let cyan = UnlitMaterial(color: .systemCyan)
         for (name, mesh, material) in [
             ("vispace-navigation-ribbon", geometry.surface, surface),
             ("vispace-navigation-edges", geometry.borders, white),
