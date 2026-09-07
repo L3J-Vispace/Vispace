@@ -136,6 +136,21 @@ public final class SpatialObjectQueryController: ObservableObject {
     public var canRenameObjects: Bool { renameProvider != nil }
     public var canCorrectClassification: Bool { classificationCorrectionProvider != nil }
 
+    public var canNavigateToSelectedObject: Bool {
+        guard queryTask == nil, case .result = state,
+            presentedIdentity == currentIdentityProvider(),
+            let presentation = latestPresentation, presentation.canStartARGuidance,
+            let selected = presentation.result.selectedCandidate?.record.metadata,
+            let target = latestGroundedTarget,
+            target.intent != .navigate,
+            selected.object.presence != .removed,
+            target.objectID == selected.object.id, target.sourceMapID == selected.mapID,
+            target.sourcePosition == selected.position,
+            target.confidenceGrade >= .medium
+        else { return false }
+        return true
+    }
+
     @Published public private(set) var state: SpatialObjectQueryControllerState = .idle
     @Published public private(set) var latestPresentation: SpatialObjectQueryPresentation?
     @Published public private(set) var latestGroundedTarget: GroundedSpatialObjectQueryTarget?
@@ -248,6 +263,30 @@ public final class SpatialObjectQueryController: ObservableObject {
             }) else { return }
         startQuery(latestSubmittedQuery, currentFloorNodeID: latestSubmittedFloor, now: now,
             selection: candidate.record.metadata, selectedRoute: presentation.result.route)
+    }
+
+    /// Starts a fresh, explicitly selected navigation query. Keep the exact
+    /// candidate instead of searching its name again, and re-read its confidence
+    /// and coordinate alignment before publishing a new navigation target.
+    @discardableResult
+    public func navigateToSelectedObject(
+        _ expectedTarget: GroundedSpatialObjectQueryTarget,
+        now: TimeInterval = Date().timeIntervalSince1970
+    ) -> Bool {
+        guard now.isFinite, now >= expectedTarget.resolvedAt,
+            canNavigateToSelectedObject, latestGroundedTarget == expectedTarget,
+            let presentation = latestPresentation,
+            let selected = presentation.result.selectedCandidate?.record.metadata
+        else { return false }
+        let route = IntentRoute(
+            kind: .navigate,
+            normalizedUtterance: presentation.result.route.normalizedUtterance,
+            matchedSignals: [],
+            requiresLLM: false
+        )
+        startQuery(latestSubmittedQuery, currentFloorNodeID: latestSubmittedFloor,
+            now: now, selection: selected, selectedRoute: route)
+        return true
     }
 
     public func renameSelectedObject(_ displayName: String?,
@@ -697,7 +736,7 @@ public final class SpatialObjectQueryController: ObservableObject {
                 case .lastSeen:
                     return "‘\(label)’의 마지막 확인 위치를 찾았어요. AR 안내를 시작할 수 있어요."
                 case .navigate:
-                    return "‘\(label)’ 위치를 찾았어요. AR 방향 안내를 시작할 수 있어요."
+                    return "‘\(label)’ 위치를 찾았어요. 바닥 경로를 확인하고 있어요."
                 case .searchObject:
                     return "‘\(label)’ 위치를 찾았어요. AR 안내를 시작할 수 있어요."
                 case .relationQuery, .complexAsk:

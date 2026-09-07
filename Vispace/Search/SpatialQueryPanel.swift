@@ -304,6 +304,24 @@ struct SpatialQueryPanel: View {
                 .buttonStyle(.bordered)
                 .accessibilityIdentifier("vispace.object.register")
             }
+            if queryController.canNavigateToSelectedObject,
+                let target = queryController.latestGroundedTarget {
+                Button {
+                    queryIsFocused = false
+                    if queryController.navigateToSelectedObject(target) {
+                        navigationController.clearRoute()
+                    }
+                } label: {
+                    Label("이 위치까지 길 안내", systemImage: "point.topleft.down.to.point.bottomright.curvepath.fill")
+                        .font(.body.weight(.semibold))
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color(uiColor: .systemCyan))
+                .foregroundStyle(.black)
+                .accessibilityHint("선택한 물체 위치와 이동할 수 있는 바닥을 확인한 뒤 경로를 표시합니다.")
+                .accessibilityIdentifier("vispace.query.navigate")
+            }
             if presentation.result.candidates.count > 1 {
                 ScrollView {
                     VStack(spacing: 6) {

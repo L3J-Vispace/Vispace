@@ -6,6 +6,158 @@ import XCTest
 
 @MainActor
 final class SpatialObjectQueryControllerTests: XCTestCase {
+    func testNavigationActionPreservesExplicitCandidateAndRefreshesGrounding() async throws {
+        let map = mapID(1_100), frame = frameID(1_100)
+        let records = try (0..<3).map { index in
+            record(try metadata(id: objectID(1_100 + index), mapID: map, frameID: frame,
+                label: "keyboard", position: vec(Double(index), 0, -2)), aliases: ["키보드"])
+        }
+        let controller = controller(identityBox: QueryIdentityBox(identity(mapID: map, frameID: frame)),
+            records: records)
+        controller.submit("키보드 어디있어", now: 100)
+        try await waitForIdle(controller)
+        XCTAssertFalse(controller.canNavigateToSelectedObject)
+        controller.selectCandidate(objectID: records[1].metadata.object.id, mapID: map, now: 101)
+        try await waitForIdle(controller)
+        let selected = try XCTUnwrap(controller.latestGroundedTarget)
+        XCTAssertTrue(controller.canNavigateToSelectedObject)
+        XCTAssertEqual(selected.intent, .searchObject)
+
+        XCTAssertTrue(controller.navigateToSelectedObject(selected, now: 102))
+        XCTAssertNil(controller.latestGroundedTarget)
+        XCTAssertFalse(controller.canNavigateToSelectedObject)
+        try await waitForIdle(controller)
+
+        let destination = try XCTUnwrap(controller.latestGroundedTarget)
+        XCTAssertEqual(destination.intent, .navigate)
+        XCTAssertEqual(destination.objectID, records[1].metadata.object.id)
+        XCTAssertEqual(destination.sourceMapID, selected.sourceMapID)
+        XCTAssertEqual(destination.sourcePosition, selected.sourcePosition)
+        XCTAssertEqual(destination.currentFramePosition, selected.currentFramePosition)
+        XCTAssertEqual(destination.resolvedAt, 102)
+        XCTAssertFalse(controller.canNavigateToSelectedObject)
+        XCTAssertFalse(controller.navigateToSelectedObject(destination, now: 103))
+    }
+
+    func testNavigationActionRejectsObsoleteButtonAndChangedCaptureIdentity() async throws {
+        let map = mapID(1_110), frame = frameID(1_110)
+        let identityBox = QueryIdentityBox(identity(mapID: map, frameID: frame))
+        let keyboard = try metadata(id: objectID(1_110), mapID: map, frameID: frame, label: "keyboard")
+        let mouse = try metadata(id: objectID(1_111), mapID: map, frameID: frame, label: "mouse")
+        let controller = controller(identityBox: identityBox,
+            records: [record(keyboard, aliases: ["키보드"]), record(mouse, aliases: ["마우스"])])
+        controller.submit("키보드 어디있어", now: 100)
+        try await waitForIdle(controller)
+        let obsolete = try XCTUnwrap(controller.latestGroundedTarget)
+        controller.submit("마우스 어디있어", now: 101)
+        try await waitForIdle(controller)
+        let current = try XCTUnwrap(controller.latestGroundedTarget)
+        let requests = controller.metrics.requestsStarted
+        XCTAssertFalse(controller.navigateToSelectedObject(obsolete, now: 102))
+        XCTAssertEqual(controller.latestGroundedTarget, current)
+        XCTAssertFalse(controller.navigateToSelectedObject(current, now: .nan))
+        XCTAssertFalse(controller.navigateToSelectedObject(current, now: 99))
+
+        identityBox.value = identity(mapID: map, frameID: frameID(1_112))
+        XCTAssertFalse(controller.canNavigateToSelectedObject)
+        XCTAssertFalse(controller.navigateToSelectedObject(current, now: 102))
+        controller.cancelCurrentQuery()
+        XCTAssertFalse(controller.canNavigateToSelectedObject)
+        XCTAssertFalse(controller.navigateToSelectedObject(current, now: 102))
+        XCTAssertEqual(controller.metrics.requestsStarted, requests)
+    }
+
+    func testNavigationActionRechecksSelectedPositionConfidenceAndRemovalWithoutFallback() async throws {
+        let map = mapID(1_120), frame = frameID(1_120)
+        let current = identity(mapID: map, frameID: frame)
+        let original = try metadata(id: objectID(1_120), mapID: map, frameID: frame,
+            label: "keyboard", position: vec(1, 0, -2))
+        let other = try metadata(id: objectID(1_121), mapID: map, frameID: frame,
+            label: "keyboard", position: vec(2, 0, -2))
+        for change in 0..<3 {
+            let provider = SuspendedQuerySnapshotProvider()
+            let controller = SpatialObjectQueryController(
+                snapshotProvider: { map in try await provider.load(currentMapID: map) },
+                currentIdentityProvider: { current })
+            controller.submit("키보드 어디있어", now: 100)
+            try await waitForRequestCount(provider, 1)
+            await provider.resume(requestIndex: 0,
+                with: snapshot(records: [record(original, aliases: ["키보드"])]))
+            try await waitForIdle(controller)
+            let target = try XCTUnwrap(controller.latestGroundedTarget)
+            XCTAssertTrue(controller.navigateToSelectedObject(target, now: 101))
+            try await waitForRequestCount(provider, 2)
+            let changed = try metadata(id: original.object.id, mapID: map, frameID: frame,
+                label: "keyboard", position: change == 0 ? vec(5, 0, -2) : original.position.value,
+                presence: change == 2 ? .removed : .visible,
+                confidence: change == 1 ? confidence(0.1) : original.object.confidence)
+            await provider.resume(requestIndex: 1, with: snapshot(records: [
+                record(changed, aliases: ["키보드"]), record(other, aliases: ["키보드"])
+            ]))
+            try await waitForIdle(controller)
+            XCTAssertNil(controller.latestGroundedTarget)
+            XCTAssertFalse(controller.canNavigateToSelectedObject)
+            if change == 1 {
+                XCTAssertEqual(controller.latestPresentation?.result.status, .lowConfidence)
+            } else if case .failed = controller.state {} else {
+                XCTFail("Changed or removed destination requires another user selection")
+            }
+        }
+    }
+
+    func testNavigationActionRechecksAlignmentBeforePublishingAnotherMapTarget() async throws {
+        let sourceMap = mapID(1_130), sourceFrame = frameID(1_130)
+        let currentMap = mapID(1_131), currentFrame = frameID(1_131)
+        let current = identity(mapID: currentMap, frameID: currentFrame)
+        let stored = try metadata(id: objectID(1_130), mapID: sourceMap,
+            frameID: sourceFrame, label: "keyboard", position: vec(1, 0, -2))
+        let alignment = try alignmentRecord(sourceMapID: sourceMap, sourceFrameID: sourceFrame,
+            targetMapID: currentMap, targetFrameID: currentFrame,
+            transform: .translation(vec(2, 0, 1)))
+        let provider = SuspendedQuerySnapshotProvider()
+        let controller = SpatialObjectQueryController(
+            snapshotProvider: { map in try await provider.load(currentMapID: map) },
+            currentIdentityProvider: { current })
+        controller.submit("키보드 어디있어", now: 100)
+        try await waitForRequestCount(provider, 1)
+        await provider.resume(requestIndex: 0,
+            with: snapshot(records: [record(stored, aliases: ["키보드"])], alignments: [alignment]))
+        try await waitForIdle(controller)
+        let target = try XCTUnwrap(controller.latestGroundedTarget)
+        XCTAssertTrue(controller.navigateToSelectedObject(target, now: 101))
+        try await waitForRequestCount(provider, 2)
+        await provider.resume(requestIndex: 1,
+            with: snapshot(records: [record(stored, aliases: ["키보드"])]))
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.latestPresentation?.guidanceAvailability, .coordinateAlignmentUnavailable)
+        XCTAssertNil(controller.latestGroundedTarget)
+        XCTAssertFalse(controller.canNavigateToSelectedObject)
+    }
+
+    func testNavigationActionCannotPublishAcrossCaptureTransition() async throws {
+        let map = mapID(1_140), frame = frameID(1_140)
+        let identityBox = QueryIdentityBox(identity(mapID: map, frameID: frame))
+        let stored = try metadata(id: objectID(1_140), mapID: map, frameID: frame, label: "keyboard")
+        let provider = SuspendedQuerySnapshotProvider()
+        let controller = SpatialObjectQueryController(
+            snapshotProvider: { map in try await provider.load(currentMapID: map) },
+            currentIdentityProvider: { identityBox.value })
+        let records = snapshot(records: [record(stored, aliases: ["키보드"])])
+        controller.submit("키보드 어디있어", now: 100)
+        try await waitForRequestCount(provider, 1)
+        await provider.resume(requestIndex: 0, with: records)
+        try await waitForIdle(controller)
+        let target = try XCTUnwrap(controller.latestGroundedTarget)
+        XCTAssertTrue(controller.navigateToSelectedObject(target, now: 101))
+        try await waitForRequestCount(provider, 2)
+        identityBox.value = identity(mapID: map, frameID: frameID(1_141))
+        await provider.resume(requestIndex: 1, with: records)
+        try await waitForIdle(controller)
+        XCTAssertNil(controller.latestPresentation)
+        XCTAssertNil(controller.latestGroundedTarget)
+        XCTAssertFalse(controller.canNavigateToSelectedObject)
+    }
+
     func testClassificationCorrectionKeepsSelectedIDAndNameAndRefreshesSearch() async throws {
         let map = mapID(993), frame = frameID(993)
         let current = identity(mapID: map, frameID: frame)
