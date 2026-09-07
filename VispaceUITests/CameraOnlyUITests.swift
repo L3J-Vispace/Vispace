@@ -295,7 +295,7 @@ final class CameraOnlyUITests: XCTestCase {
         let body = app.staticTexts["vispace.perception.unavailable.body"]
         XCTAssertTrue(title.waitForExistence(timeout: 5))
         XCTAssertEqual(title.label, "물체 인식을 사용할 수 없어요")
-        XCTAssertTrue(body.label.contains("새 물체를 인식하거나 공간 기억에 추가하지 않아요"))
+        XCTAssertTrue(body.label.contains("물체 자동 인식과 공간 기억 자동 갱신을 사용할 수 없어요"))
         XCTAssertTrue(app.textFields["vispace.query.field"].isHittable)
         XCTAssertTrue(app.buttons["vispace.data.settings"].isHittable)
     }
