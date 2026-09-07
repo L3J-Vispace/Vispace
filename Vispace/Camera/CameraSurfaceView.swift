@@ -232,6 +232,9 @@ struct CameraSurfaceView: UIViewRepresentable {
         )
         view.backgroundColor = .black
         view.isOpaque = true
+        // Reuse the session's reconstructed geometry to hide floor guidance
+        // behind observed furniture and walls, without drawing debug meshes.
+        view.environment.sceneUnderstanding.options.insert(.occlusion)
         updateAccessibility(on: view)
         view.onGeometryChange = { [coordinator = context.coordinator] view in
             coordinator.updateDisplayGeometry(from: view)
