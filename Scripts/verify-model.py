@@ -16,9 +16,9 @@ import struct
 import sys
 
 
-EXPECTED_SHA256 = "cde8af2528d6eca1d1580fdd0f0147cb6613d40ba962656b5f683c65f571870e"
+EXPECTED_SHA256 = "0e32f297ad9cfc0ea8e67276867956488c7ee10dc87c057da4debc939e20b76d"
 REPO_ROOT = Path(__file__).resolve().parent.parent
-MODEL_PATH = REPO_ROOT / "Vispace/Resources/Models/YOLOv3TinyInt8LUT.mlmodel"
+MODEL_PATH = REPO_ROOT / "Vispace/Resources/Models/YOLOv3Int8LUT.mlmodel"
 CATALOG_PATH = REPO_ROOT / "Packages/VispaceCore/Sources/VispaceCore/ObjectSemanticCatalog.swift"
 
 
@@ -134,6 +134,8 @@ def verify(data: bytes, catalog_source: str) -> dict:
         raise ValueError(f"Model/catalog class contract mismatch (including order); missing={missing}, extra={extra}")
     if not contract["nms_per_class"]:
         raise ValueError("Expected class-specific non-maximum suppression")
+    if contract["model_default_confidence_threshold"] != 0.5 or contract["model_default_iou_threshold"] != 0.1:
+        raise ValueError("Unexpected bundled model suppression defaults")
     if contract["iou_threshold_input"] != "iouThreshold" or contract["confidence_threshold_input"] != "confidenceThreshold":
         raise ValueError("Runtime threshold provider names do not match the model")
     return contract

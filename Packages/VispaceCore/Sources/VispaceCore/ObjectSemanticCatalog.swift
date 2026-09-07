@@ -53,7 +53,7 @@ public struct ObjectSemanticCatalog: Hashable, Sendable {
                             supportsAutomaticDetection: false)
     }
 
-    /// The first 80 entries follow YOLOv3TinyInt8LUT.mlmodel's actual class order.
+    /// The first 80 entries follow YOLOv3Int8LUT.mlmodel's actual class order.
     /// Manual categories are understood by search but require a real saved record.
     public static let `default` = Self(entries: [
         detected("person", "사람", "인물"),

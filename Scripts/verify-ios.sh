@@ -126,7 +126,7 @@ run_verification() {
     echo "Release app binary was not produced at $release_binary." >&2
     exit 1
   fi
-  local compiled_detector="$derived/Build/Products/Release-iphonesimulator/Vispace.app/YOLOv3TinyInt8LUT.mlmodelc"
+  local compiled_detector="$derived/Build/Products/Release-iphonesimulator/Vispace.app/YOLOv3Int8LUT.mlmodelc"
   if [[ ! -d "$compiled_detector" ]]; then
     echo "Compiled detector model was not embedded at $compiled_detector." >&2
     exit 1

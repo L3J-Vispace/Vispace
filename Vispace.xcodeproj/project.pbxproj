@@ -11,7 +11,7 @@
 		397EAF8141A86ADEBBB6053C /* VispaceCore in Frameworks */ = {isa = PBXBuildFile; productRef = 8E797E3E4FB6967CA1CD2300 /* VispaceCore */; };
 		3EEB6781C8FF88B3FCCB0B3B /* VispaceCore in Frameworks */ = {isa = PBXBuildFile; productRef = 481E6E30C51880FEF47EE837 /* VispaceCore */; };
 		40924278D4EFD8C9C37B5398 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = 9D1041D9E8440D84DD39A0F7 /* Localizable.xcstrings */; };
-		5101226B836A5AFB606F6CE8 /* YOLOv3TinyInt8LUT.mlmodel in Sources */ = {isa = PBXBuildFile; fileRef = DA22F3E28B906B50C4458DC9 /* YOLOv3TinyInt8LUT.mlmodel */; };
+		937F2557D9BDBA40692DEAFC /* YOLOv3Int8LUT.mlmodel in Sources */ = {isa = PBXBuildFile; fileRef = 0D201DD4C263C018B79418C4 /* YOLOv3Int8LUT.mlmodel */; };
 		D56122C3FE9379AAB10F24E1 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = B2BD889ED585745CB1977C05 /* PrivacyInfo.xcprivacy */; };
 /* End PBXBuildFile section */
 
@@ -33,13 +33,13 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		0D201DD4C263C018B79418C4 /* YOLOv3Int8LUT.mlmodel */ = {isa = PBXFileReference; lastKnownFileType = file.mlmodel; path = YOLOv3Int8LUT.mlmodel; sourceTree = "<group>"; };
 		19E6460AC6F71AE034C4612B /* VispaceCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = VispaceCore; path = Packages/VispaceCore; sourceTree = SOURCE_ROOT; };
 		1FC4114979B5F7F3664A2E88 /* VispaceTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = VispaceTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		484D354EA171D2DD976D75D8 /* Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Release.xcconfig; sourceTree = "<group>"; };
 		6082C0DB2FEBADF9568787DF /* InfoPlist.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = InfoPlist.xcstrings; sourceTree = "<group>"; };
 		9D1041D9E8440D84DD39A0F7 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
 		B2BD889ED585745CB1977C05 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
-		DA22F3E28B906B50C4458DC9 /* YOLOv3TinyInt8LUT.mlmodel */ = {isa = PBXFileReference; lastKnownFileType = file.mlmodel; path = YOLOv3TinyInt8LUT.mlmodel; sourceTree = "<group>"; };
 		DFA4172B34C807D2FEDD5834 /* Vispace.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Vispace.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		EC4B7685E320C0666EB3AD4E /* Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Debug.xcconfig; sourceTree = "<group>"; };
 		F523E4E3DDC7AB67C9E57408 /* VispaceUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = VispaceUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -52,7 +52,7 @@
 				Resources/InfoPlist.xcstrings,
 				Resources/Localizable.xcstrings,
 				Resources/Models,
-				Resources/Models/YOLOv3TinyInt8LUT.mlmodel,
+				Resources/Models/YOLOv3Int8LUT.mlmodel,
 				Resources/PrivacyInfo.xcprivacy,
 			);
 			target = A292F9CC33A34B4D7DA5D6EF /* Vispace */;
@@ -125,7 +125,7 @@
 		344CB42F2BE7670D1ECED153 /* Models */ = {
 			isa = PBXGroup;
 			children = (
-				DA22F3E28B906B50C4458DC9 /* YOLOv3TinyInt8LUT.mlmodel */,
+				0D201DD4C263C018B79418C4 /* YOLOv3Int8LUT.mlmodel */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -344,7 +344,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				5101226B836A5AFB606F6CE8 /* YOLOv3TinyInt8LUT.mlmodel in Sources */,
+				937F2557D9BDBA40692DEAFC /* YOLOv3Int8LUT.mlmodel in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

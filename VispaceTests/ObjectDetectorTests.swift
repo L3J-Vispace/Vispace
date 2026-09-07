@@ -87,7 +87,7 @@ final class ObjectDetectorTests: XCTestCase {
     }
 
     func testBundledModelLoadsAndAcceptsRuntimeThresholdsThroughVision() throws {
-        let url = try XCTUnwrap(Bundle.main.url(forResource: "YOLOv3TinyInt8LUT", withExtension: "mlmodelc"))
+        let url = try XCTUnwrap(Bundle.main.url(forResource: "YOLOv3Int8LUT", withExtension: "mlmodelc"))
         let configuration = MLModelConfiguration()
         // Keep this contract smoke test independent of GPU/Neural Engine availability.
         configuration.computeUnits = .cpuOnly

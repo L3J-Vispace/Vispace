@@ -7,8 +7,8 @@ if [[ $# -ne 0 ]]; then
 fi
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-detector_model="$repo_root/Vispace/Resources/Models/YOLOv3TinyInt8LUT.mlmodel"
-detector_sha256='cde8af2528d6eca1d1580fdd0f0147cb6613d40ba962656b5f683c65f571870e'
+detector_model="$repo_root/Vispace/Resources/Models/YOLOv3Int8LUT.mlmodel"
+detector_sha256='0e32f297ad9cfc0ea8e67276867956488c7ee10dc87c057da4debc939e20b76d'
 
 if [[ ! -f "$detector_model" ]]; then
   printf 'Required detector model is missing: %s\n' "$detector_model" >&2

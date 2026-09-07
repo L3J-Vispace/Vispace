@@ -1,31 +1,37 @@
 # Bundled model provenance
 
-## YOLOv3TinyInt8LUT
+## YOLOv3Int8LUT
 
 - Purpose: on-device, multi-object detection for the Phase 1 spatial-observation pipeline
 - Source: Apple Core ML model gallery
-- Download URL: `https://ml-assets.apple.com/coreml/models/Image/ObjectDetection/YOLOv3Tiny/YOLOv3TinyInt8LUT.mlmodel`
-- Retrieved: 2026-09-04
-- File size: 8,913,366 bytes
-- SHA-256: `cde8af2528d6eca1d1580fdd0f0147cb6613d40ba962656b5f683c65f571870e`
+- Download URL: `https://ml-assets.apple.com/coreml/models/Image/ObjectDetection/YOLOv3/YOLOv3Int8LUT.mlmodel`
+- Retrieved: 2026-09-07
+- File size: 62,200,325 bytes
+- SHA-256: `0e32f297ad9cfc0ea8e67276867956488c7ee10dc87c057da4debc939e20b76d`
 - Model metadata author: Joseph Redmon, Ali Farhadi
-- Model metadata version: YOLOv3-tiny
+- Model metadata version: YOLOv3
 - Model metadata license pointer: `https://github.com/pjreddie/darknet`
 - Upstream primary license: Darknet is dedicated to the public domain and permits unrestricted use.
 - Training taxonomy: 80 COCO object classes
 - Input: 416 x 416 RGB image, with optional confidence and IoU thresholds
 - Outputs: labeled bounding-box coordinates and confidence arrays consumed through Vision
 
-The quantized model is the smallest Apple-hosted YOLOv3 Tiny variant. It is an
-engineering default, not an accuracy claim. Before a public release, its
+The bundled model is Apple's quantized full YOLOv3 variant. It replaces
+YOLOv3TinyInt8LUT after a reproduction on the reported desk photograph showed
+that Tiny's keyboard score was below the visual-candidate threshold, while
+the full model detected the keyboard, mouse, and monitor with the existing
+letterbox preprocessing and runtime thresholds. This single-image comparison
+does not establish general accuracy or performance on an iPhone. The model
+resource grows from 8,913,366 to 62,200,325 bytes. Before a public release, its
 precision, recall, latency, thermal behavior, and duplicate-instance behavior
 must be measured on the approved Vispace physical-device dataset. A release
 build must fail if this file's digest differs from the value above.
 
 ## Runtime detection contract
 
-The model file is unchanged. Its embedded non-maximum-suppression defaults are
-confidence `0.30`, IoU `0.10`, and suppression within each class. The application
+The model file is bundled exactly as downloaded. Its embedded
+non-maximum-suppression defaults are confidence `0.50`, IoU `0.10`, and
+suppression within each class. The application
 supplies `confidenceThreshold = 0.30` and `iouThreshold = 0.45` through
 `VNCoreMLModel.featureProvider`. This admits more provisional visual candidates
 and avoids suppressing separate same-class boxes after only 10% overlap. These

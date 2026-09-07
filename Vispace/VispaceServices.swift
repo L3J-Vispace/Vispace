@@ -98,12 +98,12 @@ final class VispaceServices: ObservableObject {
                 )
             } else {
                 detectorResolution = ObjectDetectorFactory.bundledModel(
-                    named: "YOLOv3TinyInt8LUT"
+                    named: "YOLOv3Int8LUT"
                 )
             }
         #else
             detectorResolution = ObjectDetectorFactory.bundledModel(
-                named: "YOLOv3TinyInt8LUT"
+                named: "YOLOv3Int8LUT"
             )
         #endif
         let perceptionController = SpatialPerceptionController(

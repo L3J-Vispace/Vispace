@@ -227,7 +227,7 @@ jobs:
         run: |
           set -euo pipefail
           app="${RUNNER_TEMP}/VispaceReleaseDerivedData/Build/Products/Release-iphonesimulator/Vispace.app"
-          test -d "${app}/YOLOv3TinyInt8LUT.mlmodelc"
+          test -d "${app}/YOLOv3Int8LUT.mlmodelc"
           test -f "${app}/ko.lproj/Localizable.strings"
           test -f "${app}/ko.lproj/InfoPlist.strings"
           python3 Scripts/verify-privacy.py --manifest "${app}/PrivacyInfo.xcprivacy"

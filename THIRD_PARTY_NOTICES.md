@@ -1,8 +1,8 @@
 # Third-party notices
 
-## YOLOv3 Tiny / Darknet
+## YOLOv3 / Darknet
 
-Vispace includes the `YOLOv3TinyInt8LUT` Core ML model distributed through
+Vispace includes the `YOLOv3Int8LUT` Core ML model distributed through
 Apple's Core ML model gallery. Its embedded model metadata credits Joseph
 Redmon and Ali Farhadi and directs users to the Darknet repository for license
 information.
