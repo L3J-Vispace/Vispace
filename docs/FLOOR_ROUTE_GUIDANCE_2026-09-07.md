@@ -27,7 +27,9 @@
 | RealityKit 메시 배치·교체·즉시 제거·폭 검증 3개 | 통과 |
 | 기존 UI 테스트 13개 | 통과 |
 | 서명된 Release iPhone archive (`52a82f5`) | 생성 및 `codesign --verify --deep --strict` 통과 |
-| 새 빌드의 iPhone 테스트·설치 | 아이폰 잠금으로 대기, 완료되지 않음 |
+| 새 빌드의 iPhone 렌더링 테스트 | 4개 통과 (`ribbon-device2/Tests.xcresult`) |
+| 새 빌드의 iPhone 설치 | Release 앱 설치 성공, 기기 앱 목록에서 `com.l3j.vispace` 재확인 |
+| 설치된 앱의 일반 실행 | 최초 보안 사전 검사 거부 후, 재시도에서 기기 잠금 오류 확인. 잠금 해제 후 실행 확인 대기 |
 
 실패한 검사는 `ARNavigationRibbonRenderingTests.testCaptureProductionRibbonOnLightAndDarkSyntheticFloors` 하나다. 두 색상 반복에서 `ARView.snapshot`이 경로와 바닥 전체를 검정색으로 반환하여 청록색 픽셀 단언에 실패했다. 합성 장면이라는 UIKit 설명만 보이므로 이 이미지는 시각 검증의 근거로 사용할 수 없다.
 
@@ -37,17 +39,18 @@ Release Simulator 빌드와 정적 분석은 테스트 실패로 후속 스크�
 
 ## 재개 지점
 
-Mac은 Tailscale ping에 응답하지만 Windows의 SSH/TCP 22 연결이 `Permission denied` / socket access denied로 거부되기 시작했다. Git HTTPS push는 성공했다. 네트워크나 인증 정책은 변경하지 않았다.
+Mac의 Tailscale 주소로 향하는 Windows SSH/TCP 22 연결은 `Permission denied` / socket access denied로 거부되었다. 같은 LAN 주소에서는 기존 SSH 키와 저장된 호스트키를 엄격하게 확인하여 동일한 Mac에 연결했다. VPN·방화벽·인증 정책은 변경하지 않았다.
 
 - Mac checkout: `/Users/dlfkd/VispaceValidation/recognition-20260907`.
 - 전체 실행: `TestResults/ribbon-check2/Tests.xcresult`.
 - 그림자 옵션을 끈 단독 재실행: `TestResults/ribbon-render-recheck/Tests.xcresult`.
 - key-window 실험: `TestResults/ribbon-fixture-window/Tests.xcresult`.
 - 준비된 서명 빌드: `TestResults/ribbon-device2/Vispace.xcarchive`.
-- iPhone 테스트/설치 스크립트는 `TestResults/ribbon-device2`에서 화면 잠금 해제를 기다리는 상태를 마지막으로 확인했다. 설치 성공 결과는 없다.
+- iPhone 테스트/설치 스크립트 `TestResults/ribbon-device2`는 잠금 해제 후 렌더링 테스트 4개를 통과했고, 2026-09-07 23:10 KST Release 앱 설치에 성공했다. 일반 실행은 `Application failed preflight checks`로 거부되어 스크립트 전체 종료 코드는 1이다. 테스트 성공 및 설치 성공과 전체 스크립트 종료 코드를 구분한다.
+- `TestResults/ribbon-install-now/installed-app.json`에서 설치를 재확인했다. 23:18 KST 일반 실행 재시도는 `Locked` / `FBSOpenApplicationErrorDomain` 오류 7로 거부되었다. 앱 실행과 실행 유지 확인은 아이폰 잠금 해제 뒤에 남아 있다.
 - Mac의 `VispaceTests/ARNavigationRibbonRenderingTests.swift`만 key-window 실험으로 수정된 상태다. 연결 복구 후 해당 테스트 파일만 복원하거나 검토한 실험본으로 교체한 다음 공식 동기화를 수행해야 한다. 다른 파일을 일괄 초기화하지 않는다.
 - Windows의 미검증 후속 실험은 gitignored `TestResults/MacRecognition-20260907/ribbon-fixture-warm.swift`와 `ribbon-fixture-experiment.sh`에 보존했다. 앵커·투영 좌표와 픽셀 준비 상태를 제한 시간 안에 기록하고, 같은 시점의 `simctl` 화면과 비교하여 실제 표시와 snapshot API 문제를 구분한다. 이 실험은 아직 실행하지 못했다.
 
-최종 시각 승인과 실기기 반영이 남아 있다. 검정 캡처를 승인된 미리보기로 배포하거나, 테스트 건너뜀/단언 완화로 통과한 것처럼 처리하지 않는다. 개인 사진, 캡처, 서명 파일 및 진단 자료는 Git에 포함하지 않았다.
+최종 시각 승인과 설치된 앱의 일반 실행 확인이 남아 있다. 실기기 합성 캡처 테스트의 통과는 실제 방에서 보행한 경로의 정확도 검증을 대신하지 않는다. 검정 Simulator 캡처를 승인된 미리보기로 배포하거나, 테스트 건너뜀/단언 완화로 통과한 것처럼 처리하지 않는다. 개인 사진, 캡처, 서명 파일 및 진단 자료는 Git에 포함하지 않았다.
 
 참조한 API 문서: [RealityKit MeshDescriptor](https://developer.apple.com/documentation/realitykit/meshdescriptor), [UnlitMaterial](https://developer.apple.com/documentation/realitykit/unlitmaterial), [scene occlusion](https://developer.apple.com/documentation/realitykit/arview/environment-swift.struct/sceneunderstanding-swift.struct/options-swift.struct/occlusion).
