@@ -68,7 +68,10 @@ final class ARNavigationRibbonRenderingTests: XCTestCase {
         let host = UIViewController()
         let view = ARView(frame: scene.coordinateSpace.bounds, cameraMode: .nonAR,
                           automaticallyConfigureSession: false)
-        view.renderOptions = [.disableMotionBlur, .disableDepthOfField, .disableCameraGrain]
+        // Simulator cannot compile RealityKit's programmable grounding-shadow
+        // pipeline. This unlit floor fixture does not use grounding shadows.
+        view.renderOptions = [.disableMotionBlur, .disableDepthOfField,
+                              .disableCameraGrain, .disableGroundingShadows]
         host.view = view
         window.rootViewController = host
         window.windowLevel = .normal + 1
