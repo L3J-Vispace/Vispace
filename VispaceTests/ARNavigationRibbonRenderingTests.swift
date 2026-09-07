@@ -191,10 +191,14 @@ final class ARNavigationRibbonRenderingTests: XCTestCase {
             else { return 0 }
             context.draw(source, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
             let pixels = buffer.bindMemory(to: UInt8.self)
-            return stride(from: 0, to: pixels.count, by: 4).reduce(0) { count, index in
-                count + (Int(pixels[index + 1]) > Int(pixels[index]) + 20
-                    && Int(pixels[index + 2]) > Int(pixels[index]) + 20 ? 1 : 0)
+            var count = 0
+            for index in stride(from: 0, to: pixels.count, by: 4) {
+                let red = Int(pixels[index])
+                let green = Int(pixels[index + 1])
+                let blue = Int(pixels[index + 2])
+                if green > red + 20 && blue > red + 20 { count += 1 }
             }
+            return count
         }
     }
 
