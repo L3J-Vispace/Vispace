@@ -355,6 +355,7 @@ public enum ARIndoorNavigationOutputError: Error, Equatable, Sendable {
     case incompatibleCoordinateContext
     case surfaceRevisionMismatch
     case emptyPath
+    case invalidClearance
 }
 
 /// Renderer seam. The renderer receives only adjacent route segments; there is
@@ -371,13 +372,19 @@ public struct ARIndoorNavigationPathOutput: Equatable, Hashable, Sendable {
     public let totalDistance: Double
     public let confidenceScore: ConfidenceScore
     public let confidence: ConfidenceGrade
+    /// The route engine's wall clearance. Visual geometry must stay inside it.
+    public let maximumHalfWidth: Double
 
     public init(
         path: IndoorNavigationPath,
         semanticLabel: String,
         identity: ARCaptureIdentity,
-        surfaceRevision: UInt64
+        surfaceRevision: UInt64,
+        maximumHalfWidth: Double = 0.20
     ) throws {
+        guard maximumHalfWidth.isFinite, maximumHalfWidth > 0 else {
+            throw ARIndoorNavigationOutputError.invalidClearance
+        }
         guard identity.mapID == path.mapID,
             identity.coordinateFrameID == path.coordinateFrameID,
             identity.status == .confirmed
@@ -404,6 +411,7 @@ public struct ARIndoorNavigationPathOutput: Equatable, Hashable, Sendable {
         totalDistance = path.totalDistance
         confidenceScore = path.confidenceScore
         confidence = path.confidence
+        self.maximumHalfWidth = maximumHalfWidth
     }
 }
 
@@ -1208,7 +1216,8 @@ public final class IndoorNavigationController: ObservableObject {
                 path: path,
                 semanticLabel: destination.semanticLabel,
                 identity: identity,
-                surfaceRevision: surfaceRevision
+                surfaceRevision: surfaceRevision,
+                maximumHalfWidth: engine.policy.agentRadius
             )
         } else {
             output = nil

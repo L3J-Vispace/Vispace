@@ -54,7 +54,7 @@ struct CameraSurfaceView: UIViewRepresentable {
         private var markerPosition: Vec3?
         private var furnitureAnchor: AnchorEntity?
         private var furniturePlacement: RecommendedFurniturePlacement?
-        private var navigationAnchors: [AnchorEntity] = []
+        private var navigationAnchor: AnchorEntity?
         private var renderedNavigationPath: ARIndoorNavigationPathOutput?
 
         init(sessionController: any CameraSessionControlling) {
@@ -170,50 +170,10 @@ struct CameraSurfaceView: UIViewRepresentable {
             }
             removeNavigationPath(from: view)
             guard let path,
-                path.waypoints.allSatisfy(Self.isRepresentableAsFloat)
-            else {
-                return
-            }
-
-            let material = UnlitMaterial(color: UIColor.systemCyan)
-            for waypoint in path.waypoints {
-                let anchor = AnchorEntity(world: Self.floatVector(waypoint))
-                let marker = ModelEntity(
-                    mesh: .generateSphere(radius: 0.035),
-                    materials: [material]
-                )
-                marker.name = "vispace-navigation-waypoint"
-                anchor.addChild(marker)
-                view.scene.addAnchor(anchor)
-                navigationAnchors.append(anchor)
-            }
-
-            for segment in path.segments {
-                let start = Self.floatVector(segment.start)
-                let end = Self.floatVector(segment.end)
-                let delta = end - start
-                let length = simd_length(delta)
-                guard length.isFinite, length > 0.001 else {
-                    continue
-                }
-                let anchor = AnchorEntity(world: (start + end) / 2)
-                let line = ModelEntity(
-                    mesh: .generateBox(
-                        width: 0.055,
-                        height: 0.018,
-                        depth: length
-                    ),
-                    materials: [material]
-                )
-                line.name = "vispace-navigation-segment"
-                line.orientation = simd_quatf(
-                    from: SIMD3<Float>(0, 0, 1),
-                    to: simd_normalize(delta)
-                )
-                anchor.addChild(line)
-                view.scene.addAnchor(anchor)
-                navigationAnchors.append(anchor)
-            }
+                let anchor = try? ARNavigationRibbonRendering.makeAnchor(for: path)
+            else { return }
+            view.scene.addAnchor(anchor)
+            navigationAnchor = anchor
             renderedNavigationPath = path
         }
 
@@ -226,10 +186,10 @@ struct CameraSurfaceView: UIViewRepresentable {
         }
 
         func removeNavigationPath(from view: ARView) {
-            for anchor in navigationAnchors {
+            if let anchor = navigationAnchor {
                 view.scene.removeAnchor(anchor)
             }
-            navigationAnchors.removeAll(keepingCapacity: false)
+            navigationAnchor = nil
             renderedNavigationPath = nil
         }
 
@@ -242,14 +202,6 @@ struct CameraSurfaceView: UIViewRepresentable {
 
         private static func isRepresentableAsFloat(_ value: Double) -> Bool {
             value.isFinite && abs(value) <= Double(Float.greatestFiniteMagnitude)
-        }
-
-        private static func floatVector(_ position: Vec3) -> SIMD3<Float> {
-            SIMD3<Float>(
-                Float(position.x),
-                Float(position.y),
-                Float(position.z)
-            )
         }
 
         func updateDisplayGeometry(from view: ARView) {

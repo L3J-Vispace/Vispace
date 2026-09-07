@@ -6,6 +6,24 @@ import simd
 
 @MainActor
 final class IndoorNavigationControllerTests: XCTestCase {
+    func testPublishedRibbonInheritsCustomWallClearance() async throws {
+        let fixture = NavigationAppFixture()
+        let harness = makeHarness(fixture: fixture, engine: IndoorARNavigationEngine(
+            policy: try IndoorNavigationPolicy(agentRadius: 0.10)
+        ))
+        harness.controller.activate()
+        harness.surfaceContinuation.yield(fixture.surface(revision: 1))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10))
+        harness.controller.navigate(to: try fixture.metadata(x: 2))
+        await eventually { harness.controller.renderablePath != nil }
+        let output = try XCTUnwrap(harness.controller.renderablePath)
+        XCTAssertEqual(output.maximumHalfWidth, 0.10)
+        let geometry = try XCTUnwrap(ARNavigationRibbonGeometry.make(
+            waypoints: output.waypoints, maximumHalfWidth: output.maximumHalfWidth))
+        XCTAssertTrue(geometry.surface.positions.allSatisfy { abs($0.z) <= 0.100_001 })
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
     func testFutureSourceStateCannotBecomeDirectOrGroundedNavigationDestination() throws {
         let fixture = NavigationAppFixture()
         let original = try fixture.metadata(x: 2)
