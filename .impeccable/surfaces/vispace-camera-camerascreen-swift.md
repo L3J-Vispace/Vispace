@@ -16,3 +16,5 @@ Constraints: keep live camera pixels dominant. Query, placement, navigation, and
 Direction: Camera-first spatial guidance. After the one-time first-run gateway, the observed world remains the primary surface; controls and evidence-backed guidance support the current request without obscuring the room.
 
 Unresolved: final App Store icon and brand assets; physical-device accuracy, accessibility, and release acceptance. Search/Ask and AR guidance are implemented, not future authorization questions.
+
+Navigation extension (2026-09-07, Operate): the user's floor-route reference replaces narrow route sticks with a continuous translucent ribbon, inset edges, repeated direction marks, and a floor destination ring. A confirmed search result offers an explicit route action that preserves the selected object's identity and revalidates evidence. No map panel is added. Geometry and lifecycle checks passed, but native visual approval and updated iPhone installation remain pending; see `docs/FLOOR_ROUTE_GUIDANCE_2026-09-07.md`. Black Simulator captures are invalid evidence, not an approved visual result.
