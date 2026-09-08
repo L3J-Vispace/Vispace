@@ -199,7 +199,7 @@ enum SpatialStorageDirectory {
             for url in try fileManager.contentsOfDirectory(at: quarantine, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]) {
                 let name = url.lastPathComponent
                 let parts = name.split(separator: ".")
-                let catalogNames = ["spatial-metadata-v1", "place-memory-v1", "coordinate-alignments-v1", "scene-graphs-v1", "temporal-spatial-memory-v1"]
+                let catalogNames = ["spatial-metadata-v1", "place-memory-v1", "coordinate-alignments-v1", "scene-graphs-v1", "temporal-spatial-memory-v1", "place-visual-evidence-v1"]
                 guard parts.count == 4,
                     catalogNames.contains(String(parts[0])) || UUID(uuidString: String(parts[0])) != nil,
                     UUID(uuidString: String(parts[1])) != nil,

@@ -245,6 +245,122 @@ final class PlaceVisualEvidenceTests: XCTestCase {
         XCTAssertTrue(catalog.landmarks.allSatisfy { $0.mapID == fixture.sourceMap })
     }
 
+    func testPlaceDeletionUsesReservedSpaceButStillRequiresRoomForAtomicReplacement() async throws {
+        let fixture = try VisualFixture()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        struct Catalog: Codable {
+            let schemaVersion: Int
+            let landmarks: [PlaceVisualLandmark]
+        }
+        let url = directory.appendingPathComponent(ARPlaceVisualEvidenceProvider.fileName)
+        let original = try JSONEncoder().encode(Catalog(schemaVersion: 1, landmarks: fixture.source + fixture.target))
+        let remaining = try JSONEncoder().encode(Catalog(schemaVersion: 1, landmarks: fixture.source))
+        try original.write(to: url)
+        let insufficient = ARPlaceVisualEvidenceProvider(
+            directoryURL: directory,
+            fileManager: VisualEvidenceDiskSpaceFileManager(freeBytes: Int64(remaining.count - 1)))
+        do {
+            try await insufficient.deleteMap(fixture.targetMap)
+            XCTFail("Atomic deletion still needs space for the replacement catalog")
+        } catch {
+            XCTAssertEqual(error as? SpatialStorageError,
+                           .insufficientFreeSpace(requiredBytes: Int64(remaining.count)))
+        }
+        XCTAssertEqual(try Data(contentsOf: url), original)
+
+        let enoughForDeletion = ARPlaceVisualEvidenceProvider(
+            directoryURL: directory,
+            fileManager: VisualEvidenceDiskSpaceFileManager(freeBytes: Int64(remaining.count)))
+        try await enoughForDeletion.deleteMap(fixture.targetMap)
+        let retained = try JSONDecoder().decode(Catalog.self, from: Data(contentsOf: url))
+        XCTAssertEqual(retained.landmarks, fixture.source)
+    }
+
+    func testCorruptVisualCatalogIsPreservedAndDoesNotBlockPlaceDeletion() async throws {
+        let fixture = try VisualFixture()
+        struct Catalog: Encodable {
+            let schemaVersion = 1
+            let landmarks: [PlaceVisualLandmark]
+        }
+        let invalidLandmark = fixture.target[0].replacing(support: 0)
+        let invalidCatalogs = try [
+            Data("not-valid-json".utf8),
+            JSONEncoder().encode(Catalog(landmarks: [fixture.target[0], fixture.target[0]])),
+            JSONEncoder().encode(Catalog(landmarks: [invalidLandmark])),
+        ]
+        for original in invalidCatalogs {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent(ARPlaceVisualEvidenceProvider.fileName)
+            try original.write(to: url)
+            let provider = ARPlaceVisualEvidenceProvider(directoryURL: directory)
+            let result = try await provider.resolve(
+                current: fixture.surface(), candidate: fixture.candidate, objects: fixture.objects)
+            XCTAssertEqual(result.evidence, .unresolved)
+            let quarantine = directory.appendingPathComponent("Quarantine")
+            let preserved = try XCTUnwrap(FileManager.default.contentsOfDirectory(
+                at: quarantine, includingPropertiesForKeys: nil).first { $0.pathExtension == "quarantined" })
+            XCTAssertEqual(try Data(contentsOf: preserved), original)
+            try await provider.deleteMap(fixture.targetMap)
+            let remaining = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+            XCTAssertEqual((remaining["landmarks"] as? [Any])?.count, 0)
+            XCTAssertEqual(try Data(contentsOf: preserved), original)
+        }
+    }
+
+    func testFutureVisualCatalogAndReadFailureRemainInPlace() async throws {
+        let fixture = try VisualFixture()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent(ARPlaceVisualEvidenceProvider.fileName)
+        let original = Data("{\"schemaVersion\":99,\"landmarks\":[]}".utf8)
+        try original.write(to: url)
+        let provider = ARPlaceVisualEvidenceProvider(directoryURL: directory)
+        do {
+            try await provider.deleteMap(fixture.targetMap)
+            XCTFail("A newer catalog must remain available to its writer")
+        } catch {
+            XCTAssertEqual(error as? SpatialStorageError, .unsupportedSchema(actual: 99))
+        }
+        XCTAssertEqual(try Data(contentsOf: url), original)
+        let inaccessible = ARPlaceVisualEvidenceProvider(
+            directoryURL: directory, fileManager: VisualEvidenceReadFailureFileManager(deniedPath: url.path))
+        do {
+            _ = try await inaccessible.resolve(
+                current: fixture.surface(), candidate: fixture.candidate, objects: fixture.objects)
+            XCTFail("A transient file error must propagate without recovery")
+        } catch {
+            XCTAssertEqual((error as NSError).domain, NSCocoaErrorDomain)
+            XCTAssertEqual((error as NSError).code, CocoaError.Code.fileReadNoPermission.rawValue)
+        }
+        XCTAssertEqual(try Data(contentsOf: url), original)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("Quarantine").path))
+    }
+
+    func testOversizedFutureVisualCatalogRemainsInPlace() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent(ARPlaceVisualEvidenceProvider.fileName)
+        var original = Data("{\"schemaVersion\":99,\"landmarks\":[]}".utf8)
+        original.append(Data(repeating: 0x20, count: ARPlaceVisualEvidenceProvider.maximumBytes))
+        try original.write(to: url)
+        let provider = ARPlaceVisualEvidenceProvider(directoryURL: directory)
+        do {
+            try await provider.deleteMap(MapID())
+            XCTFail("An unclassified oversized catalog must not enter quarantine")
+        } catch {
+            XCTAssertEqual(error as? SpatialStorageError,
+                           .capacityExceeded(maximumBytes: Int64(ARPlaceVisualEvidenceProvider.maximumBytes)))
+        }
+        XCTAssertEqual(try Data(contentsOf: url), original)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("Quarantine").path))
+    }
+
     private func visualAlignment(
         from source: [PlaceVisualLandmark], to target: [PlaceVisualLandmark]
     ) throws -> CoordinateAlignmentRecord {
@@ -306,6 +422,33 @@ final class PlaceVisualEvidenceTests: XCTestCase {
             cameraIntrinsics: Matrix3x3Snapshot(matrix_identity_float3x3),
             cameraImageDimensions: ImageDimensions(width: 256, height: 256), displayTransform: nil,
             sceneDepth: nil, smoothedSceneDepth: nil)
+    }
+}
+
+private final class VisualEvidenceDiskSpaceFileManager: FileManager, @unchecked Sendable {
+    private let freeBytes: Int64
+
+    init(freeBytes: Int64) {
+        self.freeBytes = freeBytes
+        super.init()
+    }
+
+    override func attributesOfFileSystem(forPath path: String) throws -> [FileAttributeKey: Any] {
+        [.systemFreeSize: NSNumber(value: freeBytes)]
+    }
+}
+
+private final class VisualEvidenceReadFailureFileManager: FileManager, @unchecked Sendable {
+    private let deniedPath: String
+
+    init(deniedPath: String) {
+        self.deniedPath = deniedPath
+        super.init()
+    }
+
+    override func attributesOfItem(atPath path: String) throws -> [FileAttributeKey: Any] {
+        if path == deniedPath { throw CocoaError(.fileReadNoPermission) }
+        return try super.attributesOfItem(atPath: path)
     }
 }
 

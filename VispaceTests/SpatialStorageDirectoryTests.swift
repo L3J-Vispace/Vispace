@@ -103,10 +103,16 @@ final class SpatialStorageDirectoryTests: XCTestCase {
         let staged = root.appendingPathComponent(".\(UUID().uuidString).\(UUID().uuidString).staged")
         try Data("abandoned".utf8).write(to: staged)
         try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-90_000)], ofItemAtPath: staged.path)
+        let oldVisualEvidence = quarantine.appendingPathComponent("place-visual-evidence-v1.\(UUID().uuidString).json.quarantined")
+        try Data("old visual evidence".utf8).write(to: oldVisualEvidence)
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-31 * 24 * 60 * 60)],
+            ofItemAtPath: oldVisualEvidence.path)
         try SpatialStorageDirectory.maintainArtifacts(at: root, now: now)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: quarantine.path).count, 65)
         XCTAssertEqual(try Data(contentsOf: unknown), Data("keep".utf8))
         XCTAssertFalse(FileManager.default.fileExists(atPath: staged.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oldVisualEvidence.path))
     }
     func testPolicyRequestsProtectionForNewAndExistingDirectories() throws {
         let root = temporaryDirectory()
