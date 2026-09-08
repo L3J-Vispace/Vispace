@@ -364,6 +364,48 @@ final class FurniturePlacementEvaluationTests: XCTestCase {
         }
     }
 
+    func testUncertainObstacleCannotProvePassageIsBlocked() throws {
+        let passage = try PlacementPassageEvidence(
+            identifier: "uncertain-route", region: region(width: 8, depth: 3),
+            travelAxis: .alongWidth, requiredClearWidth: 0.8, confidence: score(0.95)
+        )
+        for confidence in [0.3, 0.7] {
+            let obstacle = try PlacementObstacleEvidence(
+                objectID: objectID(49),
+                bounds: box(minX: 2, minY: 0, minZ: 0.5, maxX: 3, maxY: 1, maxZ: 1.5),
+                confidence: score(confidence)
+            )
+            let result = FurniturePlacementEvaluator().evaluate(
+                candidate: try candidate(z: -0.5),
+                evidence: try clearEvidence(obstacles: [obstacle], passages: [passage])
+            )
+            XCTAssertEqual(result.disposition, confidence < 0.5 ? .insufficientEvidence : .rejected)
+            XCTAssertEqual(result.reasons.map(\.code),
+                [confidence < 0.5 ? .possiblePassageConflict : .passageWidthTooNarrow])
+            XCTAssertEqual(result.confidenceScore.value, confidence, accuracy: 1e-9)
+            XCTAssertEqual(result.measurements.narrowestAffectedPassageWidth!, 0.5, accuracy: 1e-9)
+        }
+    }
+
+    func testUncertainObstacleDoesNotDowngradeIndependentlyProvenPassageBlockage() throws {
+        let passage = try PlacementPassageEvidence(
+            identifier: "narrow-route", region: region(width: 8, depth: 2),
+            travelAxis: .alongWidth, requiredClearWidth: 0.8, confidence: score(0.95)
+        )
+        let obstacle = try PlacementObstacleEvidence(
+            objectID: objectID(49),
+            bounds: box(minX: 2, minY: 0, minZ: 0.5, maxX: 3, maxY: 1, maxZ: 1),
+            confidence: score(0.3)
+        )
+        let result = FurniturePlacementEvaluator().evaluate(
+            candidate: try candidate(),
+            evidence: try clearEvidence(obstacles: [obstacle], passages: [passage])
+        )
+        XCTAssertEqual(result.disposition, .rejected)
+        XCTAssertEqual(result.reasons.map(\.code), [.passageWidthTooNarrow])
+        XCTAssertEqual(result.confidenceScore.value, 0.95, accuracy: 1e-9)
+    }
+
     func testLowOverheadObstacleBlocksPassageEvenWhenFurnitureFitsBelowIt() throws {
         let overhead = try PlacementObstacleEvidence(
             objectID: objectID(48),

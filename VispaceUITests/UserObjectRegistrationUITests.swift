@@ -6,6 +6,32 @@ final class UserObjectRegistrationUITests: XCTestCase {
     }
 
     @MainActor
+    func testRegistrationActionsRemainReachableAtLargestAccessibilityTextSize() throws {
+        let app = XCUIApplication()
+        app.launchArguments = [
+            "-AppleLanguages", "(ko)", "-AppleLocale", "ko_KR",
+            "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL",
+            "-VispaceDisableARSession", "-VispaceSkipOnboarding",
+        ]
+        app.launch()
+        XCTAssertTrue(app.textFields["vispace.query.field"].waitForExistence(timeout: 5))
+        let name = openRegistration(in: app)
+        name.tap()
+        name.typeText("my speaker")
+        let capture = app.buttons["vispace.registration.capture"]
+        for _ in 0..<5 {
+            if capture.isHittable { break }
+            app.swipeUp()
+        }
+        XCTAssertTrue(capture.isHittable)
+        capture.tap()
+        let close = app.buttons["vispace.registration.close"]
+        XCTAssertTrue(close.isHittable)
+        close.tap()
+        XCTAssertTrue(app.textFields["vispace.query.field"].isHittable)
+    }
+
+    @MainActor
     func testRegistrationCanBeCancelledAndReopenedWithoutRetainingTheDraft() throws {
         let app = launchWithoutCameraEvidence()
         let name = openRegistration(in: app)

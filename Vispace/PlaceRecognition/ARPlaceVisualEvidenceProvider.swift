@@ -286,14 +286,16 @@ public actor ARPlaceVisualEvidenceProvider {
     static let maximumLandmarks = 256
     private let directoryURL: URL
     private let catalogURL: URL
+    private let fileManager: FileManager
     private var live: [LandmarkKey: PlaceVisualLandmark] = [:]
     private var latestHistogram: (ARPoseSnapshot, NormalizedPlaceHistogram)?
     private var lastCapture: ARPoseSnapshot?
     private var generation: UInt64 = 0
 
-    public init(directoryURL: URL) {
+    public init(directoryURL: URL, fileManager: FileManager = .default) {
         self.directoryURL = directoryURL.standardizedFileURL
         catalogURL = directoryURL.standardizedFileURL.appendingPathComponent(Self.fileName)
+        self.fileManager = fileManager
     }
 
     public func ingest(
@@ -404,36 +406,82 @@ public actor ARPlaceVisualEvidenceProvider {
         reset()
         var catalog = try load()
         catalog.landmarks.removeAll { $0.mapID == mapID }
-        try save(catalog)
+        try save(catalog, reclaiming: true)
     }
 
     private func load() throws -> PlaceVisualCatalog {
-        try SpatialStorageDirectory.prepare(at: directoryURL)
-        try SpatialStorageDirectory.validatePath(at: catalogURL)
-        guard FileManager.default.fileExists(atPath: catalogURL.path) else {
+        try SpatialStorageDirectory.prepare(at: directoryURL, fileManager: fileManager)
+        try SpatialStorageDirectory.validatePath(at: catalogURL, fileManager: fileManager)
+        guard fileManager.fileExists(atPath: catalogURL.path) else {
             return PlaceVisualCatalog(schemaVersion: 1, landmarks: [])
         }
-        try SpatialStorageDirectory.validateRegularFile(at: catalogURL)
-        let attributes = try FileManager.default.attributesOfItem(atPath: catalogURL.path)
-        guard let bytes = (attributes[.size] as? NSNumber)?.intValue, bytes <= Self.maximumBytes else {
-            throw SpatialStorageError.capacityExceeded(maximumBytes: Int64(Self.maximumBytes))
-        }
-        let catalog = try JSONDecoder().decode(PlaceVisualCatalog.self, from: Data(contentsOf: catalogURL))
-        guard catalog.schemaVersion == 1, catalog.landmarks.count <= Self.maximumLandmarks,
-            catalog.landmarks.allSatisfy(\.isValid),
-            Set(catalog.landmarks.map { LandmarkKey(mapID: $0.mapID, objectID: $0.objectID) }).count
+        // An oversized file may belong to a newer schema we cannot inspect.
+        // Preserve it in place rather than treating the size limit as corruption.
+        let data = try readBoundedCatalog()
+        do {
+            try SpatialStorageDirectory.validateJSONSchemas(data)
+            let catalog = try JSONDecoder().decode(PlaceVisualCatalog.self, from: data)
+            guard Set(catalog.landmarks.map { LandmarkKey(mapID: $0.mapID, objectID: $0.objectID) }).count
                 == catalog.landmarks.count
-        else { throw SpatialStorageError.unsupportedSchema(actual: catalog.schemaVersion) }
-        return catalog
+            else {
+                throw DecodingError.dataCorrupted(.init(
+                    codingPath: [], debugDescription: "Duplicate camera landmark identity."))
+            }
+            return catalog
+        } catch let error as SpatialStorageError {
+            throw error
+        } catch {
+            try quarantineCatalog(reason: String(describing: error))
+            return PlaceVisualCatalog(schemaVersion: 1, landmarks: [])
+        }
     }
 
-    private func save(_ catalog: PlaceVisualCatalog) throws {
+    private func readBoundedCatalog() throws -> Data {
+        try SpatialStorageDirectory.validateRegularFile(at: catalogURL, fileManager: fileManager)
+        let handle = try FileHandle(forReadingFrom: catalogURL)
+        defer { try? handle.close() }
+        let limit = Self.maximumBytes + 1
+        var data = Data()
+        while data.count < limit {
+            guard let chunk = try handle.read(upToCount: min(64 * 1_024, limit - data.count)),
+                !chunk.isEmpty
+            else { break }
+            data.append(chunk)
+        }
+        guard data.count <= Self.maximumBytes else {
+            throw SpatialStorageError.capacityExceeded(maximumBytes: Int64(Self.maximumBytes))
+        }
+        return data
+    }
+
+    private func quarantineCatalog(reason: String) throws {
+        try SpatialStorageDirectory.validateRegularFile(at: catalogURL, fileManager: fileManager)
+        let quarantine = directoryURL.appendingPathComponent("Quarantine", isDirectory: true)
+        try SpatialStorageDirectory.prepare(at: quarantine, fileManager: fileManager)
+        let stem = "place-visual-evidence-v1.\(UUID().uuidString.lowercased())"
+        let destination = quarantine.appendingPathComponent("\(stem).json.quarantined")
+        let reasonURL = quarantine.appendingPathComponent("\(stem).reason.txt")
+        try Data(String(reason.prefix(2_048)).utf8).write(
+            to: reasonURL, options: [.atomic, .completeFileProtectionUnlessOpen])
+        do {
+            try fileManager.moveItem(at: catalogURL, to: destination)
+            try? fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: destination.path)
+        } catch {
+            try? fileManager.removeItem(at: reasonURL)
+            throw error
+        }
+        try? SpatialStorageDirectory.maintainArtifacts(at: directoryURL, fileManager: fileManager)
+    }
+
+    private func save(_ catalog: PlaceVisualCatalog, reclaiming: Bool = false) throws {
         try Task.checkCancellation()
         let data = try JSONEncoder().encode(catalog)
         guard data.count <= Self.maximumBytes else {
             throw SpatialStorageError.capacityExceeded(maximumBytes: Int64(Self.maximumBytes))
         }
-        try SpatialStorageDirectory.atomicWrite(data, to: catalogURL, directory: directoryURL)
+        try SpatialStorageDirectory.atomicWrite(
+            data, to: catalogURL, directory: directoryURL,
+            fileManager: fileManager, reclaiming: reclaiming)
     }
 }
 

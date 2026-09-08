@@ -552,6 +552,39 @@ final class PlaceRecognitionControllerTests: XCTestCase {
         let finalMergeCount = await mergeRecorder.count()
         XCTAssertEqual(finalMergeCount, 1)
         XCTAssertEqual(checkpoint.count, 0)
+
+        for revision in 5...6 {
+            await controller.deactivateAndWaitForPendingWork()
+            if revision == 6 { controller.invalidateStoredAssociationCache(for: MapID()) }
+            controller.activate()
+            channel.send(makeSnapshot(
+                frameID: sourceFrameID, segmentID: segmentID,
+                mapID: sourceMapID, revision: UInt64(revision)))
+            try await waitForIdle(controller, receivedSnapshots: UInt64(revision))
+            let retainedMergeCount = await mergeRecorder.count()
+            XCTAssertEqual(retainedMergeCount, 1, "Maintenance and unrelated deletion must retain deduplication")
+        }
+
+        let deletedMaps: [MapID?] = [targetMapID, sourceMapID, nil]
+        for (deletionIndex, deletedMap) in deletedMaps.enumerated() {
+            await controller.deactivateAndWaitForPendingWork()
+            controller.invalidateStoredAssociationCache(for: deletedMap)
+            // Retained fingerprints and objects model reimporting the same map
+            // IDs after their durable association observations were deleted.
+            await store.removeAssociationHistory()
+            controller.activate()
+            for observationIndex in 0..<3 {
+                let revision = UInt64(7 + deletionIndex * 3 + observationIndex)
+                channel.send(makeSnapshot(
+                    frameID: sourceFrameID, segmentID: segmentID,
+                    mapID: sourceMapID, revision: revision))
+                try await waitForIdle(controller, receivedSnapshots: revision)
+                let expectedCount = deletionIndex + (observationIndex == 2 ? 2 : 1)
+                let actualCount = await mergeRecorder.count()
+                XCTAssertEqual(actualCount, expectedCount,
+                               "Deleted alignments must rebuild only after three fresh observations")
+            }
+        }
         controller.deactivate()
     }
 
@@ -1282,6 +1315,10 @@ private actor RecordingPlaceStore {
         associationWrites &+= 1
         associations.removeAll { $0.id == record.id }
         associations.append(record)
+    }
+
+    func removeAssociationHistory() {
+        associations.removeAll()
     }
 
     func catalogReadCount() -> UInt64 { reads }

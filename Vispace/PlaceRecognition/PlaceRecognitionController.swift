@@ -377,6 +377,16 @@ public final class PlaceRecognitionController: ObservableObject {
         await pendingMonitor?.value
     }
 
+    /// Call after a drained deletion attempt, which may remove durable
+    /// alignments before failing. Read-only maintenance keeps the cache.
+    func invalidateStoredAssociationCache(for mapID: MapID? = nil) {
+        if let mapID {
+            settledMergePairs = settledMergePairs.filter { $0.first != mapID && $0.second != mapID }
+        } else {
+            settledMergePairs.removeAll()
+        }
+    }
+
     private func startMonitoringIfNeeded() {
         guard monitorTask == nil else {
             return
