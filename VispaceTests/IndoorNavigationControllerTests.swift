@@ -6,6 +6,49 @@ import simd
 
 @MainActor
 final class IndoorNavigationControllerTests: XCTestCase {
+    func testPathOutputRejectsGeometryBeyondRendererLimits() throws {
+        let fixture = NavigationAppFixture()
+        for (count, step, accepted) in [(4_096, 0.1, true), (4_097, 0.1, false), (2, 1_001.0, false)] {
+            let points = try (0..<count).map { index in
+                IndoorNavigationWaypoint(cell: IndoorNavigationCell(column: index, row: 0),
+                    position: try Vec3(x: Double(index) * step, y: 0, z: 0), evidenceConfidence: .one)
+            }
+            let distance = Double(count - 1) * step
+            let path = try IndoorNavigationPath(mapID: XCTUnwrap(fixture.identity.mapID),
+                coordinateFrameID: fixture.identity.coordinateFrameID, destinationObjectID: ObjectID(),
+                evidenceRevision: 1, waypoints: points, totalDistance: distance,
+                straightLineDistance: distance, quality: .direct, confidenceScore: .one,
+                confidence: .high, exploredNodeCount: count)
+            if accepted {
+                let output = try ARIndoorNavigationPathOutput(path: path, semanticLabel: "sofa",
+                    identity: fixture.identity, surfaceRevision: 1)
+                XCTAssertEqual(output.waypoints.count, count)
+            } else {
+                XCTAssertThrowsError(try ARIndoorNavigationPathOutput(path: path, semanticLabel: "sofa",
+                    identity: fixture.identity, surfaceRevision: 1)) { error in
+                    XCTAssertEqual(error as? ARIndoorNavigationOutputError, .unsupportedGeometry)
+                }
+            }
+        }
+    }
+
+    func testUnrenderableClearanceNeverPublishesSuccessfulGuidance() async throws {
+        let fixture = NavigationAppFixture()
+        let harness = makeHarness(fixture: fixture, engine: IndoorARNavigationEngine(
+            policy: try IndoorNavigationPolicy(agentRadius: 0.000_01)))
+        harness.controller.activate()
+        harness.surfaceContinuation.yield(fixture.surface(revision: 1))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10))
+        harness.controller.navigate(to: try fixture.metadata(x: 2))
+        await eventually { harness.controller.latestPresentation != nil }
+        XCTAssertEqual(harness.controller.latestPresentation?.evidenceIssue, .routeGeometryUnsupported)
+        XCTAssertFalse(harness.controller.latestPresentation?.canRenderPath ?? true)
+        XCTAssertNil(harness.controller.renderablePath)
+        XCTAssertEqual(harness.controller.state, .noPath)
+        XCTAssertEqual(harness.controller.metrics.routesPublished, 0)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
     func testPublishedRibbonInheritsCustomWallClearance() async throws {
         let fixture = NavigationAppFixture()
         let harness = makeHarness(fixture: fixture, engine: IndoorARNavigationEngine(

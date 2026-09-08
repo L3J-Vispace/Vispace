@@ -14,6 +14,7 @@ public enum ARIndoorNavigationEvidenceIssue: String, Equatable, Sendable {
     case coverageAttestationUnavailable
     case surfaceObservationStale
     case dynamicOccupancyUnavailable
+    case routeGeometryUnsupported
 }
 
 public enum ARIndoorNavigationEvidenceAdaptation: Sendable {
@@ -356,6 +357,7 @@ public enum ARIndoorNavigationOutputError: Error, Equatable, Sendable {
     case surfaceRevisionMismatch
     case emptyPath
     case invalidClearance
+    case unsupportedGeometry
 }
 
 /// Renderer seam. The renderer receives only adjacent route segments; there is
@@ -397,6 +399,11 @@ public struct ARIndoorNavigationPathOutput: Equatable, Hashable, Sendable {
         let waypoints = path.waypoints.map(\.position)
         guard !waypoints.isEmpty else {
             throw ARIndoorNavigationOutputError.emptyPath
+        }
+        guard ARNavigationRibbonGeometry.supports(
+            waypoints: waypoints, maximumHalfWidth: maximumHalfWidth
+        ) else {
+            throw ARIndoorNavigationOutputError.unsupportedGeometry
         }
         self.destinationObjectID = path.destinationObjectID
         self.semanticLabel = String(semanticLabel.prefix(80))
@@ -1212,13 +1219,21 @@ public final class IndoorNavigationController: ObservableObject {
     ) {
         let output: ARIndoorNavigationPathOutput?
         if let path = result.path {
-            output = try? ARIndoorNavigationPathOutput(
-                path: path,
-                semanticLabel: destination.semanticLabel,
-                identity: identity,
-                surfaceRevision: surfaceRevision,
-                maximumHalfWidth: engine.policy.agentRadius
-            )
+            do {
+                output = try ARIndoorNavigationPathOutput(
+                    path: path,
+                    semanticLabel: destination.semanticLabel,
+                    identity: identity,
+                    surfaceRevision: surfaceRevision,
+                    maximumHalfWidth: engine.policy.agentRadius
+                )
+            } catch ARIndoorNavigationOutputError.unsupportedGeometry {
+                publishEvidenceIssue(.routeGeometryUnsupported, destination: destination)
+                return
+            } catch {
+                publishEvidenceIssue(.coordinateContextMismatch, destination: destination)
+                return
+            }
         } else {
             output = nil
         }
@@ -1488,6 +1503,8 @@ public final class IndoorNavigationController: ObservableObject {
             return "관측한 공간 정보가 오래되어 경로를 지웠어요. 바닥과 통로를 다시 비춰 주세요."
         case .dynamicOccupancyUnavailable:
             return "현재 통로의 장애물 정보를 확인하지 못해 경로를 표시하지 않았어요."
+        case .routeGeometryUnsupported:
+            return "현재 경로를 화면에 표시할 수 없어요. 가까운 위치에서 다시 안내를 요청해 주세요."
         }
     }
 
