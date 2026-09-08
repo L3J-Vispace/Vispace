@@ -827,6 +827,9 @@ public struct FurniturePlacementEvaluator: Sendable {
                 continue
             }
             var blocked = [crossAxisInterval(of: footprint, in: passage)]
+            var confirmedBlocked = blocked
+            var combinedConfidence = passage.confidence.value
+            var confirmedConfidence = passage.confidence.value
             for obstacle in obstacles.sorted(by: { $0.objectID < $1.objectID }) {
                 // Passage regions are floor-level footprints. Only geometry
                 // within the same two-metre walking envelope used by indoor
@@ -838,25 +841,36 @@ public struct FurniturePlacementEvaluator: Sendable {
                 guard Geometry2.intersectionArea(polygon, passagePolygon) > Geometry2.epsilon else {
                     continue
                 }
-                blocked.append(crossAxisInterval(of: polygon, in: passage))
+                let interval = crossAxisInterval(of: polygon, in: passage)
+                blocked.append(interval)
+                combinedConfidence = min(combinedConfidence, obstacle.confidence.value)
+                if obstacle.confidence.value + Geometry2.epsilon >= policy.minimumEvidenceConfidence.value {
+                    confirmedBlocked.append(interval)
+                    confirmedConfidence = min(confirmedConfidence, obstacle.confidence.value)
+                }
             }
             let clearWidth = widestClearLane(blocked: blocked, passage: passage)
             narrowestWidth = nearestValue(narrowestWidth, clearWidth)
             guard clearWidth + Geometry2.epsilon < passage.requiredClearWidth else { continue }
 
+            // An uncertain obstacle cannot prove a blockage, but it must not
+            // downgrade a blockage already established without that obstacle.
+            let confirmedClearWidth = widestClearLane(blocked: confirmedBlocked, passage: passage)
             let strongEvidence =
-                passage.confidence.value + Geometry2.epsilon
-                >= policy.minimumEvidenceConfidence.value
+                passage.confidence.value + Geometry2.epsilon >= policy.minimumEvidenceConfidence.value
+                && confirmedClearWidth + Geometry2.epsilon < passage.requiredClearWidth
             let code: FurniturePlacementReasonCode =
                 strongEvidence
                 ? .passageWidthTooNarrow : .possiblePassageConflict
             let reason = FurniturePlacementReason(
                 code: code,
                 evidenceIdentifier: passage.identifier,
-                measuredValue: clearWidth,
+                measuredValue: strongEvidence ? confirmedClearWidth : clearWidth,
                 requiredValue: passage.requiredClearWidth
             )
-            let scored = ScoredReason(reason: reason, score: passage.confidence.value)
+            let scored = ScoredReason(
+                reason: reason, score: strongEvidence ? confirmedConfidence : combinedConfidence
+            )
             if strongEvidence {
                 rejected.append(scored)
             } else {
