@@ -10,6 +10,7 @@ struct SpatialQueryPanel: View {
     let onManageData: () -> Void
     let distanceDescription: (Vec3) -> String
     var onRegisterObject: (String) -> Void = { _ in }
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var queryIsFocused: Bool
     @State private var query = ""
     @State private var rejection: SpatialCommandRejection?
@@ -30,13 +31,35 @@ struct SpatialQueryPanel: View {
             if let rejection {
                 messageCard(message: rejectionMessage(rejection), systemImage: "info.circle.fill")
             } else if let presentation = navigationController.latestPresentation {
-                messageCard(
-                    message: presentation.message,
-                    systemImage: presentation.canRenderPath
-                        ? "point.topleft.down.to.point.bottomright.curvepath.fill"
-                        : "exclamationmark.triangle.fill"
-                )
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+                VStack(spacing: 8) {
+                    messageCard(
+                        message: presentation.message,
+                        systemImage: presentation.canRenderPath
+                            ? "point.topleft.down.to.point.bottomright.curvepath.fill"
+                            : "exclamationmark.triangle.fill"
+                    )
+                    if [.noPath, .invalidated].contains(navigationController.state),
+                        queryController.canRefreshSelectedNavigation,
+                        let target = queryController.latestGroundedTarget {
+                        Button {
+                            queryIsFocused = false
+                            if queryController.refreshSelectedNavigation(target) {
+                                navigationController.clearRoute()
+                            }
+                        } label: {
+                            Label("경로 다시 확인", systemImage: "arrow.clockwise")
+                                .font(.body.weight(.semibold))
+                                .frame(maxWidth: .infinity, minHeight: 44)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Color(uiColor: .systemCyan))
+                        .foregroundStyle(.black)
+                        .accessibilityHint("같은 물체의 최신 위치와 통로를 다시 확인합니다.")
+                        .accessibilityIdentifier("vispace.navigation.retry")
+                    }
+                }
+                .frame(maxWidth: 520)
+                .transition(resultTransition)
             } else if let presentation = placementController.latestPresentation {
                 messageCard(
                     message: presentation.message,
@@ -44,7 +67,7 @@ struct SpatialQueryPanel: View {
                         ? "checkmark.seal.fill"
                         : "info.circle.fill"
                 )
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .transition(resultTransition)
             } else if let presentation = relationQueryController.latestPresentation {
                 VStack(alignment: .leading, spacing: 8) {
                     messageCard(
@@ -76,19 +99,19 @@ struct SpatialQueryPanel: View {
                         }
                     }
                 }
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .transition(resultTransition)
             } else if let relationMessage = relationStateMessage {
                 messageCard(
                     message: relationMessage,
                     systemImage: "exclamationmark.triangle.fill"
                 )
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .transition(resultTransition)
             } else if let presentation = queryController.latestPresentation {
                 resultCard(presentation)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .transition(resultTransition)
             } else if case .failed(let message) = queryController.state {
                 messageCard(message: message, systemImage: "exclamationmark.triangle.fill")
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .transition(resultTransition)
             }
 
             HStack(spacing: 10) {
@@ -169,7 +192,7 @@ struct SpatialQueryPanel: View {
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 10)
-        .animation(.easeOut(duration: 0.2), value: queryController.latestPresentation)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: queryController.latestPresentation)
         .onChange(of: perceptionController.metrics.promotedObjects) { _, _ in
             queryController.refreshUnresolvedQueryAfterObservation()
         }
@@ -261,6 +284,10 @@ struct SpatialQueryPanel: View {
     private func dismissAll() {
         rejection = nil
         interaction.dismiss()
+    }
+
+    private var resultTransition: AnyTransition {
+        reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity)
     }
 
     private func rejectionMessage(_ reason: SpatialCommandRejection) -> String {
@@ -415,6 +442,8 @@ struct SpatialQueryPanel: View {
             } label: {
                 Image(systemName: "xmark.circle.fill")
                     .foregroundStyle(.white.opacity(0.72))
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel(Text("query.dismissResult"))
