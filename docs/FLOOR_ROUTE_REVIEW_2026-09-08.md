@@ -48,3 +48,16 @@ Mac 검증 checkout: `/Users/dlfkd/VispaceValidation/recognition-20260907`.
 - `TestResults/ribbon-reviewed-device`: 최신 서명 archive, 설치 성공 JSON, 기기 잠금 및 일반 실행 거부 JSON.
 
 개인 사진, 서명 정보, 공간 기록 및 캡처는 Git에 포함하지 않는다. 기존 설치 결과는 `docs/FLOOR_ROUTE_GUIDANCE_2026-09-07.md`에서 구분하여 기록한다.
+
+## 브랜치 통합 전 렌더링 실패 수정
+
+같은 Xcode 26.6과 iOS 26.5에서 앱의 화면 상태만 바꾸어 기존 실패를 재현했다. 새 Simulator의 온보딩 화면에서는 원래 픽셀 검사가 두 차례 통과했지만, 온보딩을 완료하고 카메라 화면이 열린 상태에서는 밝은 바닥과 어두운 바닥 모두 cyan 픽셀이 0개였다. 기존 창을 가리는 것만으로는 해결되지 않았다. `meshShadowCasterProgrammableBlending` 오류는 성공한 실행에도 나타났으므로 앞선 실패의 원인으로 단정하지 않는다.
+
+테스트 호스트의 `.ar` 카메라 뷰와 합성 장면의 `.nonAR` 뷰가 함께 존재하는 조건을 격리했다. 캡처 중 기존 카메라 뷰를 `.nonAR`로 전환하고, `defer`에서 각 뷰의 원래 모드와 key window를 복원한다. 앱 코드, 경로 메시, 재질, 픽셀 통과 기준과 대기 시간은 변경하지 않았다.
+
+- `ARNavigationRibbonRenderingTests` 5개 통과, 실패와 건너뜀 없음. 기존 `.ar` 뷰를 명시적으로 만드는 회귀 검사에서도 실제 캡처와 원래 모드, 창 가시성, key window, 앵커 보존을 확인했다.
+- 밝은 바닥과 어두운 바닥의 실제 캡처에서 경로, 방향 표시와 도착 원을 확인했다. 합성 장면 검사는 실제 방에서의 보행 검증을 대신하지 않는다.
+- 통합 대상 코어를 Swift 6.2 Linux에서 새 빌드 경로로 검사했다. Debug와 Release 각각 380개 통과, iOS Swift 소스 124개 문법 검사, 모델 계약과 개인정보 선언 검사도 통과했다.
+- Mac 재현 기록: `TestResults/ribbon-integration-fresh.VkyP5Z`와 `ntP6jj`는 온보딩 상태 통과, `gkiQs2`는 카메라 화면에서 실패, `C1qVUh`는 창 숨김만 적용한 실패, `Jce6mK`는 모드 격리 후 통과, `4CXoYP`는 회귀 검사를 포함한 5개 통과 결과다.
+
+전체 통합 검증과 GitHub Actions 상태는 [통합 PR #5](https://github.com/L3J-Vispace/Vispace/pull/5)에 기록한다. 앞서 기록한 실기기 잠금, 실제 보행 및 VoiceOver 검수 범위는 이 Simulator 수정으로 해소된 것으로 보지 않는다.

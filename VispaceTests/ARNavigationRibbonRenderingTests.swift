@@ -62,14 +62,50 @@ final class ARNavigationRibbonRenderingTests: XCTestCase {
     /// Actual RealityKit rendering on a synthetic floor, never camera evidence.
     /// ARView.snapshot supplies pixels; UIKit adds the explicit demo label.
     func testCaptureProductionRibbonOnLightAndDarkSyntheticFloors() async throws {
+        try await captureProductionRibbon()
+    }
+
+    func testCaptureRestoresAnExistingARCameraSurface() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let priorKeyWindow = scene.windows.first(where: \.isKeyWindow)
+        let cameraWindow = UIWindow(windowScene: scene)
+        let host = UIViewController()
+        let cameraView = ARView(frame: scene.coordinateSpace.bounds, cameraMode: .ar,
+                                automaticallyConfigureSession: false)
+        let existingAnchor = AnchorEntity(world: .zero)
+        cameraView.scene.addAnchor(existingAnchor)
+        host.view = cameraView
+        cameraWindow.rootViewController = host
+        cameraWindow.makeKeyAndVisible()
+        defer {
+            cameraWindow.isHidden = true
+            cameraWindow.rootViewController = nil
+            priorKeyWindow?.makeKey()
+        }
+
+        try await captureProductionRibbon()
+
+        XCTAssertEqual(cameraView.cameraMode, .ar)
+        XCTAssertTrue(cameraWindow.isKeyWindow)
+        XCTAssertFalse(cameraWindow.isHidden)
+        XCTAssertEqual(cameraView.scene.anchors.count, 1)
+        XCTAssertTrue(cameraView.scene.anchors.first === existingAnchor)
+    }
+
+    private func captureProductionRibbon() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let priorKeyWindow = scene.windows.first(where: \.isKeyWindow)
+        // A host .ar view makes a second .nonAR view render black on Simulator.
+        // Isolate synthetic rendering without altering the host's scene content.
+        let priorCameraViews = scene.windows.flatMap { cameraViews(in: $0) }.map {
+            (view: $0, mode: $0.cameraMode)
+        }
+        priorCameraViews.forEach { $0.view.cameraMode = .nonAR }
         let window = UIWindow(windowScene: scene)
         let host = UIViewController()
         let view = ARView(frame: scene.coordinateSpace.bounds, cameraMode: .nonAR,
                           automaticallyConfigureSession: false)
-        // Simulator cannot compile RealityKit's programmable grounding-shadow
-        // pipeline. This unlit floor fixture does not use grounding shadows.
+        // This unlit floor fixture does not use photographic effects or shadows.
         view.renderOptions = [.disableMotionBlur, .disableDepthOfField,
                               .disableCameraGrain, .disableGroundingShadows]
         host.view = view
@@ -79,6 +115,7 @@ final class ARNavigationRibbonRenderingTests: XCTestCase {
         defer {
             window.isHidden = true
             window.rootViewController = nil
+            priorCameraViews.forEach { $0.view.cameraMode = $0.mode }
             priorKeyWindow?.makeKey()
         }
         XCTAssertGreaterThan(window.bounds.height, window.bounds.width, "Capture on a portrait iPhone Simulator")
@@ -144,6 +181,10 @@ final class ARNavigationRibbonRenderingTests: XCTestCase {
             add(attachment)
             preview.removeFromSuperview()
         }
+    }
+
+    private func cameraViews(in view: UIView) -> [ARView] {
+        (view as? ARView).map { [$0] } ?? view.subviews.flatMap { cameraViews(in: $0) }
     }
 
     private func waitForSceneFrames(in view: ARView) async throws {
