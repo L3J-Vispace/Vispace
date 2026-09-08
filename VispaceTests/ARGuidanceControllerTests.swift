@@ -63,7 +63,7 @@ final class ARGuidanceControllerTests: XCTestCase {
     func testRemovedMovedOrDegradedRecordRevokesMarkerWithoutPose() async throws {
         let context = ContextFixture()
         let source = try context.metadata()
-        for change in 0..<4 {
+        for change in 0..<6 {
             let (stream, continuation) = AsyncStream<ARPoseSnapshot>.makeStream()
             let records = GuidanceRecordStore(source)
             let controller = ARGuidanceController(poses: stream,
@@ -83,6 +83,16 @@ final class ARGuidanceControllerTests: XCTestCase {
                 object.stateUpdatedAt = 100
                 await records.set(try SpatialObjectMetadata(mapID: source.mapID,
                     object: object, position: source.position))
+            } else if change >= 4 {
+                let position = try FramedPosition(
+                    coordinateFrameID: source.position.coordinateFrameID,
+                    value: source.position.value, observedAt: source.position.observedAt,
+                    trackingQuality: change == 4 ? .limited : .unavailable,
+                    uncertainty: source.position.uncertainty
+                )
+                await records.set(try SpatialObjectMetadata(
+                    mapID: source.mapID, object: source.object, position: position
+                ))
             } else {
                 await records.set(try context.metadata(
                     position: change == 1 ? Vec3(x: 1, y: 0, z: -2) : nil,

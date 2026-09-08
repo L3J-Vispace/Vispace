@@ -337,6 +337,7 @@ public final class ARGuidanceController: ObservableObject {
                             current.object.confidence == source.object.confidence,
                             current.position.coordinateFrameID == source.position.coordinateFrameID,
                             current.position.value == source.position.value,
+                            current.position.trackingQuality == source.position.trackingQuality,
                             current.position.uncertainty == source.position.uncertainty,
                             self.targetIsFresh(target)
                         else { self.invalidateTarget(); return }
