@@ -41,7 +41,10 @@ final class SpatialQueryPanelRenderingTests: XCTestCase {
                     .environment(\.locale, Locale(identifier: "ko_KR"))
                     .environment(\.colorScheme, dark ? .dark : .light)
                     .environment(\.dynamicTypeSize, largeText ? .accessibility5 : .large)
-                    .environment(\.accessibilityReduceMotion, true)
+                    .transaction { transaction in
+                        transaction.animation = nil
+                        transaction.disablesAnimations = true
+                    }
                     let host = UIHostingController(rootView: root)
                     window.overrideUserInterfaceStyle = dark ? .dark : .light
                     window.rootViewController = host
