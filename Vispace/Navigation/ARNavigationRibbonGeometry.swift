@@ -48,38 +48,29 @@ enum ARNavigationRibbonGeometry {
         var lastSegment: Int
     }
 
+    private struct ValidatedRoute {
+        let origin: SIMD3<Double>
+        let points: [SIMD3<Double>]
+        let halfWidth: Double
+    }
+
+    /// Lets the controller reject an unsupported path before publishing a
+    /// successful presentation without allocating any render meshes.
+    static func supports(waypoints: [Vec3], maximumHalfWidth: Double) -> Bool {
+        validate(waypoints: waypoints, maximumHalfWidth: maximumHalfWidth) != nil
+    }
+
     /// Caps work and preserves centimetre-scale Float precision in a local AR
     /// coordinate system. Invalid imported geometry must not reach RealityKit.
     static func make(
         waypoints: [Vec3],
         maximumHalfWidth: Double = 0.18
     ) -> Geometry? {
-        guard !waypoints.isEmpty, waypoints.count <= 4_096,
-              maximumHalfWidth.isFinite, maximumHalfWidth > 0 else { return nil }
-        let halfWidth = min(0.18, maximumHalfWidth)
-        // Widths below Float's useful floor-rendering precision have no visible
-        // footprint; do not widen a narrow policy to make it renderable.
-        guard halfWidth >= 0.0001 else { return nil }
-        guard waypoints.allSatisfy({ point in
-            [point.x, point.y, point.z].allSatisfy { $0.isFinite && abs($0) <= 10_000 }
-        }) else { return nil }
-        let first = waypoints[0]
-        let origin = SIMD3<Double>(first.x, first.y, first.z)
-        var points: [SIMD3<Double>] = []
-        points.reserveCapacity(waypoints.count)
-        for waypoint in waypoints {
-            let point = SIMD3<Double>(waypoint.x, waypoint.y, waypoint.z) - origin
-            guard abs(point.x) <= 1_000, abs(point.y) <= 1_000,
-                  abs(point.z) <= 1_000 else { return nil }
-            if let previous = points.last {
-                if point == previous { continue }
-                // A vertical jump is not evidence of a walkable ramp.
-                guard hypot(point.x - previous.x, point.z - previous.z) >= 0.0001 else {
-                    return nil
-                }
-            }
-            points.append(point)
-        }
+        guard let route = validate(waypoints: waypoints, maximumHalfWidth: maximumHalfWidth)
+        else { return nil }
+        let origin = route.origin
+        let points = route.points
+        let halfWidth = route.halfWidth
 
         var segments: [Segment] = []
         var distance = 0.0
@@ -90,7 +81,6 @@ enum ARNavigationRibbonGeometry {
                 let delta = end - start
                 let length = hypot(delta.x, delta.z)
                 distance += length
-                guard distance <= 2_000 else { return nil }
                 let direction = SIMD3<Double>(delta.x / length, 0, delta.z / length)
                 segments.append(Segment(
                     start: start, end: end, length: length, direction: direction,
@@ -123,12 +113,48 @@ enum ARNavigationRibbonGeometry {
         }
 
         let endpoint = points[points.count - 1]
+        let destinationRadius = min(0.16, halfWidth)
         return Geometry(
             origin: SIMD3<Float>(origin), endpoint: SIMD3<Float>(endpoint),
             halfWidth: Float(halfWidth), surface: surface, borders: borders,
-            chevrons: makeChevrons(segments, halfWidth: halfWidth),
-            destination: makeDestination(at: endpoint, radius: min(0.16, halfWidth))
+            chevrons: makeChevrons(
+                segments, halfWidth: halfWidth,
+                destination: endpoint, destinationRadius: destinationRadius
+            ),
+            destination: makeDestination(at: endpoint, radius: destinationRadius)
         )
+    }
+
+    private static func validate(waypoints: [Vec3], maximumHalfWidth: Double) -> ValidatedRoute? {
+        guard !waypoints.isEmpty, waypoints.count <= 4_096,
+              maximumHalfWidth.isFinite, maximumHalfWidth > 0 else { return nil }
+        let halfWidth = min(0.18, maximumHalfWidth)
+        // Widths below Float's useful floor-rendering precision have no visible
+        // footprint; do not widen a narrow policy to make it renderable.
+        guard halfWidth >= 0.0001 else { return nil }
+        guard waypoints.allSatisfy({ point in
+            [point.x, point.y, point.z].allSatisfy { $0.isFinite && abs($0) <= 10_000 }
+        }) else { return nil }
+        let first = waypoints[0]
+        let origin = SIMD3<Double>(first.x, first.y, first.z)
+        var points: [SIMD3<Double>] = []
+        points.reserveCapacity(waypoints.count)
+        var distance = 0.0
+        for waypoint in waypoints {
+            let point = SIMD3<Double>(waypoint.x, waypoint.y, waypoint.z) - origin
+            guard abs(point.x) <= 1_000, abs(point.y) <= 1_000,
+                  abs(point.z) <= 1_000 else { return nil }
+            if let previous = points.last {
+                if point == previous { continue }
+                let length = hypot(point.x - previous.x, point.z - previous.z)
+                // A vertical jump is not evidence of a walkable ramp.
+                guard length >= 0.0001 else { return nil }
+                distance += length
+                guard distance <= 2_000 else { return nil }
+            }
+            points.append(point)
+        }
+        return ValidatedRoute(origin: origin, points: points, halfWidth: halfWidth)
     }
 
     private static func quad(
@@ -148,7 +174,10 @@ enum ARNavigationRibbonGeometry {
         ]
     }
 
-    private static func makeChevrons(_ segments: [Segment], halfWidth: Double) -> Mesh {
+    private static func makeChevrons(
+        _ segments: [Segment], halfWidth: Double,
+        destination: SIMD3<Double>, destinationRadius: Double
+    ) -> Mesh {
         var mesh = Mesh()
         guard !segments.isEmpty else { return mesh }
         var runs = [Run(firstSegment: 0, lastSegment: 0)]
@@ -173,6 +202,11 @@ enum ARNavigationRibbonGeometry {
         let scale = halfWidth / 0.18
         let halfLength = 0.09 * scale
         let spacing = 0.75
+        // The glyph and destination ring share the floor lift. Keep the whole
+        // glyph outside the arrival disc so their opaque triangles cannot
+        // overlap and flicker. Check every run, including an earlier segment
+        // that passes close to the destination on a bent route.
+        let destinationClearance = destinationRadius + (hypot(0.09, 0.09) + 0.01) * scale
         for run in runs {
             let first = segments[run.firstSegment]
             let last = segments[run.lastSegment]
@@ -184,6 +218,8 @@ enum ARNavigationRibbonGeometry {
             for index in firstIndex...lastIndex {
                 let along = spacing / 2 + Double(index) * spacing - first.distanceFromStart
                 let center = first.start + first.direction * along + SIMD3<Double>(0, first.slope * along, 0)
+                guard hypot(center.x - destination.x, center.z - destination.z)
+                    >= destinationClearance else { continue }
                 func point(_ lateral: Double, _ forward: Double) -> SIMD3<Double> {
                     center + first.side * (lateral * scale) + first.direction * (forward * scale)
                         + SIMD3<Double>(0, first.slope * forward * scale + 0.016, 0)

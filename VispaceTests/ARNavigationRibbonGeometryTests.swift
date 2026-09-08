@@ -136,6 +136,26 @@ final class ARNavigationRibbonGeometryTests: XCTestCase {
         }
     }
 
+    func testFinalChevronsLeaveTheDestinationDiscClearAtEveryPolicyWidth() throws {
+        for halfWidth in [0.18, 0.1, 0.015, 0.0001] {
+            let geometry = try XCTUnwrap(ARNavigationRibbonGeometry.make(
+                waypoints: [.zero, point(0, 0, 2)], maximumHalfWidth: halfWidth
+            ))
+            XCTAssertFalse(geometry.chevrons.positions.isEmpty)
+            assertChevronsClearDestination(geometry)
+            assertValidMeshes(geometry)
+        }
+    }
+
+    func testEarlierChevronsAlsoLeaveTheDestinationDiscClearOnABentRoute() throws {
+        let geometry = try XCTUnwrap(ARNavigationRibbonGeometry.make(waypoints: [
+            .zero, point(0, 0, 2), point(0.2, 0, 2), point(0.2, 0, 1.1),
+        ]))
+        XCTAssertFalse(geometry.chevrons.positions.isEmpty)
+        assertChevronsClearDestination(geometry)
+        assertValidMeshes(geometry)
+    }
+
     func testChevronsNeverBridgeACornerOrFloorSlopeChange() throws {
         for route in [
             [point(0, 0, 0), point(0, 0, 0.4), point(0.4, 0, 0.4)],
@@ -195,6 +215,34 @@ final class ARNavigationRibbonGeometryTests: XCTestCase {
         assertValidMeshes(geometry)
     }
 
+    func testSupportCheckMatchesRenderingAtInputBoundaries() {
+        let cases: [(waypoints: [Vec3], halfWidth: Double, expected: Bool)] = [
+            ([.zero], 0.18, true),
+            ([.zero, point(0, 0, 1)], 0.0001, true),
+            ([.zero, point(1_000, 0, 0), .zero], 0.18, true),
+            (Array(repeating: .zero, count: 4_096), 0.18, true),
+            ([], 0.18, false),
+            ([.zero], 0.00001, false),
+            ([.zero], .nan, false),
+            ([.zero, point(0, 1, 0)], 0.18, false),
+            ([.zero, point(1_001, 0, 0)], 0.18, false),
+            ([.zero, point(1_000, 0, 0), .zero, point(1, 0, 0)], 0.18, false),
+            (Array(repeating: .zero, count: 4_097), 0.18, false),
+        ]
+        for entry in cases {
+            let supported = ARNavigationRibbonGeometry.supports(
+                waypoints: entry.waypoints, maximumHalfWidth: entry.halfWidth
+            )
+            XCTAssertEqual(supported, entry.expected)
+            XCTAssertEqual(
+                ARNavigationRibbonGeometry.make(
+                    waypoints: entry.waypoints, maximumHalfWidth: entry.halfWidth
+                ) != nil,
+                supported
+            )
+        }
+    }
+
     private func point(_ x: Double, _ y: Double, _ z: Double) -> Vec3 {
         try! Vec3(x: x, y: y, z: z)
     }
@@ -216,6 +264,34 @@ final class ARNavigationRibbonGeometryTests: XCTestCase {
                 let first = mesh.positions[Int(mesh.triangleIndices[index + 1])] - mesh.positions[Int(mesh.triangleIndices[index])]
                 let second = mesh.positions[Int(mesh.triangleIndices[index + 2])] - mesh.positions[Int(mesh.triangleIndices[index])]
                 XCTAssertGreaterThanOrEqual(first.z * second.x - first.x * second.z, -0.000001, file: file, line: line)
+            }
+        }
+    }
+
+    private func assertChevronsClearDestination(
+        _ geometry: ARNavigationRibbonGeometry.Geometry,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let endpoint = SIMD2<Double>(Double(geometry.endpoint.x), Double(geometry.endpoint.z))
+        let radius = min(0.16, Double(geometry.halfWidth))
+        let mesh = geometry.chevrons
+        for index in stride(from: 0, to: mesh.triangleIndices.count, by: 3) {
+            let vertices = mesh.triangleIndices[index..<(index + 3)].map {
+                let vertex = mesh.positions[Int($0)]
+                return SIMD2<Double>(Double(vertex.x), Double(vertex.z))
+            }
+            // Check the actual triangle interiors as well as its vertices;
+            // a long glyph edge can cross the ring without a vertex on it.
+            for a in 0...8 {
+                for b in 0...(8 - a) {
+                    let sample = vertices[0] * (Double(a) / 8)
+                        + vertices[1] * (Double(b) / 8)
+                        + vertices[2] * (Double(8 - a - b) / 8)
+                    XCTAssertGreaterThanOrEqual(
+                        hypot(sample.x - endpoint.x, sample.y - endpoint.y),
+                        radius - 0.000001, file: file, line: line
+                    )
+                }
             }
         }
     }
