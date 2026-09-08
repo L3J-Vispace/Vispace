@@ -290,7 +290,7 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
             )
         }
 
-        if ranked.count > 1, candidatesAreAmbiguous(ranked[0], ranked[1]) {
+        if ranked.dropFirst().contains(where: { candidatesAreAmbiguous(ranked[0], $0) }) {
             var issues: [SpatialObjectSearchIssue] = [.multiplePlausibleObjects]
             if ranked[0].candidate.confidenceGrade == .low {
                 issues.append(.groundedPositionLowConfidence)

@@ -555,6 +555,35 @@ final class SpatialObjectQuerySearchTests: XCTestCase {
         XCTAssertNil(result.groundedPosition)
     }
 
+    func testDifferentPresenceBetweenEquivalentCandidatesCannotHideAmbiguity() throws {
+        let recentVisible = try makeMetadata(
+            id: objectID(50_140), mapID: currentMapID, frameID: currentFrameID,
+            label: "bottle", lastSeenAt: 90, uncertainty: .highConfidenceDepth)
+        let interveningLastSeen = try makeMetadata(
+            id: objectID(50_141), mapID: currentMapID, frameID: currentFrameID,
+            label: "bottle", presence: .lastSeen, lastSeenAt: 80,
+            uncertainty: .highConfidenceDepth)
+        let olderVisible = try makeMetadata(
+            id: objectID(50_142), mapID: currentMapID, frameID: currentFrameID,
+            label: "bottle", lastSeenAt: 70, uncertainty: .highConfidenceDepth)
+
+        for limit in [1, 8] {
+            let engine = DeterministicSpatialObjectSearchEngine(
+                policy: try SpatialObjectSearchPolicy(maximumResultCount: limit))
+            let result = engine.search(
+                utterance: "where is bottle",
+                records: [record(olderVisible), record(interveningLastSeen), record(recentVisible)],
+                context: try context())
+
+            XCTAssertEqual(result.status, .ambiguous)
+            XCTAssertEqual(result.issues, [.multiplePlausibleObjects])
+            XCTAssertEqual(result.candidates.map(\.record.metadata.object.id),
+                Array([objectID(50_140), objectID(50_141), objectID(50_142)].prefix(limit)))
+            XCTAssertNil(result.selectedCandidate)
+            XCTAssertNil(result.groundedPosition)
+        }
+    }
+
     func testLowConfidenceCandidateIsExplicitAndCannotDriveGuidance() throws {
         let weak = try makeMetadata(
             id: objectID(50_119),
