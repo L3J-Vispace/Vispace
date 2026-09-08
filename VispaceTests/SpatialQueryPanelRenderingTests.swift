@@ -41,6 +41,7 @@ final class SpatialQueryPanelRenderingTests: XCTestCase {
                         Color(white: dark ? 0.15 : 0.8).ignoresSafeArea()
                         Text("합성 UI 검증 · 실제 카메라 장면 아님")
                             .font(.caption).foregroundStyle(dark ? .white : .black)
+                            .dynamicTypeSize(.large) // Test caption only; keep the production panel at the requested size.
                             .padding(.top, 12)
                         panel
                     }
@@ -59,13 +60,19 @@ final class SpatialQueryPanelRenderingTests: XCTestCase {
                     window.layoutIfNeeded()
 
                     let name = "query-panel-\(retry ? "retry" : "selected")-\(dark ? "dark" : "light")-\(largeText ? "AXXXL" : "standard")"
-                    let screenshot = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
-                        window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+                    if largeText, let scroll = overflowingResultScrollView(in: window, viewportWidth: window.bounds.width) {
+                        let top = -scroll.adjustedContentInset.top
+                        scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: top), animated: false)
+                        window.layoutIfNeeded()
+                        _ = capture(window, name: "\(name)-top")
+                        let bottom = scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom
+                        scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: bottom), animated: false)
+                        try await Task.sleep(for: .milliseconds(100))
+                        window.layoutIfNeeded()
+                        XCTAssertGreaterThan(scroll.contentOffset.y, top,
+                                             "Long accessibility results must actually scroll to their actions")
                     }
-                    let attachment = XCTAttachment(image: screenshot)
-                    attachment.name = name
-                    attachment.lifetime = .keepAlways
-                    add(attachment)
+                    let screenshot = capture(window, name: name)
 
                     XCTAssertNotNil(screenshot.cgImage)
                     XCTAssertGreaterThan(screenshot.size.height, screenshot.size.width)
@@ -79,6 +86,28 @@ final class SpatialQueryPanelRenderingTests: XCTestCase {
                 }
             }
         }
+    }
+
+    private func overflowingResultScrollView(in view: UIView, viewportWidth: CGFloat) -> UIScrollView? {
+        if let scroll = view as? UIScrollView, scroll.isScrollEnabled,
+            scroll.bounds.width > viewportWidth * 0.8, scroll.contentSize.height > scroll.bounds.height {
+            return scroll
+        }
+        for child in view.subviews {
+            if let scroll = overflowingResultScrollView(in: child, viewportWidth: viewportWidth) { return scroll }
+        }
+        return nil
+    }
+
+    private func capture(_ window: UIWindow, name: String) -> UIImage {
+        let screenshot = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+        }
+        let attachment = XCTAttachment(image: screenshot)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        return screenshot
     }
 
     private func cyanButtonPixelCount(in image: UIImage) throws -> Int {
