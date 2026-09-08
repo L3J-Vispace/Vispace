@@ -422,6 +422,89 @@ final class IndoorNavigationControllerTests: XCTestCase {
         XCTAssertEqual(alignmentIssue, .targetNotGrounded)
     }
 
+    func testNewSourceObservationPreservesAlignmentAndOriginalHandoffLease() throws {
+        let fixture = NavigationAppFixture()
+        let source = try fixture.metadata(x: 20, mapID: MapID(), frameID: CoordinateFrameID())
+        let currentPosition = try FramedPosition(
+            coordinateFrameID: fixture.identity.coordinateFrameID,
+            value: Vec3(x: 2, y: 0, z: 0), observedAt: source.position.observedAt,
+            trackingQuality: .normal, uncertainty: .highConfidenceDepth)
+        let target = groundedTarget(source, identity: fixture.identity, currentPosition: currentPosition)
+        let refreshed = try observingAgain(source, at: 9.5)
+        let adapter = ARIndoorNavigationTargetAdapter()
+
+        guard case .ready(let result) = adapter.resolve(groundedTarget: target,
+            sourceMetadata: refreshed, currentIdentity: fixture.identity, now: 10) else {
+            return XCTFail("A new observation of the exact same position should retain its grounded route")
+        }
+        XCTAssertEqual(result.position.value, currentPosition.value)
+        XCTAssertEqual(result.position.coordinateFrameID, fixture.identity.coordinateFrameID)
+        XCTAssertEqual(result.position.observedAt, refreshed.position.observedAt)
+        XCTAssertEqual(result.object.lastSeenAt, result.position.observedAt)
+        XCTAssertEqual(result.object.confidence.geometry, ConfidenceScore(clamping: 0.7))
+        XCTAssertEqual(target.resolvedAt, 9)
+        XCTAssertEqual(target.sourcePosition.observedAt, 9)
+
+        guard case .invalid(.targetStale) = adapter.resolve(groundedTarget: target,
+            sourceMetadata: try observingAgain(source, at: 40), currentIdentity: fixture.identity, now: 40) else {
+            return XCTFail("New observations must not extend the original handoff/alignment lease")
+        }
+    }
+
+    func testSourceRefreshRejectsChangedGroundingOlderTimesAndFutureObservations() throws {
+        let fixture = NavigationAppFixture()
+        let source = try fixture.metadata(x: 2)
+        let target = groundedTarget(source, identity: fixture.identity)
+        let invalid: [(SpatialObjectMetadata, ARIndoorNavigationTargetIssue)] = [
+            (try observingAgain(source, at: 8.5), .searchTargetMismatch),
+            (try observingAgain(source, at: 11), .targetStale),
+            (try observingAgain(source, at: 9.5, value: Vec3(x: 2.01, y: 0, z: 0)), .searchTargetMismatch),
+            (try observingAgain(source, at: 9.5, frameID: CoordinateFrameID()), .searchTargetMismatch),
+            (try observingAgain(source, at: 9.5, trackingQuality: .limited), .searchTargetMismatch),
+            (try observingAgain(source, at: 9.5, uncertainty: .lowConfidenceDepth), .searchTargetMismatch),
+        ]
+        for (record, expectedIssue) in invalid {
+            guard case .invalid(let issue) = ARIndoorNavigationTargetAdapter().resolve(
+                groundedTarget: target, sourceMetadata: record, currentIdentity: fixture.identity, now: 10) else {
+                XCTFail("Changed or invalid evidence must not be treated as a timestamp-only refresh")
+                continue
+            }
+            XCTAssertEqual(issue, expectedIssue)
+        }
+    }
+
+    func testGroundedRouteSurvivesRealObservationRefreshAcrossItsRenderLease() async throws {
+        let fixture = NavigationAppFixture()
+        let source = try fixture.metadata(x: 2)
+        let store = NavigationMetadataStore(try observingAgain(source, at: 9.5))
+        let harness = makeHarness(fixture: fixture,
+            metadataProvider: { objectID, mapID in await store.load(objectID: objectID, mapID: mapID) },
+            now: 10)
+        harness.controller.activate()
+        harness.surfaceContinuation.yield(fixture.surface(revision: 1))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10))
+        // The repository has already received a newer observation after the
+        // query selected its source. The initial route must still be usable.
+        harness.controller.navigate(to: groundedTarget(source, identity: fixture.identity))
+        await eventually { harness.controller.renderablePath != nil }
+        XCTAssertEqual(harness.controller.renderablePath?.destinationObjectID, source.object.id)
+
+        await store.replace(try observingAgain(source, at: 9.8))
+        await eventually(timeoutIterations: 1_000) { harness.controller.metrics.routesPublished >= 2 }
+        XCTAssertNotNil(harness.controller.renderablePath)
+        XCTAssertNil(harness.controller.latestPresentation?.targetIssue)
+        let reads = await store.readCount
+        XCTAssertGreaterThanOrEqual(reads, 2, "The render lease must re-read actual repository metadata")
+
+        await store.replace(try observingAgain(source, at: 9.9, value: Vec3(x: 2.01, y: 0, z: 0)))
+        await eventually(timeoutIterations: 1_000) {
+            harness.controller.latestPresentation?.targetIssue == .searchTargetMismatch
+        }
+        XCTAssertNil(harness.controller.renderablePath)
+        XCTAssertEqual(harness.controller.state, .noPath)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
     func testControllerPublishesOnlyAdjacentObservedPathSegments() async throws {
         let fixture = NavigationAppFixture()
         let harness = makeHarness(fixture: fixture)
@@ -1046,6 +1129,37 @@ final class IndoorNavigationControllerTests: XCTestCase {
         XCTAssertEqual(harness.controller.renderablePath?.waypoints.last, currentPosition.value)
     }
 
+    private func groundedTarget(
+        _ source: SpatialObjectMetadata, identity: ARCaptureIdentity,
+        currentPosition: FramedPosition? = nil
+    ) -> GroundedSpatialObjectQueryTarget {
+        GroundedSpatialObjectQueryTarget(
+            semanticLabel: source.object.semanticLabel, objectID: source.object.id,
+            sourceMapID: source.mapID, currentMapID: identity.mapID,
+            currentSegmentID: identity.segmentID, sourcePosition: source.position,
+            currentFramePosition: currentPosition ?? source.position, intent: .navigate,
+            effectiveConfidence: ConfidenceScore(clamping: 0.7), confidenceGrade: .medium,
+            alignmentConfidence: ConfidenceScore(clamping: 0.8), resolvedAt: 9)
+    }
+
+    private func observingAgain(
+        _ source: SpatialObjectMetadata, at timestamp: TimeInterval,
+        value: Vec3? = nil, frameID: CoordinateFrameID? = nil,
+        trackingQuality: SpatialTrackingQuality? = nil,
+        uncertainty: SpatialPositionUncertainty? = nil
+    ) throws -> SpatialObjectMetadata {
+        let position = try FramedPosition(
+            coordinateFrameID: frameID ?? source.position.coordinateFrameID,
+            value: value ?? source.position.value, observedAt: timestamp,
+            trackingQuality: trackingQuality ?? source.position.trackingQuality,
+            uncertainty: uncertainty ?? source.position.uncertainty)
+        var object = source.object
+        object.position = position.value
+        object.lastSeenAt = timestamp
+        object.stateUpdatedAt = timestamp
+        return try SpatialObjectMetadata(mapID: source.mapID, object: object, position: position)
+    }
+
     private func makeHarness(
         fixture: NavigationAppFixture,
         engine: IndoorARNavigationEngine = IndoorARNavigationEngine(),
@@ -1169,6 +1283,20 @@ private final class MainActorIdentity {
     init(_ value: ARCaptureIdentity) {
         self.value = value
     }
+}
+
+private actor NavigationMetadataStore {
+    private var metadata: SpatialObjectMetadata
+    private(set) var readCount = 0
+
+    init(_ metadata: SpatialObjectMetadata) { self.metadata = metadata }
+
+    func load(objectID: ObjectID, mapID: MapID) -> SpatialObjectMetadata? {
+        readCount += 1
+        return metadata.object.id == objectID && metadata.mapID == mapID ? metadata : nil
+    }
+
+    func replace(_ metadata: SpatialObjectMetadata) { self.metadata = metadata }
 }
 
 private actor NavigationRevisionRecorder {

@@ -278,7 +278,11 @@ public struct ARIndoorNavigationTargetAdapter: Sendable {
         }
         guard groundedTarget.objectID == sourceMetadata.object.id,
             groundedTarget.sourceMapID == sourceMetadata.mapID,
-            groundedTarget.sourcePosition == sourceMetadata.position,
+            groundedTarget.sourcePosition.coordinateFrameID == sourceMetadata.position.coordinateFrameID,
+            groundedTarget.sourcePosition.value == sourceMetadata.position.value,
+            groundedTarget.sourcePosition.trackingQuality == sourceMetadata.position.trackingQuality,
+            groundedTarget.sourcePosition.uncertainty == sourceMetadata.position.uncertainty,
+            groundedTarget.sourcePosition.observedAt <= sourceMetadata.position.observedAt,
             groundedTarget.semanticLabel == sourceMetadata.object.semanticLabel
         else {
             return .invalid(.searchTargetMismatch)
@@ -314,6 +318,17 @@ public struct ARIndoorNavigationTargetAdapter: Sendable {
             relation: min(original.confidence.relation, effective)
         )
         guard
+            // A real, newer observation of the exact same grounded location
+            // must not invalidate every route lease. Preserve its actual source
+            // time in the transformed metadata; never renew resolvedAt or the
+            // alignment proof, and never accept a changed position/quality.
+            let currentPosition = try? FramedPosition(
+                coordinateFrameID: groundedTarget.currentFramePosition.coordinateFrameID,
+                value: groundedTarget.currentFramePosition.value,
+                observedAt: sourceMetadata.position.observedAt,
+                trackingQuality: groundedTarget.currentFramePosition.trackingQuality,
+                uncertainty: groundedTarget.currentFramePosition.uncertainty
+            ),
             let transformedObject = try? SpatialObject(
                 id: original.id,
                 semanticLabel: original.semanticLabel,
@@ -333,7 +348,7 @@ public struct ARIndoorNavigationTargetAdapter: Sendable {
             let transformedMetadata = try? SpatialObjectMetadata(
                 mapID: currentMapID,
                 object: transformedObject,
-                position: groundedTarget.currentFramePosition
+                position: currentPosition
             )
         else {
             return .invalid(.derivedMetadataInvalid)
