@@ -440,6 +440,7 @@ final class VispaceServices: ObservableObject {
             deleteStore: {
                 await mapSelection.select(nil)
                 await temporalMemoryService.reset()
+                defer { placeRecognitionController.invalidateStoredAssociationCache() }
                 try await Task.detached(priority: .utility) {
                     try SpatialDataStoreMaintenance.deleteAll(at: spatialCaptureDirectory)
                 }.value
@@ -469,6 +470,7 @@ final class VispaceServices: ObservableObject {
                     await temporalMemoryService.reset()
                     try await temporalJournalRepository.deleteMap(mapID: mapID)
                     try await sceneGraphRepository.deleteMap(mapID: mapID)
+                    defer { placeRecognitionController.invalidateStoredAssociationCache(for: mapID) }
                     try await coordinateAlignmentRepository.deleteMap(mapID: mapID)
                     try await placeMemoryRepository.deleteMap(mapID: mapID)
                     try await placeVisualEvidence.deleteMap(mapID)
