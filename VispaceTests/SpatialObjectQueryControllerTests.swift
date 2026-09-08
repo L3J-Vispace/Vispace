@@ -6,6 +6,164 @@ import XCTest
 
 @MainActor
 final class SpatialObjectQueryControllerTests: XCTestCase {
+    func testExpiredNavigationCanExplicitlyRefreshTheSameObjectAndCurrentAlignment() async throws {
+        let sourceMap = mapID(1_170), sourceFrame = frameID(1_170)
+        let map = mapID(1_171), frame = frameID(1_171)
+        let current = identity(mapID: map, frameID: frame)
+        let original = try metadata(id: objectID(1_170), mapID: sourceMap, frameID: sourceFrame,
+            label: "keyboard", position: vec(1, 0, -2), lastSeenAt: 90)
+        let firstAlignment = try alignmentRecord(sourceMapID: sourceMap, sourceFrameID: sourceFrame,
+            targetMapID: map, targetFrameID: frame, transform: .translation(vec(2, 0, 1)))
+        let provider = SuspendedQuerySnapshotProvider()
+        let controller = SpatialObjectQueryController(
+            snapshotProvider: { try await provider.load(currentMapID: $0) },
+            currentIdentityProvider: { current }, uptimeProvider: { 10 })
+        let firstSnapshot = snapshot(records: [record(original)], alignments: [firstAlignment])
+        controller.submit("키보드 어디있어", now: 100)
+        try await waitForRequestCount(provider, 1)
+        await provider.resume(requestIndex: 0, with: firstSnapshot)
+        try await waitForIdle(controller)
+        let searchTarget = try XCTUnwrap(controller.latestGroundedTarget)
+        XCTAssertFalse(controller.canRefreshSelectedNavigation)
+        XCTAssertFalse(controller.refreshSelectedNavigation(searchTarget, now: 101))
+        XCTAssertTrue(controller.navigateToSelectedObject(searchTarget, now: 101))
+        try await waitForRequestCount(provider, 2)
+        await provider.resume(requestIndex: 1, with: firstSnapshot)
+        try await waitForIdle(controller)
+        let expired = try XCTUnwrap(controller.latestGroundedTarget)
+
+        XCTAssertFalse(controller.canNavigateToSelectedObject)
+        XCTAssertTrue(controller.canRefreshSelectedNavigation)
+        XCTAssertTrue(controller.refreshSelectedNavigation(expired, now: 132))
+        XCTAssertNil(controller.latestGroundedTarget)
+        XCTAssertFalse(controller.canRefreshSelectedNavigation)
+        XCTAssertFalse(controller.refreshSelectedNavigation(expired, now: 132))
+        try await waitForRequestCount(provider, 3)
+        let refreshed = try metadata(id: original.object.id, mapID: sourceMap, frameID: sourceFrame,
+            label: "keyboard", position: original.position.value, lastSeenAt: 131)
+        let other = try metadata(id: objectID(1_172), mapID: sourceMap, frameID: sourceFrame,
+            label: "keyboard", position: vec(4, 0, -2), lastSeenAt: 131)
+        let currentAlignment = try alignmentRecord(sourceMapID: sourceMap, sourceFrameID: sourceFrame,
+            targetMapID: map, targetFrameID: frame, transform: .translation(vec(5, 0, 1)))
+        await provider.resume(requestIndex: 2, with: snapshot(records: [record(other), record(refreshed)],
+            alignments: [currentAlignment]))
+        try await waitForIdle(controller)
+        let renewed = try XCTUnwrap(controller.latestGroundedTarget)
+        XCTAssertEqual(renewed.objectID, original.object.id)
+        XCTAssertEqual(renewed.sourceMapID, sourceMap)
+        XCTAssertEqual(renewed.sourcePosition, refreshed.position)
+        XCTAssertEqual(renewed.position.x, 6, accuracy: 0.000_001)
+        XCTAssertEqual(renewed.intent, .navigate)
+        XCTAssertEqual(renewed.resolvedAt, 132)
+        XCTAssertFalse(controller.refreshSelectedNavigation(expired, now: 133))
+        XCTAssertEqual(controller.metrics.requestsStarted, 3)
+    }
+
+    func testNavigationRefreshRejectsCaptureChangesBeforeAndDuringRead() async throws {
+        let map = mapID(1_180), frame = frameID(1_180)
+        let current = identity(mapID: map, frameID: frame)
+        let identityBox = QueryIdentityBox(current)
+        let stored = try metadata(id: objectID(1_180), mapID: map, frameID: frame, label: "keyboard")
+        let records = snapshot(records: [record(stored)])
+        let provider = SuspendedQuerySnapshotProvider()
+        let controller = SpatialObjectQueryController(
+            snapshotProvider: { try await provider.load(currentMapID: $0) },
+            currentIdentityProvider: { identityBox.value }, uptimeProvider: { 10 })
+        controller.submit("키보드까지 안내해줘", now: 100)
+        try await waitForRequestCount(provider, 1)
+        await provider.resume(requestIndex: 0, with: records)
+        try await waitForIdle(controller)
+        let target = try XCTUnwrap(controller.latestGroundedTarget)
+        XCTAssertEqual(target.intent, .navigate)
+        XCTAssertTrue(controller.canRefreshSelectedNavigation)
+        identityBox.value = identity(mapID: map, frameID: frameID(1_181))
+        XCTAssertFalse(controller.canRefreshSelectedNavigation)
+        XCTAssertFalse(controller.refreshSelectedNavigation(target, now: 131))
+        XCTAssertEqual(controller.metrics.requestsStarted, 1)
+
+        identityBox.value = current
+        XCTAssertFalse(controller.refreshSelectedNavigation(target, now: .nan))
+        XCTAssertFalse(controller.refreshSelectedNavigation(target, now: 99))
+        XCTAssertTrue(controller.refreshSelectedNavigation(target, now: 131))
+        try await waitForRequestCount(provider, 2)
+        identityBox.value = identity(mapID: map, frameID: frameID(1_181))
+        await provider.resume(requestIndex: 1, with: records)
+        try await waitForIdle(controller)
+        XCTAssertNil(controller.latestGroundedTarget)
+        XCTAssertFalse(controller.canRefreshSelectedNavigation)
+        XCTAssertEqual(controller.state, .idle)
+    }
+
+    func testNavigationRefreshUsesReadCompletionTimeWithoutAcceptingFutureObservations() async throws {
+        let map = mapID(1_150), frame = frameID(1_150)
+        let current = identity(mapID: map, frameID: frame)
+        let original = try metadata(id: objectID(1_150), mapID: map, frameID: frame,
+            label: "keyboard", position: vec(1, 0, -2), lastSeenAt: 90)
+        for observedAt in [102.0, 104.0] {
+            let provider = SuspendedQuerySnapshotProvider()
+            let clock = QueryUptimeBox(10)
+            let controller = SpatialObjectQueryController(
+                snapshotProvider: { try await provider.load(currentMapID: $0) },
+                currentIdentityProvider: { current }, uptimeProvider: { clock.value })
+            controller.submit("키보드 어디있어", now: 100)
+            try await waitForRequestCount(provider, 1)
+            await provider.resume(requestIndex: 0, with: snapshot(records: [record(original)]))
+            try await waitForIdle(controller)
+            let target = try XCTUnwrap(controller.latestGroundedTarget)
+
+            XCTAssertTrue(controller.navigateToSelectedObject(target, now: 101))
+            try await waitForRequestCount(provider, 2)
+            // The same location is observed during the suspended navigation
+            // refresh. The read finishes at wall time 103, two seconds later.
+            let refreshed = try metadata(id: original.object.id, mapID: map, frameID: frame,
+                label: "keyboard", position: original.position.value, lastSeenAt: observedAt)
+            clock.value = 12
+            await provider.resume(requestIndex: 1, with: snapshot(records: [record(refreshed)]))
+            try await waitForIdle(controller)
+
+            XCTAssertEqual(controller.latestPresentation?.result.candidates.first?.record.metadata, refreshed)
+            if observedAt == 102 {
+                let destination = try XCTUnwrap(controller.latestGroundedTarget)
+                XCTAssertEqual(destination.intent, .navigate)
+                XCTAssertEqual(destination.sourcePosition, refreshed.position)
+                XCTAssertEqual(destination.resolvedAt, 101, "The read must not renew the handoff lease")
+            } else {
+                XCTAssertNil(controller.latestGroundedTarget)
+                XCTAssertEqual(controller.latestPresentation?.result.status, .lowConfidence)
+                XCTAssertTrue(controller.latestPresentation?.result.issues.contains(.observationTimeInFuture) == true)
+            }
+        }
+    }
+
+    func testNavigationRefreshRejectsInvalidOrReversedEvaluationClock() async throws {
+        let map = mapID(1_160), frame = frameID(1_160)
+        let current = identity(mapID: map, frameID: frame)
+        let stored = try metadata(id: objectID(1_160), mapID: map, frameID: frame, label: "keyboard")
+        for completedUptime in [Double.nan, .infinity, 9] {
+            let provider = SuspendedQuerySnapshotProvider()
+            let clock = QueryUptimeBox(10)
+            let controller = SpatialObjectQueryController(
+                snapshotProvider: { try await provider.load(currentMapID: $0) },
+                currentIdentityProvider: { current }, uptimeProvider: { clock.value })
+            let records = snapshot(records: [record(stored)])
+            controller.submit("키보드 어디있어", now: 100)
+            try await waitForRequestCount(provider, 1)
+            await provider.resume(requestIndex: 0, with: records)
+            try await waitForIdle(controller)
+            let target = try XCTUnwrap(controller.latestGroundedTarget)
+            XCTAssertTrue(controller.navigateToSelectedObject(target, now: 101))
+            try await waitForRequestCount(provider, 2)
+            clock.value = completedUptime
+            await provider.resume(requestIndex: 1, with: records)
+            try await waitForIdle(controller)
+            XCTAssertNil(controller.latestGroundedTarget)
+            XCTAssertFalse(controller.canNavigateToSelectedObject)
+            guard case .failed = controller.state else {
+                return XCTFail("An unusable clock must not authorize navigation")
+            }
+        }
+    }
+
     func testNavigationActionPreservesExplicitCandidateAndRefreshesGrounding() async throws {
         let map = mapID(1_100), frame = frameID(1_100)
         let records = try (0..<3).map { index in
@@ -1501,6 +1659,15 @@ private actor QueryAnnotationTestStore {
         let renamed = try SpatialObjectMetadata(mapID: expected.mapID, object: object, position: objects[index].position)
         objects[index] = renamed
         return renamed
+    }
+}
+
+@MainActor
+private final class QueryUptimeBox {
+    var value: TimeInterval
+
+    init(_ value: TimeInterval) {
+        self.value = value
     }
 }
 

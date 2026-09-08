@@ -129,6 +129,7 @@ public final class SpatialObjectQueryController: ObservableObject {
             _ currentMapID: MapID?
         ) async throws -> SpatialObjectQueryRepositorySnapshot
     public typealias CurrentIdentityProvider = @MainActor @Sendable () -> ARCaptureIdentity
+    public typealias UptimeProvider = @MainActor @Sendable () -> TimeInterval
     public typealias ClassificationCorrectionProvider =
         @Sendable (SpatialObjectMetadata, String) async throws -> SpatialObjectMetadata
     public typealias RenameProvider = @Sendable (SpatialObjectMetadata, String?) async throws -> SpatialObjectMetadata
@@ -137,12 +138,21 @@ public final class SpatialObjectQueryController: ObservableObject {
     public var canCorrectClassification: Bool { classificationCorrectionProvider != nil }
 
     public var canNavigateToSelectedObject: Bool {
+        hasNavigableSelection && latestGroundedTarget?.intent != .navigate
+    }
+
+    /// The UI exposes this only when a navigation attempt needs explicit
+    /// recovery. A fresh read is required; the existing target is never restamped.
+    public var canRefreshSelectedNavigation: Bool {
+        hasNavigableSelection && latestGroundedTarget?.intent == .navigate
+    }
+
+    private var hasNavigableSelection: Bool {
         guard queryTask == nil, case .result = state,
             presentedIdentity == currentIdentityProvider(),
             let presentation = latestPresentation, presentation.canStartARGuidance,
             let selected = presentation.result.selectedCandidate?.record.metadata,
             let target = latestGroundedTarget,
-            target.intent != .navigate,
             selected.object.presence != .removed,
             target.objectID == selected.object.id, target.sourceMapID == selected.mapID,
             target.sourcePosition == selected.position,
@@ -164,6 +174,7 @@ public final class SpatialObjectQueryController: ObservableObject {
     private let currentIdentityProvider: CurrentIdentityProvider
     private let searchEngine: DeterministicSpatialObjectSearchEngine
     private let positionResolver: ValidatedCurrentFramePositionResolver
+    private let uptimeProvider: UptimeProvider
     private let renameProvider: RenameProvider?
     private let classificationCorrectionProvider: ClassificationCorrectionProvider?
     private var latestSubmittedQuery = ""
@@ -184,7 +195,8 @@ public final class SpatialObjectQueryController: ObservableObject {
         searchEngine: DeterministicSpatialObjectSearchEngine =
             DeterministicSpatialObjectSearchEngine(),
         positionResolver: ValidatedCurrentFramePositionResolver =
-            ValidatedCurrentFramePositionResolver()
+            ValidatedCurrentFramePositionResolver(),
+        uptimeProvider: @escaping UptimeProvider = { ProcessInfo.processInfo.systemUptime }
     ) {
         snapshotProvider = { currentMapID in
             try await repository.loadSnapshot(currentMapID: currentMapID)
@@ -194,6 +206,7 @@ public final class SpatialObjectQueryController: ObservableObject {
         self.classificationCorrectionProvider = classificationCorrectionProvider
         self.searchEngine = searchEngine
         self.positionResolver = positionResolver
+        self.uptimeProvider = uptimeProvider
     }
 
     public init(
@@ -204,7 +217,8 @@ public final class SpatialObjectQueryController: ObservableObject {
         searchEngine: DeterministicSpatialObjectSearchEngine =
             DeterministicSpatialObjectSearchEngine(),
         positionResolver: ValidatedCurrentFramePositionResolver =
-            ValidatedCurrentFramePositionResolver()
+            ValidatedCurrentFramePositionResolver(),
+        uptimeProvider: @escaping UptimeProvider = { ProcessInfo.processInfo.systemUptime }
     ) {
         self.snapshotProvider = snapshotProvider
         self.currentIdentityProvider = currentIdentityProvider
@@ -212,6 +226,7 @@ public final class SpatialObjectQueryController: ObservableObject {
         self.classificationCorrectionProvider = classificationCorrectionProvider
         self.searchEngine = searchEngine
         self.positionResolver = positionResolver
+        self.uptimeProvider = uptimeProvider
     }
 
     deinit {
@@ -273,8 +288,28 @@ public final class SpatialObjectQueryController: ObservableObject {
         _ expectedTarget: GroundedSpatialObjectQueryTarget,
         now: TimeInterval = Date().timeIntervalSince1970
     ) -> Bool {
+        guard canNavigateToSelectedObject else { return false }
+        return startSelectedNavigation(expectedTarget, now: now)
+    }
+
+    /// Explicitly rechecks a route that expired or could not be verified. Keep
+    /// the selected identity and reread its metadata/alignment just as for the
+    /// first navigation request, including when the old target's lease expired.
+    @discardableResult
+    public func refreshSelectedNavigation(
+        _ expectedTarget: GroundedSpatialObjectQueryTarget,
+        now: TimeInterval = Date().timeIntervalSince1970
+    ) -> Bool {
+        guard canRefreshSelectedNavigation else { return false }
+        return startSelectedNavigation(expectedTarget, now: now)
+    }
+
+    private func startSelectedNavigation(
+        _ expectedTarget: GroundedSpatialObjectQueryTarget,
+        now: TimeInterval
+    ) -> Bool {
         guard now.isFinite, now >= expectedTarget.resolvedAt,
-            canNavigateToSelectedObject, latestGroundedTarget == expectedTarget,
+            hasNavigableSelection, latestGroundedTarget == expectedTarget,
             let presentation = latestPresentation,
             let selected = presentation.result.selectedCandidate?.record.metadata
         else { return false }
@@ -459,6 +494,7 @@ public final class SpatialObjectQueryController: ObservableObject {
         latestRequestID &+= 1
         let requestID = latestRequestID
         let identity = currentIdentityProvider()
+        let requestStartedUptime = uptimeProvider()
         let query = Self.boundedQuery(utterance)
         metrics.requestsStarted &+= 1
         latestPresentation = nil
@@ -482,10 +518,23 @@ public final class SpatialObjectQueryController: ObservableObject {
                     return
                 }
 
+                // Perception can persist a newer observation while this read is
+                // suspended. Judge its timestamp at read completion, not at the
+                // button tap, without changing any persisted observation time.
+                // Keep resolvedAt below anchored to the request so this elapsed
+                // time cannot extend the navigation handoff's freshness lease.
+                let completedUptime = self.uptimeProvider()
+                guard requestStartedUptime.isFinite, requestStartedUptime >= 0,
+                    completedUptime.isFinite, completedUptime >= requestStartedUptime
+                else {
+                    self.publishFailure()
+                    self.finish(requestID: requestID)
+                    return
+                }
                 let context = try SpatialObjectSearchContext(
                     currentMapID: identity.mapID,
                     currentFloorNodeID: currentFloorNodeID,
-                    now: now,
+                    now: now + (completedUptime - requestStartedUptime),
                     includeRemoved: DeterministicIntentRouter().route(query).kind == .lastSeen
                 )
                 let records = snapshot.records
