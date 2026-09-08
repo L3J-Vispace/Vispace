@@ -11,6 +11,7 @@ struct SpatialQueryPanel: View {
     let distanceDescription: (Vec3) -> String
     var onRegisterObject: (String) -> Void = { _ in }
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @FocusState private var queryIsFocused: Bool
     @State private var query = ""
     @State private var rejection: SpatialCommandRejection?
@@ -26,92 +27,15 @@ struct SpatialQueryPanel: View {
 
     var body: some View {
         VStack(spacing: 10) {
-            Spacer(minLength: 0)
+            if !dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 0) }
 
-            if let rejection {
-                messageCard(message: rejectionMessage(rejection), systemImage: "info.circle.fill")
-            } else if let presentation = navigationController.latestPresentation {
-                VStack(spacing: 8) {
-                    messageCard(
-                        message: presentation.message,
-                        systemImage: presentation.canRenderPath
-                            ? "point.topleft.down.to.point.bottomright.curvepath.fill"
-                            : "exclamationmark.triangle.fill"
-                    )
-                    if [.noPath, .invalidated].contains(navigationController.state),
-                        queryController.canRefreshSelectedNavigation,
-                        let target = queryController.latestGroundedTarget {
-                        Button {
-                            queryIsFocused = false
-                            if queryController.refreshSelectedNavigation(target) {
-                                navigationController.clearRoute()
-                            }
-                        } label: {
-                            Label("경로 다시 확인", systemImage: "arrow.clockwise")
-                                .font(.body.weight(.semibold))
-                                .frame(maxWidth: .infinity, minHeight: 44)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(Color(uiColor: .systemCyan))
-                        .foregroundStyle(.black)
-                        .accessibilityHint("같은 물체의 최신 위치와 통로를 다시 확인합니다.")
-                        .accessibilityIdentifier("vispace.navigation.retry")
-                    }
+            if dynamicTypeSize.isAccessibilitySize {
+                ScrollView {
+                    resultContent
+                        .frame(maxWidth: .infinity)
                 }
-                .frame(maxWidth: 520)
-                .transition(resultTransition)
-            } else if let presentation = placementController.latestPresentation {
-                messageCard(
-                    message: presentation.message,
-                    systemImage: presentation.disposition == .feasible
-                        ? "checkmark.seal.fill"
-                        : "info.circle.fill"
-                )
-                .transition(resultTransition)
-            } else if let presentation = relationQueryController.latestPresentation {
-                VStack(alignment: .leading, spacing: 8) {
-                    messageCard(
-                        message: presentation.message,
-                        systemImage: "point.3.connected.trianglepath.dotted"
-                    )
-                    if let target = presentation.result.ambiguousTargets.first {
-                        ForEach(Array(target.candidates.enumerated()), id: \.element.objectID) {
-                            index, candidate in
-                            Button {
-                                relationQueryController.selectTarget(
-                                    mention: target.mention, objectID: candidate.objectID)
-                            } label: {
-                                VStack(alignment: .leading) {
-                                    Text("\(candidate.name) · 후보 \(index + 1)")
-                                    if let position = candidate.position {
-                                        Text(distanceDescription(position)).font(.caption)
-                                    }
-                                    if let time = candidate.lastSeenAt {
-                                        Text(
-                                            "마지막 관측 \(Date(timeIntervalSince1970: time).formatted(date: .abbreviated, time: .shortened))"
-                                        )
-                                        .font(.caption)
-                                    }
-                                }.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                            }
-                            .buttonStyle(.bordered)
-                            .accessibilityIdentifier("vispace.relation.candidate.\(index)")
-                        }
-                    }
-                }
-                .transition(resultTransition)
-            } else if let relationMessage = relationStateMessage {
-                messageCard(
-                    message: relationMessage,
-                    systemImage: "exclamationmark.triangle.fill"
-                )
-                .transition(resultTransition)
-            } else if let presentation = queryController.latestPresentation {
-                resultCard(presentation)
-                    .transition(resultTransition)
-            } else if case .failed(let message) = queryController.state {
-                messageCard(message: message, systemImage: "exclamationmark.triangle.fill")
-                    .transition(resultTransition)
+            } else {
+                resultContent
             }
 
             HStack(spacing: 10) {
@@ -219,6 +143,95 @@ struct SpatialQueryPanel: View {
             ObjectIdentityReviewScreen(
                 controller: perceptionController, distanceDescription: distanceDescription)
         }
+    }
+
+    @ViewBuilder
+    private var resultContent: some View {
+    if let rejection {
+        messageCard(message: rejectionMessage(rejection), systemImage: "info.circle.fill")
+    } else if let presentation = navigationController.latestPresentation {
+        VStack(spacing: 8) {
+            messageCard(
+                message: presentation.message,
+                systemImage: presentation.canRenderPath
+                    ? "point.topleft.down.to.point.bottomright.curvepath.fill"
+                    : "exclamationmark.triangle.fill"
+            )
+            if [.noPath, .invalidated].contains(navigationController.state),
+                queryController.canRefreshSelectedNavigation,
+                let target = queryController.latestGroundedTarget {
+                Button {
+                    queryIsFocused = false
+                    if queryController.refreshSelectedNavigation(target) {
+                        navigationController.clearRoute()
+                    }
+                } label: {
+                    Label("경로 다시 확인", systemImage: "arrow.clockwise")
+                        .font(.body.weight(.semibold))
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color(uiColor: .systemCyan))
+                .foregroundStyle(.black)
+                .accessibilityHint("같은 물체의 최신 위치와 통로를 다시 확인합니다.")
+                .accessibilityIdentifier("vispace.navigation.retry")
+            }
+        }
+        .frame(maxWidth: 520)
+        .transition(resultTransition)
+    } else if let presentation = placementController.latestPresentation {
+        messageCard(
+            message: presentation.message,
+            systemImage: presentation.disposition == .feasible
+                ? "checkmark.seal.fill"
+                : "info.circle.fill"
+        )
+        .transition(resultTransition)
+    } else if let presentation = relationQueryController.latestPresentation {
+        VStack(alignment: .leading, spacing: 8) {
+            messageCard(
+                message: presentation.message,
+                systemImage: "point.3.connected.trianglepath.dotted"
+            )
+            if let target = presentation.result.ambiguousTargets.first {
+                ForEach(Array(target.candidates.enumerated()), id: \.element.objectID) {
+                    index, candidate in
+                    Button {
+                        relationQueryController.selectTarget(
+                            mention: target.mention, objectID: candidate.objectID)
+                    } label: {
+                        VStack(alignment: .leading) {
+                            Text("\(candidate.name) · 후보 \(index + 1)")
+                            if let position = candidate.position {
+                                Text(distanceDescription(position)).font(.caption)
+                            }
+                            if let time = candidate.lastSeenAt {
+                                Text(
+                                    "마지막 관측 \(Date(timeIntervalSince1970: time).formatted(date: .abbreviated, time: .shortened))"
+                                )
+                                .font(.caption)
+                            }
+                        }.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("vispace.relation.candidate.\(index)")
+                }
+            }
+        }
+        .transition(resultTransition)
+    } else if let relationMessage = relationStateMessage {
+        messageCard(
+            message: relationMessage,
+            systemImage: "exclamationmark.triangle.fill"
+        )
+        .transition(resultTransition)
+    } else if let presentation = queryController.latestPresentation {
+        resultCard(presentation)
+            .transition(resultTransition)
+    } else if case .failed(let message) = queryController.state {
+        messageCard(message: message, systemImage: "exclamationmark.triangle.fill")
+            .transition(resultTransition)
+    }
     }
 
     private var isSearching: Bool {
@@ -427,33 +440,55 @@ struct SpatialQueryPanel: View {
     }
 
     private func messageCard(message: String, systemImage: String) -> some View {
-        HStack(alignment: .top, spacing: 11) {
-            Image(systemName: systemImage)
-                .foregroundStyle(.yellow)
-                .accessibilityHidden(true)
-
-            Text(message)
-                .font(.subheadline)
-                .foregroundStyle(.white)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            Button {
-                dismissAll()
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.white.opacity(0.72))
-                    .frame(minWidth: 44, minHeight: 44)
-                    .contentShape(Rectangle())
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .top) {
+                        messageIcon(systemImage)
+                        Spacer()
+                        dismissResultButton
+                    }
+                    messageText(message)
+                }
+            } else {
+                HStack(alignment: .top, spacing: 11) {
+                    messageIcon(systemImage)
+                    messageText(message)
+                    dismissResultButton
+                }
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(Text("query.dismissResult"))
-            .accessibilityIdentifier("vispace.query.dismiss")
         }
         .padding(14)
         .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 18))
         .frame(maxWidth: 520)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("vispace.query.result")
+    }
+
+    private func messageIcon(_ name: String) -> some View {
+        Image(systemName: name)
+            .foregroundStyle(.yellow)
+            .accessibilityHidden(true)
+    }
+
+    private func messageText(_ message: String) -> some View {
+        Text(message)
+            .font(.subheadline)
+            .foregroundStyle(.white)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var dismissResultButton: some View {
+        Button { dismissAll() } label: {
+            Image(systemName: "xmark.circle.fill")
+                .foregroundStyle(.white.opacity(0.72))
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text("query.dismissResult"))
+        .accessibilityIdentifier("vispace.query.dismiss")
     }
 }
 
