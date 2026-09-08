@@ -1,11 +1,18 @@
 name: iOS CI
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
+  # Core CI runs automatically. iOS validation uses a hosted Mac by default;
+  # the owner's MacBook is used only by an explicit self-hosted dispatch.
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Where to run Xcode validation
+        type: choice
+        required: true
+        default: github-hosted
+        options:
+          - github-hosted
+          - self-hosted
 
 permissions:
   contents: read
@@ -17,10 +24,11 @@ concurrency:
 jobs:
   build-test-analyze:
     name: Build, test, and analyze
-    runs-on: macos-26
-    timeout-minutes: 45
+    if: github.repository == 'L3J-Vispace/Vispace'
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJSON('["self-hosted", "macOS", "ARM64", "vispace-ios"]') || 'macos-26' }}
+    timeout-minutes: 60
     env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      DEVELOPER_DIR: ${{ inputs.runner == 'self-hosted' && '/Applications/Xcode.app/Contents/Developer' || '/Applications/Xcode_26.6.app/Contents/Developer' }}
       REQUIRED_XCODE_VERSION: 26.6
       XCODEGEN_VERSION: 2.46.0
       XCODEGEN_SHA256: 4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
@@ -29,6 +37,9 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+
+      - name: Verify bundled detector model
+        run: bash Scripts/verify-model.sh
 
       - name: Verify Xcode baseline
         run: |
@@ -73,6 +84,7 @@ jobs:
           grep -q 'UIInterfaceOrientationPortrait' project.yml
           grep -q 'SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated' Config/Shared.xcconfig
           plutil -lint Vispace/Resources/PrivacyInfo.xcprivacy
+          python3 Scripts/verify-privacy.py
           if grep -R --line-number --exclude-dir=.git \
             -E 'NSMicrophoneUsageDescription|INFOPLIST_KEY_NSMicrophoneUsageDescription' \
             project.yml Config Vispace; then
@@ -141,6 +153,62 @@ jobs:
             COMPILER_INDEX_STORE_ENABLE=NO \
             build
 
+      - name: Test on Simulator
+        id: simulator_tests
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Vispace.xcodeproj \
+            -scheme Vispace \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${SIMULATOR_UDID}" \
+            -derivedDataPath "${RUNNER_TEMP}/VispaceDerivedData" \
+            -resultBundlePath "${RUNNER_TEMP}/VispaceTests.xcresult" \
+            -test-timeouts-enabled YES \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            test
+
+      - name: Report Simulator test results
+        if: ${{ !cancelled() && steps.simulator_tests.outcome != 'skipped' }}
+        run: |
+          set -euo pipefail
+          if [[ -d "${RUNNER_TEMP}/VispaceTests.xcresult" ]]; then
+            xcrun xcresulttool get test-results summary \
+              --path "${RUNNER_TEMP}/VispaceTests.xcresult" --compact
+          fi
+
+      - name: Repeat place history rotation
+        id: place_history_stress
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Vispace.xcodeproj \
+            -scheme Vispace \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${SIMULATOR_UDID}" \
+            -derivedDataPath "${RUNNER_TEMP}/VispaceDerivedData" \
+            -resultBundlePath "${RUNNER_TEMP}/VispacePlaceHistoryTests.xcresult" \
+            -only-testing:VispaceTests/PlaceRecognitionControllerTests/testDeferredAttemptRotationWithRealRepositorySurvivesHistoryLimitAndBackwardClock \
+            -test-iterations 5 \
+            -run-tests-until-failure \
+            -test-timeouts-enabled YES \
+            -maximum-test-execution-time-allowance 60 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            test-without-building
+
+      - name: Report place history results
+        if: ${{ !cancelled() && steps.place_history_stress.outcome != 'skipped' }}
+        run: |
+          set -euo pipefail
+          if [[ -d "${RUNNER_TEMP}/VispacePlaceHistoryTests.xcresult" ]]; then
+            xcrun xcresulttool get test-results summary \
+              --path "${RUNNER_TEMP}/VispacePlaceHistoryTests.xcresult" --compact
+          fi
+
       - name: Build optimized configuration without signing
         run: |
           set -euo pipefail
@@ -154,6 +222,15 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \
             build
+
+      - name: Verify optimized resources
+        run: |
+          set -euo pipefail
+          app="${RUNNER_TEMP}/VispaceReleaseDerivedData/Build/Products/Release-iphonesimulator/Vispace.app"
+          test -d "${app}/YOLOv3Int8LUT.mlmodelc"
+          test -f "${app}/ko.lproj/Localizable.strings"
+          test -f "${app}/ko.lproj/InfoPlist.strings"
+          python3 Scripts/verify-privacy.py --manifest "${app}/PrivacyInfo.xcprivacy"
 
       - name: Archive device configuration without signing
         run: |
@@ -170,19 +247,8 @@ jobs:
             COMPILER_INDEX_STORE_ENABLE=NO \
             archive
 
-      - name: Test on Simulator
-        run: |
-          set -euo pipefail
-          xcodebuild \
-            -project Vispace.xcodeproj \
-            -scheme Vispace \
-            -configuration Debug \
-            -destination "platform=iOS Simulator,id=${SIMULATOR_UDID}" \
-            -derivedDataPath "${RUNNER_TEMP}/VispaceDerivedData" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            COMPILER_INDEX_STORE_ENABLE=NO \
-            test
+      - name: Verify archived privacy declaration
+        run: python3 Scripts/verify-privacy.py --manifest "${RUNNER_TEMP}/Vispace.xcarchive/Products/Applications/Vispace.app/PrivacyInfo.xcprivacy"
 
       - name: Analyze
         run: |
@@ -197,3 +263,30 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \
             analyze
+
+      - name: Preserve failed test diagnostics on the MacBook
+        if: failure() && inputs.runner == 'self-hosted'
+        run: |
+          set -euo pipefail
+          evidence="${HOME}/GitHubActions/vispace-evidence/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${evidence}"
+          printf 'Commit: %s\nRun: %s/%s/actions/runs/%s\n' \
+            "${GITHUB_SHA}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}" \
+            > "${evidence}/run.txt"
+          for bundle in VispaceTests VispacePlaceHistoryTests; do
+            if [[ -d "${RUNNER_TEMP}/${bundle}.xcresult" ]]; then
+              ditto -c -k --keepParent "${RUNNER_TEMP}/${bundle}.xcresult" "${evidence}/${bundle}.zip"
+            fi
+          done
+          echo "Failed test diagnostics saved on the MacBook: ${evidence}"
+
+      - name: Upload test diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-test-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/VispaceTests.xcresult
+            ${{ runner.temp }}/VispacePlaceHistoryTests.xcresult
+          if-no-files-found: ignore
+          retention-days: 7

@@ -3,6 +3,8 @@ import Foundation
 public enum SpatialObjectError: Error, Equatable, Sendable {
     case emptySemanticLabel
     case invalidTimestamp
+    case invalidDisplayName
+    case invalidTemporalRevision
 }
 
 public enum ObjectCertainty: String, Codable, Hashable, Sendable {
@@ -18,8 +20,12 @@ public enum ObjectPresence: String, Codable, Hashable, Sendable {
 }
 
 public struct SpatialObject: Codable, Hashable, Sendable {
+    public static let maximumDisplayNameLength = 64
     public let id: ObjectID
     public var semanticLabel: String
+    /// Original detector class retained after an explicit user correction.
+    /// It is an observation alias, never independent physical identity proof.
+    public var detectorSemanticLabel: String?
     public var nodeID: SpatialNodeID?
     public var position: Vec3
     public var bounds: AABB?
@@ -31,6 +37,10 @@ public struct SpatialObject: Codable, Hashable, Sendable {
     /// Ordering timestamp for lifecycle mutations. This is distinct from
     /// `lastSeenAt`, which always means the time of the latest observation.
     public var stateUpdatedAt: TimeInterval
+    /// User annotation; never replaces the detector's semantic class.
+    public private(set) var displayName: String?
+    public var temporalRevision: UInt64?
+    public var displayLabel: String { displayName ?? semanticLabel }
 
     public init(
         id: ObjectID = ObjectID(),
@@ -43,22 +53,34 @@ public struct SpatialObject: Codable, Hashable, Sendable {
         confidence: ConfidenceVector,
         firstSeenAt: TimeInterval,
         lastSeenAt: TimeInterval,
-        stateUpdatedAt: TimeInterval? = nil
+        stateUpdatedAt: TimeInterval? = nil,
+        displayName: String? = nil,
+        temporalRevision: UInt64? = nil,
+        detectorSemanticLabel: String? = nil
     ) throws {
         let normalizedLabel = semanticLabel.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedStateUpdatedAt = stateUpdatedAt ?? lastSeenAt
         guard !normalizedLabel.isEmpty else {
             throw SpatialObjectError.emptySemanticLabel
         }
+        guard temporalRevision == nil || temporalRevision! > 0 else {
+            throw SpatialObjectError.invalidTemporalRevision
+        }
         guard firstSeenAt.isFinite, firstSeenAt >= 0,
-            lastSeenAt.isFinite, lastSeenAt >= firstSeenAt,
-            resolvedStateUpdatedAt.isFinite, resolvedStateUpdatedAt >= lastSeenAt
+            lastSeenAt.isFinite, lastSeenAt >= 0,
+            resolvedStateUpdatedAt.isFinite, resolvedStateUpdatedAt >= 0,
+            temporalRevision != nil || (lastSeenAt >= firstSeenAt && resolvedStateUpdatedAt >= lastSeenAt)
         else {
             throw SpatialObjectError.invalidTimestamp
         }
 
         self.id = id
         self.semanticLabel = normalizedLabel
+        let detectorLabel = detectorSemanticLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard detectorLabel.map({ !$0.isEmpty && $0.count <= 64 }) ?? true else {
+            throw SpatialObjectError.emptySemanticLabel
+        }
+        self.detectorSemanticLabel = detectorLabel
         self.nodeID = nodeID
         self.position = position
         self.bounds = bounds
@@ -68,11 +90,25 @@ public struct SpatialObject: Codable, Hashable, Sendable {
         self.firstSeenAt = firstSeenAt
         self.lastSeenAt = lastSeenAt
         self.stateUpdatedAt = resolvedStateUpdatedAt
+        self.displayName = nil
+        self.temporalRevision = temporalRevision
+        try setDisplayName(displayName)
+    }
+
+    public mutating func setDisplayName(_ value: String?) throws {
+        let name = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let name, !name.isEmpty else { displayName = nil; return }
+        guard name.count <= Self.maximumDisplayNameLength,
+            name.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }),
+            name.unicodeScalars.contains(where: CharacterSet.alphanumerics.contains)
+        else { throw SpatialObjectError.invalidDisplayName }
+        displayName = name
     }
 
     private enum CodingKeys: String, CodingKey {
         case id
         case semanticLabel
+        case detectorSemanticLabel
         case nodeID
         case position
         case bounds
@@ -82,6 +118,8 @@ public struct SpatialObject: Codable, Hashable, Sendable {
         case firstSeenAt
         case lastSeenAt
         case stateUpdatedAt
+        case displayName
+        case temporalRevision
     }
 
     public init(from decoder: Decoder) throws {
@@ -98,7 +136,10 @@ public struct SpatialObject: Codable, Hashable, Sendable {
                 confidence: container.decode(ConfidenceVector.self, forKey: .confidence),
                 firstSeenAt: container.decode(TimeInterval.self, forKey: .firstSeenAt),
                 lastSeenAt: container.decode(TimeInterval.self, forKey: .lastSeenAt),
-                stateUpdatedAt: container.decode(TimeInterval.self, forKey: .stateUpdatedAt)
+                stateUpdatedAt: container.decode(TimeInterval.self, forKey: .stateUpdatedAt),
+                displayName: container.decodeIfPresent(String.self, forKey: .displayName),
+                temporalRevision: container.decodeIfPresent(UInt64.self, forKey: .temporalRevision),
+                detectorSemanticLabel: container.decodeIfPresent(String.self, forKey: .detectorSemanticLabel)
             )
         } catch let error as DecodingError {
             throw error
@@ -115,6 +156,7 @@ public struct SpatialObject: Codable, Hashable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(id, forKey: .id)
         try container.encode(semanticLabel, forKey: .semanticLabel)
+        try container.encodeIfPresent(detectorSemanticLabel, forKey: .detectorSemanticLabel)
         try container.encodeIfPresent(nodeID, forKey: .nodeID)
         try container.encode(position, forKey: .position)
         try container.encodeIfPresent(bounds, forKey: .bounds)
@@ -124,6 +166,8 @@ public struct SpatialObject: Codable, Hashable, Sendable {
         try container.encode(firstSeenAt, forKey: .firstSeenAt)
         try container.encode(lastSeenAt, forKey: .lastSeenAt)
         try container.encode(stateUpdatedAt, forKey: .stateUpdatedAt)
+        try container.encodeIfPresent(displayName, forKey: .displayName)
+        try container.encodeIfPresent(temporalRevision, forKey: .temporalRevision)
     }
 }
 

@@ -4,61 +4,82 @@
 
 ## Platform
 
-ios
+iOS, iPhone first.
 
 ## Stack
 
-Delegated technical decision: a native iPhone application built with SwiftUI and Apple platform frameworks. The initial implementation uses ARKit and RealityKit for the live camera/spatial session, Vision for on-device perception seams, and Foundation for deterministic domain logic and protected local persistence. Third-party runtime dependencies are avoided until a capability demonstrably requires one.
+Vispace is a native SwiftUI application built with Apple platform frameworks. ARKit and RealityKit provide capture, tracking, depth, mesh, rendering, and relocalization. Vision and Core ML run the bundled object detector on device. Foundation-backed repositories provide deterministic domain logic and protected local persistence. The app has no third-party runtime dependency and does not require a network or LLM for its spatial functions.
 
 ## Users
 
-The confirmed user is an iPhone owner who needs to search, understand, remember, or navigate a real indoor space through the phone camera. A narrower launch segment such as consumers, classrooms, offices, or facilities management is not yet decided.
+The confirmed user is an iPhone owner who wants to find, understand, remember, arrange, or navigate a real indoor space through the phone camera. A narrower launch segment such as homes, classrooms, offices, or facilities management remains a release decision.
 
-## Product Purpose
+## Product purpose
 
-Vispace continuously builds and updates a digital model of the space seen by the iPhone. It associates objects with stable identities, positions, relationships, confidence, and history so that the user can later search the physical world, ask spatial questions, and receive camera-aligned AR guidance.
+Vispace continuously builds and updates a local digital model of the observed space. It associates supported objects with identity, 3D bounds, positions, relationships, confidence, and history. The user can then search the physical world, ask spatial questions, inspect where something was last seen, evaluate whether furniture fits, and request camera-aligned guidance.
 
-Success means that the spatial engine remains useful without waiting for an LLM: deterministic search, last-seen lookup, basic relation queries, and navigation continue locally, while an LLM is an optional explanation layer for complex questions.
+Success means that spatial truth remains deterministic and evidence-backed without an LLM. An optional language layer may later improve expression, but it cannot create coordinates, existence, relations, placement safety, or routes.
 
 ## Positioning
 
-Vispace does not stop at classifying the current camera frame. Its distinct mechanism is a continuously updated LiveMap plus hierarchical spatial memory that connects what an object is, where it is, how it relates to the space, where it was, and how the user can reach it.
+Vispace does more than classify one camera frame. Its LiveMap and temporal spatial memory connect what an object is, where it is, how it relates to the room, where it was, whether it changed, whether a proposed item fits, and how the user can reach a verified target.
 
-## Operating Context
+## Operating context
 
-The app is used while a person moves through indoor rooms and corridors with an iPhone camera active. The system must recognize known, overlapping, and new space; avoid duplicate maps; preserve object identity across viewpoint, lighting, occlusion, and movement; and recover from tracking, network, and LLM failures.
+The app is used while a person moves slowly through indoor rooms and corridors with the rear camera active. It must distinguish known, overlapping, and new space; avoid duplicate maps; preserve object identity across viewpoint, lighting, occlusion, movement, and relaunch; and recover conservatively from tracking or persistence failures.
 
-## Capabilities and Constraints
+## Implemented capabilities and constraints
 
-- The only visible application surface is the live camera. Do not add cards, toolbars, onboarding chrome, status labels, buttons, or decorative overlays unless the user explicitly changes this constraint.
-- The first shipping target is iPhone only.
-- The implementation must be structured for production distribution, not as a disposable prototype.
-- Pose and object tracking run frequently; expensive detection, place recognition, re-identification, persistence, and LLM work are event-driven or throttled.
-- Spatial facts carry confidence. Uncertain place, identity, state, or relation data stays provisional rather than being written as confirmed truth.
-- Current, last-seen, moved, and removed states are distinct.
-- Search, last-seen lookup, navigation, and basic relation queries must not depend on an available LLM.
-- Camera/depth capability varies by iPhone. The product must use available depth and mesh features when supported and degrade safely when they are not.
-- Multi-device sync, account model, launch segment, cloud boundary, retention policy, a production object-detection model, and final App Store brand assets are open product decisions.
+- First-run guidance introduces the service, spatial memory, search, placement, navigation, scanning, and the camera permission request before capture starts. Data-retention explanations are available in spatial-data settings rather than the introduction.
+- The live camera is the primary surface. The bottom query field, results, relation answers, placement controls, AR target markers, furniture previews, navigation paths, and the spatial-data settings entry are explicitly authorized parts of the implemented user workflow.
+- On-device Vision/Core ML detection is throttled and depth-supported. A detection remains provisional until identity and confidence gates permit durable promotion.
+- Current, last-seen, moved, and removed states retain provenance. Explicit user classification correction has a separate journal event and preserves the object's ID, user name, and previous locations; changing a display name alone does not reclassify it.
+- Continuous identity updates require actual tracked image/depth continuity. After an observation gap, a user may confirm the same physical object or a distinct new object; an arbitrary temporary tracking ID never authorizes a merge.
+- Cross-coordinate map alignment uses bounded, local Vision appearance features with capture provenance and uniquely verified nondegenerate landmark correspondences. Visual thresholds are engineering admission rules pending physical calibration.
+- Object search, last-seen lookup, basic relation queries, placement evaluation, and indoor routing run locally and do not depend on a network or LLM.
+- Placement advice uses verified geometry, collision, wall, clearance, and passage evidence. Missing or incompatible evidence produces an unavailable or unsuitable result, never invented approval.
+- Indoor routes use verified floor and obstacle evidence and deterministic A*. A route is removed when its map, surface revision, tracking, or obstacle evidence becomes invalid.
+- A plane classified as a door does not establish that the door is open. Until open-state evidence exists, Vispace does not route through that opening.
+- Door uncertainty blocks the affected passage locally. Full measured portal geometry and multiple recent depth views are required for a short-lived open passage; unrelated verified areas can still be routed.
+- Observed access, connection, and blockage relations expire with their map/surface/object revision or evidence lease. Missing evidence remains an unconfirmed answer.
+- All spatial recommendations and guidance fail closed when required evidence is missing, stale, excessive, or incompatible.
+- Camera/depth capability varies by iPhone. Unsupported devices expose unavailable capability rather than fabricated depth, geometry, placement, or navigation precision.
+- Raw camera frames are ephemeral and are neither persisted nor transmitted.
+- Structured maps, object metadata, relations, and temporal history stay local and are retained until the user deletes them from spatial-data settings.
+- Cloud sync, accounts, and remote spatial storage are not implemented.
 
-## Brand Commitments
+## Brand commitments
 
 - Product name: Vispace.
-- Visible UI commitment: the world itself is the interface; the camera image remains unobstructed.
+- The observed world remains visually primary.
+- Every app-owned overlay must answer a direct spatial task, be dismissible or state-bound, avoid hiding the scene unnecessarily, and disappear when its evidence becomes invalid.
+- Uncertainty is shown as uncertainty; lack of evidence is never styled as success.
 
-## Evidence on Hand
+## Evidence on hand
 
 - Product specification: `Vispace_프로젝트_기획서_수정1.docx` supplied by the user.
 - Source repository: `https://github.com/L3J-Vispace/Vispace`.
-- The repository was empty at implementation start; no existing code, visual identity, model assets, benchmarks, or production claims existed to preserve.
+- Current source, automated tests, and verification scripts are the implementation evidence. Physical accuracy and performance claims require recorded device measurements.
 
-## Product Principles
+## Product principles
 
 1. See continuously, compute selectively.
 2. Never turn uncertainty into a spatial fact.
-3. AR output precedes optional language generation.
-4. The camera view is the product surface, not a backdrop for interface chrome.
+3. Deterministic spatial output precedes optional language generation.
+4. The observed world is primary; interface elements exist only to operate or explain a spatial feature.
 5. Local spatial capability survives network and LLM failure.
+6. A safe unavailable result is better than an attractive unsupported answer.
 
-## Accessibility & Inclusion
+## Accessibility and inclusion
 
-The camera-only surface contains no custom interactive controls. System permission prompts and platform accessibility behavior remain intact. Any future interactive or explanatory layer must support VoiceOver, Dynamic Type, sufficient contrast, Reduce Motion, and non-visual alternatives to direction-only AR guidance.
+English/Korean first-run guidance supports VoiceOver, Dynamic Type, sufficient contrast, Reduce Motion, and minimum 44-point controls. Query, placement, result dismissal, settings, deletion confirmation, and camera recovery controls require localized accessibility labels and predictable focus order. Direction-only AR output must also expose a nonvisual target, direction, distance, confidence, or unavailable explanation. Reduced Motion removes nonessential direction animation without changing spatial meaning.
+
+## Release evidence still required
+
+- Final model provenance, licensed distribution basis, supported classes, and measured accuracy.
+- Signed installation and end-to-end validation on supported LiDAR and non-LiDAR physical iPhones.
+- Real-room recognition, identity, relocalization, last-seen, relation, placement, obstacle, no-path, and door-state behavior.
+- Thermal, memory, latency, accessibility, and positioning-error measurements against approved targets.
+- Launch segment, minimum supported hardware policy, portrait/rotation policy, export scope, App Store privacy labels, and final brand assets.
+
+Feature-specific source and execution status is recorded in [the gap follow-up](docs/FEATURE_GAPS_2026-09-05.md). Newly connected source paths are not called automation-verified until their latest build and regression results exist. Physical acceptance and release certification remain separate.

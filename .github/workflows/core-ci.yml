@@ -1,0 +1,62 @@
+name: Core CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core-tests:
+    name: Core tests and Swift syntax (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SWIFT_IMAGE: swift:6.2@sha256:29b983751c605c2d3102d2ab93438c6e0cadf110d9d2aa6e929b6dec9dcb7cbc
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify bundled detector model and privacy declaration
+        run: |
+          set -euo pipefail
+          bash Scripts/verify-model.sh
+          python3 Scripts/verify-privacy.py
+
+      - name: Run core regression tests
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}/Packages/VispaceCore:/workspace:ro" \
+            --workdir /workspace \
+            "${SWIFT_IMAGE}" \
+            swift test --scratch-path /tmp/vispace-core-build --parallel
+
+      - name: Verify optimized core behavior
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}/Packages/VispaceCore:/workspace:ro" \
+            --workdir /workspace \
+            "${SWIFT_IMAGE}" \
+            swift test --scratch-path /tmp/vispace-core-build --configuration release --parallel
+
+      - name: Parse iOS Swift sources
+        # Syntax coverage only: Apple frameworks still require the manual iOS CI.
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/workspace:ro" \
+            --workdir /workspace \
+            "${SWIFT_IMAGE}" \
+            bash -c 'find Vispace VispaceTests VispaceUITests -name "*.swift" -print0 | xargs -0 swiftc -frontend -parse'

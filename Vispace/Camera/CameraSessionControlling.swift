@@ -7,4 +7,5 @@ protocol CameraSessionControlling: AnyObject {
     func activate()
     func deactivate()
     func enterBackground()
+    func setDisplayGeometry(_ geometry: FrameDisplayGeometry)
 }

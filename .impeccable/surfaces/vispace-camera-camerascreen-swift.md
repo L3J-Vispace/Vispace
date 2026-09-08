@@ -7,12 +7,16 @@ related_targets: ["Vispace/Camera/CameraSurfaceView.swift","Vispace/VispaceApp.s
 
 Scope: `Vispace/Camera/CameraScreen.swift` and its iPhone camera surface. Visitor mode: Experience.
 
-Audience: an iPhone owner moving through an indoor space. Job: enter a spatial capture session immediately. Primary action: move through and point the phone at the real space; there is no on-screen action.
+Audience: an iPhone owner moving through an indoor space. Job: scan after first-run guidance, then search remembered objects, inspect spatial relations, evaluate furniture placement, or request verified route guidance. Primary action: move slowly to collect evidence and use the compact query controls when needed.
 
-Proof/content: the unmodified rear-camera feed fills the window. Black is reserved for capture that is not yet available. The system-owned camera permission prompt is the only permitted interruption.
+Proof/content: the rear-camera feed fills the window behind compact controls. AR target markers, placement previews, and route paths require current compatible spatial evidence. Unavailable or denied capture has an explicit recovery explanation; missing evidence never becomes an invented result.
 
-Constraints: render no app-owned text, buttons, cards, chrome, HUD, coaching overlay, debug geometry, or AR markers. Target iPhone portrait, cover the full safe-area extent, pause capture whenever the scene is inactive, and retain only nonvisual accessibility metadata for the live camera surface.
+Constraints: keep live camera pixels dominant. Query, placement, navigation, and data-settings controls and grounded AR overlays are authorized by the implemented feature scope; debug geometry is not. Target iPhone portrait, cover the safe-area extent, pause capture when inactive, and provide accessible recovery and insufficient-evidence states.
 
-Direction: Unmediated Lens. The memorable moment is the absence of interface chrome: after launch, the observed world itself occupies every pixel.
+Direction: Camera-first spatial guidance. After the one-time first-run gateway, the observed world remains the primary surface; controls and evidence-backed guidance support the current request without obscuring the room.
 
-Unresolved: whether future Search/Ask input or AR guidance may ever change this visible contract; final App Store icon and brand assets; and whether a denied-permission recovery surface will be allowed later.
+Unresolved: final App Store icon and brand assets; physical-device accuracy, accessibility, and release acceptance. Search/Ask and AR guidance are implemented, not future authorization questions.
+
+Navigation extension (2026-09-07, Operate): the user's floor-route reference replaces narrow route sticks with a continuous translucent ribbon, inset edges, repeated direction marks, and a floor destination ring. A confirmed search result offers an explicit route action that preserves the selected object's identity and revalidates evidence. No map panel is added. Geometry and lifecycle checks passed, but native visual approval and updated iPhone installation remain pending; see `docs/FLOOR_ROUTE_GUIDANCE_2026-09-07.md`. Black Simulator captures are invalid evidence, not an approved visual result.
+
+Review update (2026-09-08): fixed direction/arrival overlap, renderer input rejection, observation-refresh races, explicit route retry, dismissal touch size, reduced-motion handling, and truncated accessibility-size messages. Ten final native panel captures passed visual review, including scrolling long results; actual touch/VoiceOver acceptance is still separate. Latest Simulator results are 579 passed, one RealityKit graphics capture failure, and two physical-only skips. The signed updated iPhone app is installed, but device lock prevents current physical testing and normal launch verification. See `docs/FLOOR_ROUTE_REVIEW_2026-09-08.md` for evidence and remaining checks.

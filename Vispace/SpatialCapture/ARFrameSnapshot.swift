@@ -1,6 +1,8 @@
 @preconcurrency import ARKit
 import CoreVideo
 import Foundation
+import UIKit
+import VispaceCore
 import simd
 
 /// Stable identity shared by a lightweight pose and its optional image snapshot.
@@ -9,6 +11,20 @@ public struct ARFrameID: Hashable, Sendable {
 
     public init(rawValue: UUID = UUID()) {
         self.rawValue = rawValue
+    }
+}
+
+/// Identifies the exact ARSession attachment and run that produced a frame.
+/// Coordinate-frame identifiers can intentionally survive relocalization, so
+/// they are not sufficient on their own to reject buffered work from an older
+/// session run.
+public struct ARSessionFrameToken: Equatable, Hashable, Sendable {
+    public let sessionRunGeneration: UInt64
+    public let attachmentEpoch: UInt64
+
+    public init(sessionRunGeneration: UInt64, attachmentEpoch: UInt64) {
+        self.sessionRunGeneration = sessionRunGeneration
+        self.attachmentEpoch = attachmentEpoch
     }
 }
 
@@ -69,7 +85,7 @@ public struct Matrix4x4Snapshot: Equatable, Sendable {
     }
 }
 
-public enum ARLimitedTrackingReasonSnapshot: String, Sendable {
+public enum ARLimitedTrackingReasonSnapshot: String, Equatable, Hashable, Sendable {
     case excessiveMotion
     case insufficientFeatures
     case initializing
@@ -77,13 +93,13 @@ public enum ARLimitedTrackingReasonSnapshot: String, Sendable {
     case unknown
 }
 
-public enum ARTrackingStateSnapshot: Sendable {
+public enum ARTrackingStateSnapshot: Equatable, Hashable, Sendable {
     case unavailable
     case limited(ARLimitedTrackingReasonSnapshot)
     case normal
 }
 
-public enum ARWorldMappingStatusSnapshot: String, Sendable {
+public enum ARWorldMappingStatusSnapshot: String, Equatable, Hashable, Sendable {
     case notAvailable
     case limited
     case extending
@@ -92,8 +108,16 @@ public enum ARWorldMappingStatusSnapshot: String, Sendable {
 }
 
 /// Lightweight, value-only data that is safe to hand to a latest-value stream.
-public struct ARPoseSnapshot: Sendable {
+public struct ARPoseSnapshot: Equatable, Sendable {
     public let id: ARFrameID
+    public let sessionToken: ARSessionFrameToken
+    public let coordinateFrameID: CoordinateFrameID
+    public let segmentID: CaptureSegmentID
+    public let mapID: MapID?
+    public let coordinateFrameStatus: ARCaptureIdentity.Status
+    /// Wall-clock capture time used for durable last-seen ordering across
+    /// launches. `timestamp` remains ARKit's monotonic session time.
+    public let capturedAt: TimeInterval
     public let timestamp: TimeInterval
     public let cameraTransform: Matrix4x4Snapshot
     public let trackingState: ARTrackingStateSnapshot
@@ -101,16 +125,109 @@ public struct ARPoseSnapshot: Sendable {
 
     public init(
         id: ARFrameID,
+        sessionToken: ARSessionFrameToken,
+        coordinateFrameID: CoordinateFrameID,
+        segmentID: CaptureSegmentID,
+        mapID: MapID?,
+        coordinateFrameStatus: ARCaptureIdentity.Status,
+        capturedAt: TimeInterval,
         timestamp: TimeInterval,
         cameraTransform: Matrix4x4Snapshot,
         trackingState: ARTrackingStateSnapshot,
         worldMappingStatus: ARWorldMappingStatusSnapshot
     ) {
         self.id = id
+        self.sessionToken = sessionToken
+        self.coordinateFrameID = coordinateFrameID
+        self.segmentID = segmentID
+        self.mapID = mapID
+        self.coordinateFrameStatus = coordinateFrameStatus
+        self.capturedAt = capturedAt
         self.timestamp = timestamp
         self.cameraTransform = cameraTransform
         self.trackingState = trackingState
         self.worldMappingStatus = worldMappingStatus
+    }
+}
+
+public enum FrameInterfaceOrientation: String, CaseIterable, Sendable {
+    case portrait
+    case portraitUpsideDown
+    case landscapeLeft
+    case landscapeRight
+
+    fileprivate var uiInterfaceOrientation: UIInterfaceOrientation {
+        switch self {
+        case .portrait: .portrait
+        case .portraitUpsideDown: .portraitUpsideDown
+        case .landscapeLeft: .landscapeLeft
+        case .landscapeRight: .landscapeRight
+        }
+    }
+}
+
+public struct ViewportSizeSnapshot: Equatable, Sendable {
+    public let width: Double
+    public let height: Double
+
+    public init(width: Double, height: Double) {
+        self.width = width
+        self.height = height
+    }
+
+    public var isUsable: Bool {
+        width.isFinite && height.isFinite && width > 0 && height > 0
+    }
+
+    fileprivate var cgSize: CGSize {
+        CGSize(width: width, height: height)
+    }
+}
+
+public struct FrameDisplayGeometry: Equatable, Sendable {
+    public let orientation: FrameInterfaceOrientation
+    public let viewportSize: ViewportSizeSnapshot
+
+    public init(
+        orientation: FrameInterfaceOrientation,
+        viewportSize: ViewportSizeSnapshot
+    ) {
+        self.orientation = orientation
+        self.viewportSize = viewportSize
+    }
+}
+
+public struct AffineTransformSnapshot: Equatable, Sendable {
+    public let a: Double
+    public let b: Double
+    public let c: Double
+    public let d: Double
+    public let tx: Double
+    public let ty: Double
+
+    public init(_ transform: CGAffineTransform) {
+        a = transform.a
+        b = transform.b
+        c = transform.c
+        d = transform.d
+        tx = transform.tx
+        ty = transform.ty
+    }
+
+    public var cgAffineTransform: CGAffineTransform {
+        CGAffineTransform(a: a, b: b, c: c, d: d, tx: tx, ty: ty)
+    }
+}
+
+public struct ARDisplayTransformSnapshot: Equatable, Sendable {
+    /// Transform from normalized camera-image coordinates into normalized
+    /// viewport coordinates for the recorded orientation and viewport size.
+    public let imageToViewport: AffineTransformSnapshot
+    public let geometry: FrameDisplayGeometry
+
+    public init(imageToViewport: CGAffineTransform, geometry: FrameDisplayGeometry) {
+        self.imageToViewport = AffineTransformSnapshot(imageToViewport)
+        self.geometry = geometry
     }
 }
 
@@ -123,7 +240,7 @@ public final class ImmutablePixelBuffer: @unchecked Sendable {
     public let dimensions: ImageDimensions
     public let pixelFormat: OSType
 
-    fileprivate init(pixelBuffer: CVPixelBuffer) {
+    init(pixelBuffer: CVPixelBuffer) {
         self.pixelBuffer = pixelBuffer
         dimensions = ImageDimensions(
             width: CVPixelBufferGetWidth(pixelBuffer),
@@ -133,16 +250,19 @@ public final class ImmutablePixelBuffer: @unchecked Sendable {
     }
 }
 
-public struct ARDepthSnapshot: Sendable {
-    public let depthMap: ImmutablePixelBuffer
-    public let confidenceMap: ImmutablePixelBuffer?
+public struct ARDepthSnapshot: Equatable, Sendable {
+    public let dimensions: ImageDimensions
+    public let depthMeters: [Float]
+    public let confidence: [UInt8]?
 
     public init(
-        depthMap: ImmutablePixelBuffer,
-        confidenceMap: ImmutablePixelBuffer?
+        dimensions: ImageDimensions,
+        depthMeters: [Float],
+        confidence: [UInt8]?
     ) {
-        self.depthMap = depthMap
-        self.confidenceMap = confidenceMap
+        self.dimensions = dimensions
+        self.depthMeters = depthMeters
+        self.confidence = confidence
     }
 }
 
@@ -154,6 +274,7 @@ public struct ARFrameSnapshot: Sendable {
     public let capturedImage: ImmutablePixelBuffer
     public let cameraIntrinsics: Matrix3x3Snapshot
     public let cameraImageDimensions: ImageDimensions
+    public let displayTransform: ARDisplayTransformSnapshot?
     public let sceneDepth: ARDepthSnapshot?
     public let smoothedSceneDepth: ARDepthSnapshot?
 
@@ -163,6 +284,7 @@ public struct ARFrameSnapshot: Sendable {
         capturedImage: ImmutablePixelBuffer,
         cameraIntrinsics: Matrix3x3Snapshot,
         cameraImageDimensions: ImageDimensions,
+        displayTransform: ARDisplayTransformSnapshot?,
         sceneDepth: ARDepthSnapshot?,
         smoothedSceneDepth: ARDepthSnapshot?
     ) {
@@ -171,6 +293,7 @@ public struct ARFrameSnapshot: Sendable {
         self.capturedImage = capturedImage
         self.cameraIntrinsics = cameraIntrinsics
         self.cameraImageDimensions = cameraImageDimensions
+        self.displayTransform = displayTransform
         self.sceneDepth = sceneDepth
         self.smoothedSceneDepth = smoothedSceneDepth
     }
@@ -190,6 +313,9 @@ public enum ARFrameSnapshotError: Error, Equatable, Sendable {
     )
     case destinationRowBytesTooSmall(plane: Int, required: Int, actual: Int)
     case missingBaseAddress(plane: Int)
+    case unsupportedDepthPixelFormat(OSType)
+    case unsupportedConfidencePixelFormat(OSType)
+    case depthBufferShapeMismatch
 }
 
 /// Copies all data needed after an ARSession callback returns. The source
@@ -197,9 +323,21 @@ public enum ARFrameSnapshotError: Error, Equatable, Sendable {
 public struct ARFrameSnapshotAdapter: Sendable {
     public init() {}
 
-    public func makePose(from frame: ARFrame, id: ARFrameID = ARFrameID()) -> ARPoseSnapshot {
+    public func makePose(
+        from frame: ARFrame,
+        id: ARFrameID = ARFrameID(),
+        sessionToken: ARSessionFrameToken,
+        capturedAt: TimeInterval,
+        captureIdentity: ARCaptureIdentity
+    ) -> ARPoseSnapshot {
         ARPoseSnapshot(
             id: id,
+            sessionToken: sessionToken,
+            coordinateFrameID: captureIdentity.coordinateFrameID,
+            segmentID: captureIdentity.segmentID,
+            mapID: captureIdentity.mapID,
+            coordinateFrameStatus: captureIdentity.status,
+            capturedAt: capturedAt,
             timestamp: frame.timestamp,
             cameraTransform: Matrix4x4Snapshot(frame.camera.transform),
             trackingState: trackingState(from: frame.camera.trackingState),
@@ -210,9 +348,19 @@ public struct ARFrameSnapshotAdapter: Sendable {
     public func makeSnapshot(
         from frame: ARFrame,
         id: ARFrameID = ARFrameID(),
-        imageOrientation: FrameImageOrientation
+        imageOrientation: FrameImageOrientation,
+        sessionToken: ARSessionFrameToken,
+        capturedAt: TimeInterval,
+        captureIdentity: ARCaptureIdentity,
+        displayGeometry: FrameDisplayGeometry?
     ) throws -> ARFrameSnapshot {
-        let pose = makePose(from: frame, id: id)
+        let pose = makePose(
+            from: frame,
+            id: id,
+            sessionToken: sessionToken,
+            capturedAt: capturedAt,
+            captureIdentity: captureIdentity
+        )
         let image = try copyPixelBuffer(frame.capturedImage)
         let sceneDepth = try copyDepth(frame.sceneDepth)
         let smoothedSceneDepth = try copyDepth(frame.smoothedSceneDepth)
@@ -226,6 +374,18 @@ public struct ARFrameSnapshotAdapter: Sendable {
                 width: Int(frame.camera.imageResolution.width),
                 height: Int(frame.camera.imageResolution.height)
             ),
+            displayTransform: displayGeometry.flatMap { geometry in
+                guard geometry.viewportSize.isUsable else {
+                    return nil
+                }
+                return ARDisplayTransformSnapshot(
+                    imageToViewport: frame.displayTransform(
+                        for: geometry.orientation.uiInterfaceOrientation,
+                        viewportSize: geometry.viewportSize.cgSize
+                    ),
+                    geometry: geometry
+                )
+            },
             sceneDepth: sceneDepth,
             smoothedSceneDepth: smoothedSceneDepth
         )
@@ -236,14 +396,78 @@ public struct ARFrameSnapshotAdapter: Sendable {
             return nil
         }
 
-        let depthMap = try copyPixelBuffer(source.depthMap)
-        let confidenceMap = try source.confidenceMap.map { confidenceMap in
-            try copyPixelBuffer(confidenceMap)
+        let depthMap = source.depthMap
+        let width = CVPixelBufferGetWidth(depthMap)
+        let height = CVPixelBufferGetHeight(depthMap)
+        guard CVPixelBufferGetPixelFormatType(depthMap) == kCVPixelFormatType_DepthFloat32 else {
+            throw ARFrameSnapshotError.unsupportedDepthPixelFormat(
+                CVPixelBufferGetPixelFormatType(depthMap)
+            )
+        }
+        let depthMeters: [Float] = try copySinglePlaneValues(
+            from: depthMap,
+            elementType: Float.self
+        )
+        let confidence: [UInt8]?
+        if let confidenceMap = source.confidenceMap {
+            guard CVPixelBufferGetPixelFormatType(confidenceMap) == kCVPixelFormatType_OneComponent8 else {
+                throw ARFrameSnapshotError.unsupportedConfidencePixelFormat(
+                    CVPixelBufferGetPixelFormatType(confidenceMap)
+                )
+            }
+            guard
+                CVPixelBufferGetWidth(confidenceMap) == width,
+                CVPixelBufferGetHeight(confidenceMap) == height
+            else {
+                throw ARFrameSnapshotError.depthBufferShapeMismatch
+            }
+            confidence = try copySinglePlaneValues(
+                from: confidenceMap,
+                elementType: UInt8.self
+            )
+        } else {
+            confidence = nil
         }
         return ARDepthSnapshot(
-            depthMap: depthMap,
-            confidenceMap: confidenceMap
+            dimensions: ImageDimensions(width: width, height: height),
+            depthMeters: depthMeters,
+            confidence: confidence
         )
+    }
+
+    private func copySinglePlaneValues<Element>(
+        from source: CVPixelBuffer,
+        elementType: Element.Type
+    ) throws -> [Element] {
+        let lockStatus = CVPixelBufferLockBaseAddress(source, .readOnly)
+        guard lockStatus == kCVReturnSuccess else {
+            throw ARFrameSnapshotError.sourceLockFailed(lockStatus)
+        }
+        defer { _ = CVPixelBufferUnlockBaseAddress(source, .readOnly) }
+
+        let width = CVPixelBufferGetWidth(source)
+        let height = CVPixelBufferGetHeight(source)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(source)
+        let requiredRowBytes = width * MemoryLayout<Element>.stride
+        guard bytesPerRow >= requiredRowBytes else {
+            throw ARFrameSnapshotError.destinationRowBytesTooSmall(
+                plane: 0,
+                required: requiredRowBytes,
+                actual: bytesPerRow
+            )
+        }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(source) else {
+            throw ARFrameSnapshotError.missingBaseAddress(plane: 0)
+        }
+
+        var values = [Element]()
+        values.reserveCapacity(width * height)
+        for row in 0..<height {
+            let rowAddress = baseAddress.advanced(by: row * bytesPerRow)
+                .assumingMemoryBound(to: Element.self)
+            values.append(contentsOf: UnsafeBufferPointer(start: rowAddress, count: width))
+        }
+        return values
     }
 
     private func copyPixelBuffer(_ source: CVPixelBuffer) throws -> ImmutablePixelBuffer {

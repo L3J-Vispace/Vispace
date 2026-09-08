@@ -46,7 +46,8 @@ public struct IdentityWeights: Codable, Hashable, Sendable {
         temporalContinuity: Double
     ) throws {
         let values = [visual, geometry, spatialContext, temporalContinuity]
-        guard values.allSatisfy({ $0.isFinite && $0 >= 0 }), values.reduce(0, +) > 0 else {
+        let total = values.reduce(0, +)
+        guard values.allSatisfy({ $0.isFinite && $0 >= 0 }), total.isFinite, total > 0 else {
             throw ObjectIdentityError.invalidWeights
         }
         self.visual = visual

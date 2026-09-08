@@ -32,6 +32,15 @@ targets:
     sources:
       - path: Vispace
         type: syncedFolder
+        excludes:
+          - Resources
+      # XcodeGen discovers string-catalog locales only in enumerated groups.
+      # Keep resources explicit so regeneration retains Korean without manual
+      # edits to knownRegions or duplicate resource membership.
+      - path: Vispace/Resources
+        type: group
+        group: App Resources
+        createIntermediateGroups: false
     dependencies:
       - package: VispaceCore
         product: VispaceCore
@@ -42,13 +51,16 @@ targets:
         # XcodeGen's iOS application preset otherwise injects `AppIcon` even
         # though no approved shipping icon asset exists yet.
         ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        # Do not let the application preset override the machine's approved
+        # xcconfig identity. Inherit Xcode's default when none is configured.
+        CODE_SIGN_IDENTITY: "$(inherited)"
         TARGETED_DEVICE_FAMILY: "1"
         SUPPORTS_MACCATALYST: "NO"
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: "NO"
         SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: "NO"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_KEY_CFBundleDisplayName: Vispace
-        INFOPLIST_KEY_NSCameraUsageDescription: Vispace uses the camera to show and understand the space around you.
+        INFOPLIST_KEY_NSCameraUsageDescription: Vispace needs camera access to show the space around you in real time.
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
         INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
         INFOPLIST_KEY_UIRequiredDeviceCapabilities:

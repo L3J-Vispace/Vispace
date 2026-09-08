@@ -7,8 +7,12 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		34DB20A1777C68D9A0DF1AFC /* InfoPlist.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = 6082C0DB2FEBADF9568787DF /* InfoPlist.xcstrings */; };
 		397EAF8141A86ADEBBB6053C /* VispaceCore in Frameworks */ = {isa = PBXBuildFile; productRef = 8E797E3E4FB6967CA1CD2300 /* VispaceCore */; };
 		3EEB6781C8FF88B3FCCB0B3B /* VispaceCore in Frameworks */ = {isa = PBXBuildFile; productRef = 481E6E30C51880FEF47EE837 /* VispaceCore */; };
+		40924278D4EFD8C9C37B5398 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = 9D1041D9E8440D84DD39A0F7 /* Localizable.xcstrings */; };
+		937F2557D9BDBA40692DEAFC /* YOLOv3Int8LUT.mlmodel in Sources */ = {isa = PBXBuildFile; fileRef = 0D201DD4C263C018B79418C4 /* YOLOv3Int8LUT.mlmodel */; };
+		D56122C3FE9379AAB10F24E1 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = B2BD889ED585745CB1977C05 /* PrivacyInfo.xcprivacy */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -29,13 +33,31 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		0D201DD4C263C018B79418C4 /* YOLOv3Int8LUT.mlmodel */ = {isa = PBXFileReference; lastKnownFileType = file.mlmodel; path = YOLOv3Int8LUT.mlmodel; sourceTree = "<group>"; };
 		19E6460AC6F71AE034C4612B /* VispaceCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = VispaceCore; path = Packages/VispaceCore; sourceTree = SOURCE_ROOT; };
 		1FC4114979B5F7F3664A2E88 /* VispaceTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = VispaceTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		484D354EA171D2DD976D75D8 /* Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Release.xcconfig; sourceTree = "<group>"; };
+		6082C0DB2FEBADF9568787DF /* InfoPlist.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = InfoPlist.xcstrings; sourceTree = "<group>"; };
+		9D1041D9E8440D84DD39A0F7 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
+		B2BD889ED585745CB1977C05 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		DFA4172B34C807D2FEDD5834 /* Vispace.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Vispace.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		EC4B7685E320C0666EB3AD4E /* Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Debug.xcconfig; sourceTree = "<group>"; };
 		F523E4E3DDC7AB67C9E57408 /* VispaceUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = VispaceUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		5A699A431377EDC4208CE23C /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Resources/InfoPlist.xcstrings,
+				Resources/Localizable.xcstrings,
+				Resources/Models,
+				Resources/Models/YOLOv3Int8LUT.mlmodel,
+				Resources/PrivacyInfo.xcprivacy,
+			);
+			target = A292F9CC33A34B4D7DA5D6EF /* Vispace */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		21EB6AE60FC6FB5FB150FA03 /* VispaceTests */ = {
@@ -58,6 +80,9 @@
 		};
 		A54EFD4223127AEC11D5812A /* Vispace */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				5A699A431377EDC4208CE23C /* PBXFileSystemSynchronizedBuildFileExceptionSet */,
+			);
 			explicitFileTypes = {
 			};
 			explicitFolders = (
@@ -97,6 +122,14 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
+		344CB42F2BE7670D1ECED153 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				0D201DD4C263C018B79418C4 /* YOLOv3Int8LUT.mlmodel */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
 		9FD404DC17773067200CD4CB /* Packages */ = {
 			isa = PBXGroup;
 			children = (
@@ -108,6 +141,7 @@
 		A58A7ECE8CF26D8B5CCD9ACF = {
 			isa = PBXGroup;
 			children = (
+				D4288380C4C9EDC5D02A4CEE /* App Resources */,
 				CC2E1025B5DCBB9FED0C5E43 /* Config */,
 				9FD404DC17773067200CD4CB /* Packages */,
 				A54EFD4223127AEC11D5812A /* Vispace */,
@@ -124,6 +158,26 @@
 				484D354EA171D2DD976D75D8 /* Release.xcconfig */,
 			);
 			path = Config;
+			sourceTree = "<group>";
+		};
+		D4288380C4C9EDC5D02A4CEE /* App Resources */ = {
+			isa = PBXGroup;
+			children = (
+				ED1B7E4A9C7CCDE0C3A971E9 /* Resources */,
+			);
+			name = "App Resources";
+			sourceTree = "<group>";
+		};
+		ED1B7E4A9C7CCDE0C3A971E9 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				6082C0DB2FEBADF9568787DF /* InfoPlist.xcstrings */,
+				9D1041D9E8440D84DD39A0F7 /* Localizable.xcstrings */,
+				B2BD889ED585745CB1977C05 /* PrivacyInfo.xcprivacy */,
+				344CB42F2BE7670D1ECED153 /* Models */,
+			);
+			name = Resources;
+			path = Vispace/Resources;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -208,15 +262,12 @@
 				LastUpgradeCheck = 1600;
 				TargetAttributes = {
 					A292F9CC33A34B4D7DA5D6EF = {
-						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 					A6E14D2D75A95B84FC46E148 = {
-						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 					BF7D189E2B4FDCF7B506B07C = {
-						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 						TestTargetID = A292F9CC33A34B4D7DA5D6EF;
 					};
@@ -228,6 +279,7 @@
 			knownRegions = (
 				Base,
 				en,
+				ko,
 			);
 			mainGroup = A58A7ECE8CF26D8B5CCD9ACF;
 			minimizedProjectReferenceProxies = 1;
@@ -251,6 +303,9 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				34DB20A1777C68D9A0DF1AFC /* InfoPlist.xcstrings in Resources */,
+				40924278D4EFD8C9C37B5398 /* Localizable.xcstrings in Resources */,
+				D56122C3FE9379AAB10F24E1 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -289,6 +344,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				937F2557D9BDBA40692DEAFC /* YOLOv3Int8LUT.mlmodel in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -333,10 +389,11 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = "";
+				CODE_SIGN_IDENTITY = "$(inherited)";
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Vispace;
-				INFOPLIST_KEY_NSCameraUsageDescription = "Vispace uses the camera to show and understand the space around you.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Vispace needs camera access to show the space around you in real time.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UIRequiredDeviceCapabilities = (
@@ -427,10 +484,11 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = "";
+				CODE_SIGN_IDENTITY = "$(inherited)";
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Vispace;
-				INFOPLIST_KEY_NSCameraUsageDescription = "Vispace uses the camera to show and understand the space around you.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Vispace needs camera access to show the space around you in real time.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UIRequiredDeviceCapabilities = (

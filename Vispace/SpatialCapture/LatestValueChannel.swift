@@ -7,40 +7,115 @@ public enum LatestValueSendResult: Equatable, Sendable {
 }
 
 /// A thread-safe, bounded async channel. It retains at most `bufferLimit`
-/// unconsumed values (one by default), dropping oldest work when a consumer lags.
+/// unconsumed values per subscriber (one by default), dropping oldest work when
+/// a consumer lags. Every stream request creates an independent subscriber so
+/// feature controllers cannot steal AR snapshots from one another.
 public final class LatestValueChannel<Element: Sendable>: @unchecked Sendable {
-    public let stream: AsyncStream<Element>
+    public var latest: Element? {
+        lock.lock()
+        defer { lock.unlock() }
+        return isFinished ? nil : latestValue
+    }
+    public var stream: AsyncStream<Element> {
+        let subscriberID = UUID()
+        let pair = AsyncStream<Element>.makeStream(
+            bufferingPolicy: .bufferingNewest(bufferLimit)
+        )
+        pair.continuation.onTermination = { @Sendable [weak self] _ in
+            self?.removeSubscriber(subscriberID)
+        }
 
-    private let continuation: AsyncStream<Element>.Continuation
+        lock.lock()
+        guard !isFinished else {
+            lock.unlock()
+            pair.continuation.finish()
+            return pair.stream
+        }
+        subscribers[subscriberID] = pair.continuation
+        if let latestValue {
+            _ = pair.continuation.yield(latestValue)
+            hasPendingValueWithoutSubscribers = false
+        }
+        lock.unlock()
+        return pair.stream
+    }
+
+    private let bufferLimit: Int
+    private let lock = NSLock()
+    private var subscribers: [UUID: AsyncStream<Element>.Continuation] = [:]
+    private var latestValue: Element?
+    private var hasPendingValueWithoutSubscribers = false
+    private var isFinished = false
 
     public init(bufferLimit: Int = 1) {
-        let pair = AsyncStream<Element>.makeStream(
-            bufferingPolicy: .bufferingNewest(max(1, bufferLimit))
-        )
-        stream = pair.stream
-        continuation = pair.continuation
+        self.bufferLimit = max(1, bufferLimit)
     }
 
     @discardableResult
     public func send(_ value: Element) -> LatestValueSendResult {
-        switch continuation.yield(value) {
-        case .enqueued:
-            return .enqueued
-        case .dropped:
-            return .replacedOlderValue
-        case .terminated:
-            return .terminated
-        @unknown default:
+        lock.lock()
+        guard !isFinished else {
+            lock.unlock()
             return .terminated
         }
+        latestValue = value
+        guard !subscribers.isEmpty else {
+            let result: LatestValueSendResult =
+                hasPendingValueWithoutSubscribers
+                ? .replacedOlderValue
+                : .enqueued
+            hasPendingValueWithoutSubscribers = true
+            lock.unlock()
+            return result
+        }
+
+        var droppedValue = false
+        var terminatedSubscriberIDs: [UUID] = []
+        for (subscriberID, continuation) in subscribers {
+            switch continuation.yield(value) {
+            case .enqueued:
+                break
+            case .dropped:
+                droppedValue = true
+            case .terminated:
+                terminatedSubscriberIDs.append(subscriberID)
+            @unknown default:
+                terminatedSubscriberIDs.append(subscriberID)
+            }
+        }
+        for subscriberID in terminatedSubscriberIDs {
+            subscribers.removeValue(forKey: subscriberID)
+        }
+        hasPendingValueWithoutSubscribers = subscribers.isEmpty
+        lock.unlock()
+        return droppedValue ? .replacedOlderValue : .enqueued
     }
 
     public func finish() {
-        continuation.finish()
+        lock.lock()
+        guard !isFinished else {
+            lock.unlock()
+            return
+        }
+        isFinished = true
+        let continuations = Array(subscribers.values)
+        subscribers.removeAll(keepingCapacity: false)
+        latestValue = nil
+        hasPendingValueWithoutSubscribers = false
+        lock.unlock()
+        for continuation in continuations {
+            continuation.finish()
+        }
     }
 
     deinit {
-        continuation.finish()
+        finish()
+    }
+
+    private func removeSubscriber(_ id: UUID) {
+        lock.lock()
+        subscribers.removeValue(forKey: id)
+        lock.unlock()
     }
 }
 
