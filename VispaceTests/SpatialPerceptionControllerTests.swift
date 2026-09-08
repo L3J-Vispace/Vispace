@@ -421,12 +421,20 @@ final class SpatialPerceptionControllerTests: XCTestCase {
                 detector: detector,
                 availability: .available
             ),
+            tracker: RecordingObjectTracker(),
             detectorInterval: 0.1,
             confirmedIdentityProvider: { _ in identity },
             metadataWriter: { metadata in
                 try await writer.write(metadata)
-            }
+            },
+            processingBudgetProvider: { .normal }
         )
+
+        addTeardownBlock { @MainActor in
+            controller.deactivate()
+            await writer.resumeAll()
+            await controller.deactivateAndWaitForPendingWork()
+        }
 
         controller.activate()
         for index in 0..<3 {
@@ -508,6 +516,7 @@ final class SpatialPerceptionControllerTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTFail("Detector did not receive \(expectedCount) frames before timeout.")
+        throw PerceptionFixtureWaitError.detector
     }
 
     private func waitForIdle(_ controller: SpatialPerceptionController) async throws {
@@ -516,6 +525,9 @@ final class SpatialPerceptionControllerTests: XCTestCase {
         }
         XCTAssertFalse(controller.isProcessingForTesting)
         XCTAssertLessThanOrEqual(controller.bufferedFrameCountForTesting, 1)
+        if controller.isProcessingForTesting {
+            throw PerceptionFixtureWaitError.processing
+        }
     }
 
     private func waitForWriter(
@@ -529,6 +541,7 @@ final class SpatialPerceptionControllerTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(5))
         }
         XCTFail("Metadata writer did not receive \(expectedCount) writes before timeout.")
+        throw PerceptionFixtureWaitError.writer
     }
 
     private func waitForPendingProcessingTasks(
@@ -542,6 +555,7 @@ final class SpatialPerceptionControllerTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(5))
         }
         XCTFail("Pending perception tasks did not reach \(expectedCount) before timeout.")
+        throw PerceptionFixtureWaitError.pendingTasks
     }
 
     private func waitForTracker(
@@ -555,6 +569,7 @@ final class SpatialPerceptionControllerTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTFail("Tracker did not receive \(expectedCount) frames before timeout.")
+        throw PerceptionFixtureWaitError.tracker
     }
 
     private func makeDetection() -> DetectedObject {
@@ -761,7 +776,8 @@ private actor RecordingObjectTracker: ObjectTracking {
 }
 
 private actor SuspendedMetadataWriter {
-    private var continuations: [CheckedContinuation<Void, Error>] = []
+    private var continuations: [CheckedContinuation<Void, Error>?] = []
+    private var isFinishing = false
 
     var requestCount: Int {
         continuations.count
@@ -769,14 +785,33 @@ private actor SuspendedMetadataWriter {
 
     func write(_ metadata: SpatialObjectMetadata) async throws {
         _ = metadata
+        guard !isFinishing else { return }
         try await withCheckedThrowingContinuation { continuation in
             continuations.append(continuation)
         }
     }
 
     func resume(index: Int) {
-        continuations[index].resume(returning: ())
+        guard continuations.indices.contains(index), let continuation = continuations[index] else {
+            XCTFail("Metadata write \(index) is not suspended.")
+            return
+        }
+        continuations[index] = nil
+        continuation.resume(returning: ())
     }
+
+    func resumeAll() {
+        isFinishing = true
+        for index in continuations.indices {
+            guard let continuation = continuations[index] else { continue }
+            continuations[index] = nil
+            continuation.resume(returning: ())
+        }
+    }
+}
+
+private enum PerceptionFixtureWaitError: Error {
+    case detector, processing, writer, pendingTasks, tracker
 }
 
 private actor PerceptionDeletionBarrierCompletion {
