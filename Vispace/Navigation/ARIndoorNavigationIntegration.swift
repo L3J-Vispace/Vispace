@@ -680,6 +680,7 @@ public final class IndoorNavigationController: ObservableObject {
 
     public func deactivate() {
         isActive = false
+        hasArrived = false
         if refreshStreamsOnActivation {
             surfaceMonitorTask?.cancel()
             surfaceMonitorTask = nil
@@ -860,6 +861,9 @@ public final class IndoorNavigationController: ObservableObject {
                     pathOutput: nil, message: "목적지의 기록된 위치에 도착했어요. 주변에서 물체를 확인해 주세요."
                 )
             }
+            // Arrival completes the request. A lifecycle restart must not
+            // silently begin guiding the user to the same destination again.
+            pendingDestination = nil
             state = .arrived
             return
         }
@@ -1121,6 +1125,37 @@ public final class IndoorNavigationController: ObservableObject {
                     )
                     return
                 }
+                if result.status == .success {
+                    // Source observations and the query's alignment lease may
+                    // change while depth processing or A* is suspended. Read
+                    // them again before granting any render lease.
+                    let publicationDestination = try await self.resolveDestination(
+                        destination, identity: identity
+                    )
+                    try Task.checkCancellation()
+                    guard self.isCurrent(
+                        requestID: capturedRequestID,
+                        operationID: capturedOperationID,
+                        generation: capturedGeneration,
+                        surface: surface,
+                        identity: identity
+                    ) else {
+                        self.rejectStale(requestID: capturedRequestID, operationID: capturedOperationID)
+                        return
+                    }
+                    guard case .ready(let currentMetadata) = publicationDestination else {
+                        if case .invalid(let issue) = publicationDestination {
+                            self.publishTargetIssue(issue, destination: destination)
+                        }
+                        self.finish(requestID: capturedRequestID, operationID: capturedOperationID)
+                        return
+                    }
+                    guard self.sameRouteDestination(metadata, currentMetadata) else {
+                        self.publishTargetIssue(.searchTargetMismatch, destination: destination)
+                        self.finish(requestID: capturedRequestID, operationID: capturedOperationID)
+                        return
+                    }
+                }
                 let currentEvaluationTime = self.currentEvaluationTime(
                     fallback: evaluatedAt + max(0, ProcessInfo.processInfo.systemUptime - evaluationUptime)
                 )
@@ -1151,6 +1186,7 @@ public final class IndoorNavigationController: ObservableObject {
                 if self.renderablePath != nil {
                     self.startRouteLease(duration: min(
                         1,
+                        self.remainingDestinationLease(destination),
                             usedDoorExpiry - currentEvaluationTime,
                             engine.policy.maximumEvidenceAge - (currentEvaluationTime - evidence.observedAt),
                         engine.policy.maximumStartAge - (currentEvaluationTime - startPosition.observedAt)
@@ -1224,6 +1260,31 @@ public final class IndoorNavigationController: ObservableObject {
                 now: nowProvider()
             )
         }
+    }
+
+    private func sameRouteDestination(
+        _ original: SpatialObjectMetadata,
+        _ current: SpatialObjectMetadata
+    ) -> Bool {
+        original.mapID == current.mapID
+            && original.object.id == current.object.id
+            && original.object.semanticLabel == current.object.semanticLabel
+            && original.object.bounds == current.object.bounds
+            && original.object.certainty == current.object.certainty
+            && original.object.presence == current.object.presence
+            && original.object.confidence == current.object.confidence
+            && original.position.coordinateFrameID == current.position.coordinateFrameID
+            && original.position.value == current.position.value
+            && original.position.trackingQuality == current.position.trackingQuality
+            && original.position.uncertainty == current.position.uncertainty
+            && original.position.observedAt <= current.position.observedAt
+            && original.object.lastSeenAt <= current.object.lastSeenAt
+            && original.object.stateUpdatedAt <= current.object.stateUpdatedAt
+    }
+
+    private func remainingDestinationLease(_ destination: PendingNavigationDestination) -> TimeInterval {
+        guard case .grounded(let target, _) = destination else { return .infinity }
+        return max(0, targetAdapter.maximumGroundedTargetAge - (nowProvider() - target.resolvedAt))
     }
 
     private func publish(
@@ -1383,6 +1444,14 @@ public final class IndoorNavigationController: ObservableObject {
     private func revokePublishedRoute(countInvalidation: Bool) {
         routeLeaseTask?.cancel()
         routeLeaseTask = nil
+        // The origin belongs to the revoked work, not its pending replacement.
+        // Keeping it here would let every fresh pose cancel the debounce again
+        // after the user has moved away, even when they have stopped walking.
+        routeOriginPose = nil
+        // Completion is a historical result, not a lease on live geometry.
+        // Fresh surfaces and tracking changes must not erase the arrival
+        // message while leaving the controller in its completed state.
+        if hasArrived { return }
         let hadRoute = renderablePath != nil || latestPresentation != nil
         renderablePath = nil
         latestPresentation = nil
