@@ -170,6 +170,9 @@ run_verification() {
     -destination "platform=iOS Simulator,id=$simulator_udid" \
     -derivedDataPath "$derived" \
     -resultBundlePath "$tests" \
+    -parallel-testing-enabled NO \
+    -test-timeouts-enabled YES \
+    -maximum-test-execution-time-allowance 180 \
     CODE_SIGNING_ALLOWED=NO \
     test 2>&1 | tee "$run_root/test.log"
 
