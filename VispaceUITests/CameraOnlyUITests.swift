@@ -2,6 +2,36 @@ import XCTest
 
 final class CameraOnlyUITests: XCTestCase {
     @MainActor
+    func testObjectToolsMenuUsesSelectedLanguage() throws {
+        for (language, locale, menuLabel, registerLabel, sofaLabel) in [
+            ("en", "en_US", "Object registration and furniture placement", "Remember an object location", "Sofa"),
+            ("ko", "ko_KR", "물체 등록 및 가구 배치", "물체 위치 직접 등록", "소파"),
+        ] {
+            let app = XCUIApplication()
+            app.launchArguments = [
+                "-AppleLanguages", "(\(language))", "-AppleLocale", locale,
+                "-VispaceDisableARSession", "-VispaceSkipOnboarding",
+            ]
+            app.launch()
+            let menu = app.buttons["vispace.placement.menu"]
+            XCTAssertTrue(menu.waitForExistence(timeout: 5))
+            XCTAssertEqual(menu.label, menuLabel)
+            menu.tap()
+            let registration = app.buttons[registerLabel]
+            XCTAssertTrue(registration.waitForExistence(timeout: 3))
+            XCTAssertTrue(registration.isHittable)
+            let sofa = app.buttons["vispace.placement.sofa"]
+            XCTAssertEqual(sofa.label, sofaLabel)
+            XCTAssertTrue(sofa.isHittable)
+            let capture = XCTAttachment(screenshot: app.screenshot())
+            capture.name = "object-tools-menu-\(language)"
+            capture.lifetime = .keepAlways
+            add(capture)
+            app.terminate()
+        }
+    }
+
+    @MainActor
     func testAmbiguousPlacementCanBeDismissedThenReplacedWithOneFurniture() throws {
         let app = XCUIApplication()
         app.launchArguments = [

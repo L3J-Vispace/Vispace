@@ -142,27 +142,27 @@ struct SpatialQueryPanel: View {
                     .frame(minWidth: 44, minHeight: 44)
                     .contentShape(Rectangle())
             }
-            .accessibilityLabel("관측한 물체의 이전 기록 연결")
+            .accessibilityLabel(Text("query.identityReview"))
             .accessibilityIdentifier("vispace.identity.review")
         }
 
         Menu {
-            Button("물체 위치 직접 등록") {
+            Button("query.registerObject") {
                 queryIsFocused = false
                 dismissAll()
                 onRegisterObject("")
             }
             Divider()
-            placementButton(title: "소파", kind: .sofa)
-            placementButton(title: "침대", kind: .bed)
-            placementButton(title: "책상", kind: .desk)
+            placementButton(title: "placement.kind.sofa", kind: .sofa)
+            placementButton(title: "placement.kind.bed", kind: .bed)
+            placementButton(title: "placement.kind.desk", kind: .desk)
         } label: {
             Image(systemName: "square.grid.2x2.fill")
                 .font(.title3)
                 .frame(minWidth: 44, minHeight: 44)
                 .contentShape(Rectangle())
         }
-        .accessibilityLabel("물체 등록 및 가구 배치")
+        .accessibilityLabel(Text("query.objectTools"))
         .accessibilityIdentifier("vispace.placement.menu")
 
         if isSearching {
@@ -204,14 +204,14 @@ struct SpatialQueryPanel: View {
                         navigationController.clearRoute()
                     }
                 } label: {
-                    Label("경로 다시 확인", systemImage: "arrow.clockwise")
+                    Label("query.retryRoute", systemImage: "arrow.clockwise")
                         .font(.body.weight(.semibold))
                         .frame(maxWidth: .infinity, minHeight: 44)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Color(uiColor: .systemCyan))
                 .foregroundStyle(.black)
-                .accessibilityHint("같은 물체의 최신 위치와 통로를 다시 확인합니다.")
+                .accessibilityHint(Text("query.routeRetryHint"))
                 .accessibilityIdentifier("vispace.navigation.retry")
             }
         }
@@ -323,7 +323,7 @@ struct SpatialQueryPanel: View {
     }
 
     @ViewBuilder
-    private func placementButton(title: String, kind: FurnitureKind) -> some View {
+    private func placementButton(title: LocalizedStringKey, kind: FurnitureKind) -> some View {
         Button(title) {
             queryIsFocused = false
             selectedFurniture = kind
@@ -390,14 +390,14 @@ struct SpatialQueryPanel: View {
                         navigationController.clearRoute()
                     }
                 } label: {
-                    Label("이 위치까지 길 안내", systemImage: "point.topleft.down.to.point.bottomright.curvepath.fill")
+                    Label("query.navigate", systemImage: "point.topleft.down.to.point.bottomright.curvepath.fill")
                         .font(.body.weight(.semibold))
                         .frame(maxWidth: .infinity, minHeight: 44)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Color(uiColor: .systemCyan))
                 .foregroundStyle(.black)
-                .accessibilityHint("선택한 물체 위치와 이동할 수 있는 바닥을 확인한 뒤 경로를 표시합니다.")
+                .accessibilityHint(Text("query.routeStartHint"))
                 .accessibilityIdentifier("vispace.query.navigate")
             }
             if presentation.result.totalCandidateCount > 1 {

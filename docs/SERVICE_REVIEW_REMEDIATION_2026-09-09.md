@@ -44,14 +44,14 @@
 | Mac 첫 소스 스냅샷 | 234개 파일 해시 일치, Core Debug 통과. iOS 테스트 빌드는 작성 중인 전송 테스트의 보조 함수를 스냅샷에 담기 전에 시작돼 실패했으며, 보조 함수는 현재 작업 트리에 추가되어 있음 |
 | iOS SDK 빌드·Simulator 단위/UI·규모 측정 | C11 포함 최종 전체 645개 중 643개 통과, 2개 실기기 전용 건너뜀, 실패 0개. 별도 다크 모드 내비게이션·UI 66개 통과 |
 | Release·archive·정적 분석 | C11 포함 최종 수정본 통과. 모델·개인정보 리소스 및 Release에서 Debug 전용 인수 제외 확인 |
-| 정확한 커밋의 CI | 대기 |
+| 게시 커밋의 CI | `68088ca` iOS CI 통과. 별도 Core CI는 실행 전 계정 결제/사용 한도 차단. 후속 커밋은 PR의 최신 Checks에서 확인 |
 | 이번 수정본의 실기기 설치·실행 및 현장 측정 | iPhone 연결 후 서명 키 접근 오류로 테스트 빌드 중단. 키체인 준비 대기. 기존 빌드의 결과를 재사용하지 않음 |
 
 이전 검증 로그는 로컬 `TestResults/service-review-linux/`와 Mac `TestResults/service-review-initial/`에 보관한다. 후속 수정과 현재 결과는 [반복 품질 검토](CONTINUOUS_REVIEW_2026-09-09.md)에 기록한다. 실제 통과한 범위만 완료로 계산한다.
 
 최신 Mac 검증용 별도 체크아웃은 `/Users/dlfkd/VispaceValidation/continuous-review-final-20260909`다. Windows의 각 소스 파일을 UTF-8 줄바꿈 기준으로 해시 대조하고 격리된 DerivedData와 Simulator에서 검증한다. 11:23 KST에 실물 iPhone 16 Pro의 개발 서비스가 연결된 것을 확인했으며 이번 수정본의 실기기 시험은 별도로 진행한다.
 
-현재 확인된 Core CI 차단: [34206876949](https://github.com/L3J-Vispace/Vispace/actions/runs/34206876949). 마지막 기존 iOS CI 성공: [34205445550](https://github.com/L3J-Vispace/Vispace/actions/runs/34205445550), 커밋 `3c4ad595d33f2a7e8db8561ab18eb30dbc8624f3`. 이번 수정본의 CI 결과로 표시하지 않는다.
+이번 게시 커밋 `68088ca`의 Core CI 차단: [34303913660](https://github.com/L3J-Vispace/Vispace/actions/runs/34303913660). 같은 커밋의 iOS CI 성공: [34303914465](https://github.com/L3J-Vispace/Vispace/actions/runs/34303914465). 이전 9월 8일 기록은 이번 수정본의 검증으로 합산하지 않는다. 후속 C12 등은 반복 품질 검토 문서와 PR Checks에서 별도로 확인한다.
 
 ## 롤백
 

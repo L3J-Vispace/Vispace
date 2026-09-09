@@ -1313,6 +1313,66 @@
         "ko" : { "stringUnit" : { "state" : "translated", "value" : "물체 인식을 사용할 수 없어요" } }
       }
     },
+    "placement.kind.sofa" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Sofa" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "소파" } }
+      }
+    },
+    "placement.kind.bed" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Bed" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "침대" } }
+      }
+    },
+    "placement.kind.desk" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Desk" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "책상" } }
+      }
+    },
+    "query.identityReview" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Link an observed object to a saved record" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "관측한 물체의 이전 기록 연결" } }
+      }
+    },
+    "query.objectTools" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Object registration and furniture placement" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "물체 등록 및 가구 배치" } }
+      }
+    },
+    "query.registerObject" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Remember an object location" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "물체 위치 직접 등록" } }
+      }
+    },
+    "query.retryRoute" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Check route again" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "경로 다시 확인" } }
+      }
+    },
+    "query.routeRetryHint" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Checks the object's latest location and the passage again." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "같은 물체의 최신 위치와 통로를 다시 확인합니다." } }
+      }
+    },
+    "query.navigate" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Navigate to this location" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이 위치까지 길 안내" } }
+      }
+    },
+    "query.routeStartHint" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Checks the selected object's location and walkable floor before showing a route." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "선택한 물체 위치와 이동할 수 있는 바닥을 확인한 뒤 경로를 표시합니다." } }
+      }
+    },
     "query.dismissResult" : {
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Dismiss result" } },

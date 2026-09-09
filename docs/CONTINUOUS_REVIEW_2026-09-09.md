@@ -17,6 +17,7 @@
 | C09 | 최대 글자 크기에서 이름 입력 후 키보드가 등록 버튼 공간을 차지하고 명시적 입력 완료 동작이 없음 | 키보드 완료 키로 포커스를 해제하고 폼 안의 스크롤로 키보드를 닫을 수 있게 함. 등록 회귀 시험도 키보드 완료와 실제 폼 스크롤을 검증 |
 | C10 | 병렬 Simulator 실행에서 앱 시작 실패와 RealityKit 캡처 실패가 함께 발생 | 로컬·CI의 Simulator 검사를 직렬 실행하고 테스트별 180초 제한 적용. 별도 새 Simulator의 실제 렌더링 검사로 확인하며 이미지 판정 기준은 유지 |
 | C11 | 일반 projection 실패 뒤 이력 정리를 누르면 삭제 전·후의 일반 쓰기 재시도가 정리를 막음 | 정리에서는 저널·메타데이터를 검증하고 정확히 일치하는 삭제 기록과 연결된 관계만 제거. 일반 projection은 다음 정상 복구에서 재시도. 512MiB 한도·재시작 전후·미반영 메타데이터 보존 회귀 검사 |
+| C12 | 영어 UI에서도 물체 도구 메뉴·기록 연결의 접근성 이름과 경로 설명이 한국어로 고정됨 | 메뉴 항목·접근성 이름·경로 버튼과 힌트 10개를 영어/한국어 리소스로 연결. 가구 버튼도 문자열 키를 번역하도록 수정. 실제 영어/한국어 메뉴의 이름·항목·터치 가능 여부 검사 |
 
 ## 검증 기록
 
@@ -25,15 +26,18 @@
 - C01–C10 직렬 전체 검사: 644개 중 641개 통과, 실기기 전용 2개 건너뜀, 새 도착 회귀 검사 1개 실패. 실패 원인은 재활성화 때 이미 설정된 ready 상태를 새 포즈 처리 완료로 오인한 테스트 경합이었다. 제한 추적 상태를 먼저 확인하도록 테스트를 수정했다.
 - 수정 후 다크 모드 재검사: 내비게이션 49개와 UI 17개, 총 66개 모두 통과. Release 빌드·필수 리소스·Debug 전용 인수 제외·unsigned archive·정적 분석 통과. 일반/최대 글자 크기 검색창과 등록 폼의 실제 캡처를 확인했다.
 - C11은 같은 회귀 테스트를 수정 전 코드에 먼저 실행하여 `injectedFailure`로 정리가 중단되는 것을 재현했다. 수정 전 실패 로그: `TestResults/quota-reproduction.log`.
-- C11 포함 최종 검증 디렉터리: `/Users/dlfkd/VispaceValidation/continuous-review-final-20260909`. 236개 파일 해시 일치 후 전체 645개 중 643개 통과, 2개 실기기 전용 건너뜀, 실패 0개. Release·필수 리소스·Debug 전용 인수 제외·unsigned archive·정적 분석도 통과했다. 증거는 `TestResults/current-review-final2/` 및 `TestResults/final-review.log`에 저장한다. 이후 변경은 이 검증 결과를 반영한 문서 2개뿐이다.
+- C11 포함 검증 디렉터리: `/Users/dlfkd/VispaceValidation/continuous-review-final-20260909`. 236개 파일 해시 일치 후 전체 645개 중 643개 통과, 2개 실기기 전용 건너뜀, 실패 0개. Release·필수 리소스·Debug 전용 인수 제외·unsigned archive·정적 분석도 통과했다. 증거는 `TestResults/current-review-final2/` 및 `TestResults/final-review.log`에 저장한다. C12는 그 이후의 별도 수정이다.
 - 로컬 증거: `TestResults/continuous-review-20260909/`. 실행 중인 검사는 완료로 계산하지 않는다.
 - 검증한 소스는 기능별 커밋을 합친 `c093ab6`과 일치한다. 문서 수정은 실행 코드에 영향을 주지 않는다.
 - 새 전용 Simulator에 Release 앱을 새로 설치하고 Debug 인수 없이 실행했다. 첫 설명 화면을 캡처하고 동일 프로세스가 55초 후에도 실행 중임을 확인했다. 실제 카메라·방 검증은 아니다.
 - 실기기 시도는 코드 서명에서 `errSecInternalComponent`로 실패했다. 키체인 조회도 `User interaction is not allowed`로 거절됐다. iPhone 연결은 정상이나 이번 수정본의 실기기 테스트·설치는 실행되지 않았다. Mac 로그인 키체인/서명 키 접근 준비를 사용자에게 요청했다.
+- C01–C11은 7개 커밋으로 [PR #7](https://github.com/L3J-Vispace/Vispace/pull/7)에 게시했다. 게시 커밋 `68088ca`의 [iOS CI 34303914465](https://github.com/L3J-Vispace/Vispace/actions/runs/34303914465)는 Core·전체 Simulator 643개 통과/2개 건너뜀·이력 회귀 5회 반복·Release·archive·정적 분석·결과 업로드까지 성공했다.
+- 같은 커밋의 [Core CI 34303913660](https://github.com/L3J-Vispace/Vispace/actions/runs/34303913660)는 실행 전 결제·사용 한도 차단이었다. 코드 테스트 실패와 구분한다. 후속 커밋의 CI는 PR의 최신 Checks에서 해당 head와 대조한다.
+- C12는 수정 전 영어 메뉴의 접근성 이름이 `물체 등록 및 가구 배치`로 반환되는 실패를 실제 UI 검사로 재현했다. 수정 후 전체 UI 18개가 모두 통과했고, 영어/한국어 메뉴 캡처에서 등록 항목과 가구 이름이 온전히 표시되는 것을 확인했다. 증거: `TestResults/localization-reproduction.log`, `TestResults/LocalizationUI.xcresult`, `TestResults/localization-captures-all/`. VoiceOver의 실제 음성 출력과 모든 결과 문장의 다국어 지원을 검사한 것은 아니다.
 
 ## 남은 게이트
 
-- 검증된 변경의 기능별 커밋·push·PR와 해당 커밋의 CI 확인.
+- 실기기·현장 검수와 Core CI 계정 차단이 남아 PR은 Draft로 유지한다. 후속 수정마다 해당 커밋의 검증 결과를 확인한다.
 - 이번 수정본의 실기기 설치·실행 및 `DEVICE_ACCEPTANCE.md`의 실제 방, LiDAR/비 LiDAR, VoiceOver, 오차·열·메모리·배터리 측정. 11:23 KST 재조회에서 iPhone 16 Pro / iOS 26.6.1의 개발 서비스와 연결을 확인했다. 현재 남은 실행 전제는 Mac 서명 키 접근이다.
 - 저널의 삭제 상태가 메타데이터에 아직 반영되지 않은 기록은 정리에서 삭제하지 않는다. 일반 복구로 정확한 상태를 먼저 반영해야 한다. 실제 디스크에 원자적 교체용 최소 공간조차 없으면 정리도 실패할 수 있다.
 - 소스와 Simulator 통과를 현장 정확도·경로 안전성·배포 완료로 간주하지 않는다.
