@@ -31,11 +31,22 @@ final class UserObjectRegistrationUITests: XCTestCase {
         app.launch()
         XCTAssertTrue(app.textFields["vispace.query.field"].waitForExistence(timeout: 5))
         let name = openRegistration(in: app)
+        let instructionCapture = XCTAttachment(screenshot: app.screenshot())
+        instructionCapture.name = "registration-instructions-largest-text"
+        instructionCapture.lifetime = .keepAlways
+        add(instructionCapture)
+        try app.performAccessibilityAudit(for: .textClipped)
         name.tap()
-        name.typeText("my speaker")
+        name.typeText("휴대폰")
+        XCTAssertEqual(name.value as? String, "휴대폰")
         name.typeText("\n")
         XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 3),
                       "Done must dismiss the keyboard so the primary action is reachable")
+        let nameCapture = XCTAttachment(screenshot: name.screenshot())
+        nameCapture.name = "registration-name-largest-text"
+        nameCapture.lifetime = .keepAlways
+        add(nameCapture)
+        try app.performAccessibilityAudit(for: .textClipped)
         let capture = app.buttons["vispace.registration.capture"]
         for _ in 0..<5 {
             if capture.isHittable { break }

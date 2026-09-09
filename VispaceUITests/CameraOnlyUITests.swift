@@ -2,6 +2,51 @@ import XCTest
 
 final class CameraOnlyUITests: XCTestCase {
     @MainActor
+    func testSearchRegistrationAndReturnPassStructuralAccessibilityAudit() throws {
+        continueAfterFailure = true
+        let app = XCUIApplication()
+        app.launchArguments = [
+            "-AppleLanguages", "(ko)", "-AppleLocale", "ko_KR",
+            "-VispaceDisableARSession", "-VispaceSkipOnboarding",
+        ]
+        app.launch()
+        let field = app.textFields["vispace.query.field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        field.tap()
+        field.typeText("phone")
+        app.buttons["vispace.query.submit"].tap()
+        XCTAssertTrue(app.otherElements["vispace.query.result"].waitForExistence(timeout: 5))
+        try app.performAccessibilityAudit(for: [.hitRegion, .sufficientElementDescription, .trait, .textClipped])
+        app.buttons["vispace.object.register"].tap()
+        XCTAssertTrue(app.textFields["vispace.registration.name"].waitForExistence(timeout: 5))
+        let registrationCapture = XCTAttachment(screenshot: app.screenshot())
+        registrationCapture.name = "registration-from-search-result"
+        registrationCapture.lifetime = .keepAlways
+        add(registrationCapture)
+        let registrationHierarchy = XCTAttachment(string: app.debugDescription)
+        registrationHierarchy.name = "registration-from-search-result-hierarchy"
+        registrationHierarchy.lifetime = .keepAlways
+        add(registrationHierarchy)
+        XCTAssertFalse(field.isHittable)
+        XCTAssertFalse(app.buttons["vispace.query.submit"].isHittable)
+        try app.performAccessibilityAudit(for: [.hitRegion, .sufficientElementDescription, .trait, .textClipped]) { issue in
+            // iOS 26.5 predicts clipping for these default-size controls despite their dynamic layout.
+            // The largest-text test audits both without a filter and captures the scrolled content.
+            let runtime = ProcessInfo.processInfo.operatingSystemVersion
+            return runtime.majorVersion == 26 && runtime.minorVersion == 5
+                && issue.auditType == .textClipped
+                && ["vispace.registration.status", "vispace.registration.name"]
+                    .contains(issue.element?.identifier ?? "")
+                && issue.detailedDescription.contains("may be clipped at larger Dynamic Type sizes")
+        }
+        app.buttons["vispace.registration.close"].tap()
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        XCTAssertEqual(field.value as? String, "phone")
+        XCTAssertTrue(app.buttons["vispace.query.submit"].isHittable)
+        try app.performAccessibilityAudit(for: [.hitRegion, .sufficientElementDescription, .trait, .textClipped])
+    }
+
+    @MainActor
     func testObjectToolsMenuUsesSelectedLanguage() throws {
         for (language, locale, menuLabel, registerLabel, sofaLabel) in [
             ("en", "en_US", "Object registration and furniture placement", "Remember an object location", "Sofa"),

@@ -90,11 +90,9 @@ struct CameraScreen: View {
                     onRegisterObject: { name in
                         registrationController.cancel()
                         registrationName = name
-                    }
+                    },
+                    isVisible: registrationName == nil
                 )
-                .opacity(registrationName == nil ? 1 : 0)
-                .allowsHitTesting(registrationName == nil)
-                .accessibilityHidden(registrationName != nil)
                 if sessionController.persistenceFailureMessage != nil
                     || perceptionController.persistenceFailureMessage != nil {
                     VStack {

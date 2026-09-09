@@ -18,6 +18,7 @@
 | C10 | 병렬 Simulator 실행에서 앱 시작 실패와 RealityKit 캡처 실패가 함께 발생 | 로컬·CI의 Simulator 검사를 직렬 실행하고 테스트별 180초 제한 적용. 별도 새 Simulator의 실제 렌더링 검사로 확인하며 이미지 판정 기준은 유지 |
 | C11 | 일반 projection 실패 뒤 이력 정리를 누르면 삭제 전·후의 일반 쓰기 재시도가 정리를 막음 | 정리에서는 저널·메타데이터를 검증하고 정확히 일치하는 삭제 기록과 연결된 관계만 제거. 일반 projection은 다음 정상 복구에서 재시도. 512MiB 한도·재시작 전후·미반영 메타데이터 보존 회귀 검사 |
 | C12 | 영어 UI에서도 물체 도구 메뉴·기록 연결의 접근성 이름과 경로 설명이 한국어로 고정됨 | 메뉴 항목·접근성 이름·경로 버튼과 힌트 10개를 영어/한국어 리소스로 연결. 가구 버튼도 문자열 키를 번역하도록 수정. 실제 영어/한국어 메뉴의 이름·항목·터치 가능 여부 검사 |
+| C13 | 패널 전체의 접근성 표시 설정이 장식 아이콘의 숨김을 덮어 원시 심볼 이름이 읽기 대상으로 노출됨 | 등록 중에는 패널이 소유한 입력 상태를 유지하고 컨트롤 레이아웃만 제외. 전환·배경 조작 차단·검색어 보존 검사와 실제 최대 글자 크기의 필터 없는 감사를 추가. 최종 전체 UI 19개 통과 |
 
 ## 검증 기록
 
@@ -35,7 +36,15 @@
 - 같은 커밋의 [Core CI 34303913660](https://github.com/L3J-Vispace/Vispace/actions/runs/34303913660)는 실행 전 결제·사용 한도 차단이었다. 코드 테스트 실패와 구분한다. 후속 커밋의 CI는 PR의 최신 Checks에서 해당 head와 대조한다.
 - C12는 수정 전 영어 메뉴의 접근성 이름이 `물체 등록 및 가구 배치`로 반환되는 실패를 실제 UI 검사로 재현했다. 수정 후 전체 UI 18개가 모두 통과했고, 영어/한국어 메뉴 캡처에서 등록 항목과 가구 이름이 온전히 표시되는 것을 확인했다. 증거: `TestResults/localization-reproduction.log`, `TestResults/LocalizationUI.xcresult`, `TestResults/localization-captures-all/`. VoiceOver의 실제 음성 출력과 모든 결과 문장의 다국어 지원을 검사한 것은 아니다.
 
+- C13 원시 심볼 노출은 동일 감사에서 두 번 재현했다. 증거: `TestResults/StructuralAccessibility.xcresult`, `TestResults/StructuralAccessibilityDetail.xcresult`. 컨테이너만 추가하는 중간 수정은 메뉴/검색 결과 등록 양쪽에서 배경 입력 조작 차단 검사를 깨뜨려 채택하지 않았다. 최종 수정은 상태를 소유하는 패널 안에서 레이아웃을 조건부로 표시한다.
+- 등록 이름 입력창의 일반 크기 감사에는 iOS 26.5의 `may be clipped at larger Dynamic Type sizes` 예측 경고가 있었다. 일반 크기 한글과 최대 접근성 크기의 영문/한글 캡처에서 글자가 온전히 표시됐고, 최대 크기는 필터 없는 `.textClipped` 감사를 각각 통과했다. 최종 검사에서는 iOS 26.5 일반 크기의 이름 입력창·등록 안내문에 대한 이 정확한 예측 경고만 제외한다. 안내문도 최대 크기에서 필터 없는 감사를 통과했고 시작·스크롤 후 캡처를 확인했다. 다른 OS 버전·요소·경고 유형과 최대 크기 감사에는 예외를 적용하지 않는다. 증거: `RegistrationNameLargestAudit.xcresult`, `RegistrationNameKoreanLargestAudit.xcresult`, `registration-name-korean-largest-captures/`.
+- C13 중간 수정본의 전체 UI 검사 `TestResults/AccessibilityUIFinal.xcresult`는 19개 중 18개 통과, 등록 화면의 잘림 감사 1개 실패로 종료했다. 전체 성공으로 계산하지 않는다. 이후 요소별 진단에서 이름 입력창 예외는 적용됐고, 남은 경고는 `vispace.registration.status` 안내문의 큰 글자 예측이었다.
+- 안내문에 세로 고유 높이를 확보하는 수정을 추가했지만 일반 크기의 예측 경고는 남았다. 로그의 진단 출력/줄번호 불일치가 보여 설치 바이너리와 빌드 산출물 해시를 대조했고 일치했다. 원인을 단정하지 않고 전용 Simulator 앱을 재설치하고 새 `TestResults/accessibility-clean-20260909/DerivedData`에서 `RegistrationAuditCleanInventory.xcresult`를 실행했다. 새 테스트 이름과 진단 출력으로 현재 코드 실행을 확인했다. 검색→등록→복귀·입력 보존 assertion 실패는 없었으나 안내문 예측 경고로 테스트는 실패했다. 이 단계에서는 안내문 경고에 예외를 추가하지 않고 실제 최대 글자 크기를 후속 검사했다.
+- `RegistrationInstructionsLargestAudit.xcresult`는 1개 통과로 종료했다. 최대 글자 크기에서 안내문 첫 화면과 이름 입력 후 화면의 필터 없는 잘림 감사를 통과했으며, 캡처에서 안내문 스크롤과 등록 버튼 접근을 확인했다. 2026-09-10 연결 복구 후 결과를 회수했다. 최종 전체 UI 검사 `AccessibilityUIVerified20260910.xcresult` / `accessibility-ui-verified-20260910.log`는 19개 모두 통과, 실패·건너뜀 0개로 종료했다. Windows/Mac의 변경 Swift 파일 5개 해시가 일치한다. 후속 전체 CI는 PR의 해당 head 결과를 확인한다.
+
 ## 남은 게이트
+
+- `7c437b4`의 [iOS CI 34305615238](https://github.com/L3J-Vispace/Vispace/actions/runs/34305615238)는 최종 성공했다. 전체 Simulator 646개 중 644개 통과/실기기 전용 2개 건너뜀, Core·이력 회귀 5회·Release·archive·정적 분석·결과 업로드까지 통과했다. 이는 이후의 미커밋 C13 변경을 검증한 결과가 아니다. 같은 head의 [Core CI 34305616121](https://github.com/L3J-Vispace/Vispace/actions/runs/34305616121)는 계정 결제/사용 한도 문제로 실행 전에 차단됐다.
 
 - 실기기·현장 검수와 Core CI 계정 차단이 남아 PR은 Draft로 유지한다. 후속 수정마다 해당 커밋의 검증 결과를 확인한다.
 - 이번 수정본의 실기기 설치·실행 및 `DEVICE_ACCEPTANCE.md`의 실제 방, LiDAR/비 LiDAR, VoiceOver, 오차·열·메모리·배터리 측정. 11:23 KST 재조회에서 iPhone 16 Pro / iOS 26.6.1의 개발 서비스와 연결을 확인했다. 현재 남은 실행 전제는 Mac 서명 키 접근이다.

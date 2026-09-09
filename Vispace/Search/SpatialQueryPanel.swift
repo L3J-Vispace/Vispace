@@ -10,6 +10,7 @@ struct SpatialQueryPanel: View {
     let onManageData: () -> Void
     let distanceDescription: (Vec3) -> String
     var onRegisterObject: (String) -> Void = { _ in }
+    var isVisible = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @FocusState private var queryIsFocused: Bool
@@ -26,23 +27,13 @@ struct SpatialQueryPanel: View {
     @State private var reviewsIdentity = false
 
     var body: some View {
-        VStack(spacing: 10) {
-            if !dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 0) }
-
-            if dynamicTypeSize.isAccessibilitySize {
-                ScrollView {
-                    resultContent
-                        .frame(maxWidth: .infinity)
-                }
-            } else {
-                resultContent
+        // Keep this panel's input state while removing controls during registration.
+        // A global accessibilityHidden(false) would override decorative child visibility.
+        Group {
+            if isVisible {
+                queryLayout
             }
-
-            queryControls
         }
-        .padding(.horizontal, 14)
-        .padding(.bottom, 10)
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: queryController.latestPresentation)
         .onChange(of: perceptionController.metrics.promotedObjects) { _, _ in
             queryController.refreshUnresolvedQueryAfterObservation()
         }
@@ -69,6 +60,26 @@ struct SpatialQueryPanel: View {
             ObjectIdentityReviewScreen(
                 controller: perceptionController, distanceDescription: distanceDescription)
         }
+    }
+
+    private var queryLayout: some View {
+        VStack(spacing: 10) {
+            if !dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 0) }
+
+            if dynamicTypeSize.isAccessibilitySize {
+                ScrollView {
+                    resultContent
+                        .frame(maxWidth: .infinity)
+                }
+            } else {
+                resultContent
+            }
+
+            queryControls
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 10)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: queryController.latestPresentation)
     }
 
     private var queryControls: some View {

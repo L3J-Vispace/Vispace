@@ -53,6 +53,7 @@ struct UserObjectRegistrationOverlay: View {
                 ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     Text(message).font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("vispace.registration.status")
                     if case .saved(let metadata) = controller.state {
                         Button("기억한 위치 검색") {
