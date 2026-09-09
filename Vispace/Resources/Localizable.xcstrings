@@ -102,13 +102,13 @@
       "en": {
         "stringUnit": {
           "state": "translated",
-          "value": "Includes one latest saved map and current objects, including user names. Older checkpoints and change history are excluded; fingerprints and relations are rebuilt. No original camera frames are included. Limits: 32 MiB map, 36 MiB file, 2,048 objects."
+          "value": "Includes one latest saved map and current objects, including user names. Older checkpoints and change history are excluded; fingerprints and relations are rebuilt. No original camera frames are included. Supports maps up to 128 MiB and files up to 146 MiB. Automatic records are limited to 2,048; manual records also depend on available metadata storage."
         }
       },
       "ko": {
         "stringUnit": {
           "state": "translated",
-          "value": "최신 지도 한 개와 현재 물체 기록·사용자 이름만 옮깁니다. 과거 체크포인트와 변경 이력은 포함하지 않으며, 장소 지문·관계는 다시 생성합니다. 원본 카메라 영상은 포함하지 않습니다. 지도 32 MiB, 파일 36 MiB, 물체 2,048개로 제한됩니다."
+          "value": "최신 지도 한 개와 현재 물체 기록·사용자 이름만 옮깁니다. 과거 체크포인트와 변경 이력은 포함하지 않으며, 장소 지문·관계는 다시 생성합니다. 원본 카메라 영상은 포함하지 않습니다. 지도는 128 MiB, 파일은 146 MiB까지 지원합니다. 자동 인식 기록은 2,048개까지이며, 직접 등록 기록은 메타데이터 저장 용량에 따라 달라집니다."
         }
       }
     }
@@ -230,13 +230,13 @@
       "en": {
         "stringUnit": {
           "state": "translated",
-          "value": "This place exceeds the transfer limits: 32 MiB map, 36 MiB file, or 2,048 objects."
+          "value": "This place exceeds a transfer limit: 128 MiB map, 146 MiB file, 16 MiB metadata, 65,536 total records, or 2,048 automatic records. Older files keep their original smaller limits."
         }
       },
       "ko": {
         "stringUnit": {
           "state": "translated",
-          "value": "장소가 전송 한도를 초과해요. 지도 32 MiB, 파일 36 MiB, 물체 2,048개까지 지원합니다."
+          "value": "전송 한도를 초과해요. 지도 128 MiB, 파일 146 MiB, 메타데이터 16 MiB, 전체 기록 65,536개, 자동 인식 기록 2,048개까지 지원합니다. 이전 형식의 파일에는 기존 한도가 적용돼요."
         }
       }
     }

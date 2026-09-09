@@ -683,7 +683,10 @@ public actor WorldMapCheckpointRepository {
         try Task.checkCancellation()
         guard !candidate.archive.isEmpty,
             candidate.archive.count <= SpatialPlaceArchiveCodec.maximumWorldMapBytes,
-            candidate.objects.count <= SpatialPlaceArchiveCodec.maximumObjectCount
+            candidate.objects.count <= SpatialPlaceArchiveCodec.maximumObjectCount,
+            candidate.objects.lazy.filter({ !UserObjectRegistrationAccumulator.isManualRegistration($0) })
+                .prefix(SpatialPlaceArchiveCodec.maximumAutomaticObjectCount + 1).count
+                <= SpatialPlaceArchiveCodec.maximumAutomaticObjectCount
         else { throw SpatialPlaceArchiveError.fileTooLarge }
         await operationGate.acquire()
         do {
