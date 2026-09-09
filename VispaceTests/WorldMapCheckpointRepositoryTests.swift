@@ -5,6 +5,67 @@ import XCTest
 @testable import Vispace
 
 final class WorldMapCheckpointRepositoryTests: XCTestCase {
+    func testCheckpointCanReplaceAtQuotaWhileKeepingTwoVerifiedRestorePoints() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = makeRepository(root: root)
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let first = try await repository.saveCheckpoint(archive: Data(repeating: 1, count: 512 * 1_024), captureIdentity: identity, savedAt: Date(timeIntervalSince1970: 1))
+        let continued = ARCaptureIdentity(coordinateFrameID: identity.coordinateFrameID,
+            segmentID: identity.segmentID, mapID: first.mapID, status: .confirmed)
+        var previous: [SpatialMapMetadata] = [first]
+        for number in 2...4 {
+            previous.append(try await repository.saveCheckpoint(archive: Data(repeating: UInt8(number), count: 512 * 1_024),
+                captureIdentity: continued, savedAt: Date(timeIntervalSince1970: Double(number))))
+        }
+        let usage = try await repository.storageUsageByMap()
+        XCTAssertGreaterThan(usage[first.mapID]?.checkpointBytes ?? 0, 2 * 1_024 * 1_024)
+        XCTAssertGreaterThan(usage[first.mapID]?.olderCheckpointBytes ?? 0, 1_024 * 1_024)
+        let current = try SpatialStorageDirectory.totalBytes(at: root)
+        let filler = root.appendingPathComponent("unrelated-retained-file")
+        try Data().write(to: filler)
+        let handle = try FileHandle(forWritingTo: filler)
+        try handle.truncate(atOffset: UInt64(SpatialStorageDirectory.maximumTotalBytes - current - 100))
+        try handle.close()
+        let latest = try await repository.saveCheckpoint(archive: Data(repeating: 5, count: 512 * 1_024),
+            captureIdentity: continued, savedAt: Date(timeIntervalSince1970: 5))
+        let after = try await repository.metadataSnapshot()
+        XCTAssertEqual(Set(after.maps.map(\.worldMapBlobID)), Set([previous[2].worldMapBlobID, previous[3].worldMapBlobID, latest.worldMapBlobID]))
+        XCTAssertLessThanOrEqual(try SpatialStorageDirectory.totalBytes(at: root), SpatialStorageDirectory.maximumTotalBytes)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: filler.path), "Unrelated files must never be reclaimed")
+        let damaged = root.appendingPathComponent("WorldMaps/\(latest.worldMapBlobID.uuidString.lowercased()).vispacemap")
+        try Data("corrupt".utf8).write(to: damaged)
+        let restored = try await makeRepository(root: root).loadLatestValidCheckpoint(mapID: first.mapID)
+        XCTAssertEqual(restored?.archive, Data(repeating: 4, count: 512 * 1_024))
+    }
+
+    func testCheckpointQuotaFailureDoesNotPruneLastTwoRestorePoints() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = makeRepository(root: root)
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let first = try await repository.saveCheckpoint(archive: Data(repeating: 1, count: 64 * 1_024), captureIdentity: identity)
+        let continued = ARCaptureIdentity(coordinateFrameID: identity.coordinateFrameID, segmentID: identity.segmentID, mapID: first.mapID, status: .confirmed)
+        _ = try await repository.saveCheckpoint(archive: Data(repeating: 2, count: 64 * 1_024), captureIdentity: continued)
+        let current = try SpatialStorageDirectory.totalBytes(at: root)
+        let filler = root.appendingPathComponent("unrelated-retained-file")
+        try Data().write(to: filler)
+        let handle = try FileHandle(forWritingTo: filler)
+        try handle.truncate(atOffset: UInt64(SpatialStorageDirectory.maximumTotalBytes - current - 100))
+        try handle.close()
+        let primary = root.appendingPathComponent("spatial-metadata-v1.json")
+        let before = try Data(contentsOf: primary)
+        do {
+            _ = try await repository.saveCheckpoint(archive: Data(repeating: 3, count: 64 * 1_024), captureIdentity: continued)
+            XCTFail("Insufficient room without redundant history must fail closed")
+        } catch let error as SpatialStorageError {
+            XCTAssertEqual(error, .capacityExceeded(maximumBytes: SpatialStorageDirectory.maximumTotalBytes))
+        }
+        XCTAssertEqual(try Data(contentsOf: primary), before)
+        let remaining = try await repository.metadataSnapshot()
+        XCTAssertEqual(remaining.maps.count, 2)
+    }
+
     func testManualRegistrationRetryAndExplicitMovePreserveOneIdentity() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -52,6 +113,30 @@ final class WorldMapCheckpointRepositoryTests: XCTestCase {
         } catch { XCTAssertEqual(error as? WorldMapCheckpointRepositoryError, .objectAnnotationConflict(original.object.id)) }
     }
 
+    func testRemovedMetadataReclamationIsAtomicAndSurvivesPrimaryLoss() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = makeRepository(root: root)
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let map = try await repository.saveCheckpoint(archive: Data("world-map".utf8), captureIdentity: identity)
+        let first = try removedMetadata(mapID: map.mapID, frameID: identity.coordinateFrameID, id: ObjectID())
+        let second = try removedMetadata(mapID: map.mapID, frameID: identity.coordinateFrameID, id: ObjectID())
+        let live = try manualRegistration(mapID: map.mapID, frameID: identity.coordinateFrameID, id: ObjectID(), time: 2)
+        _ = try await repository.upsertObjectMetadataBatch([first, second, live])
+        let primary = root.appendingPathComponent("spatial-metadata-v1.json")
+        let before = try Data(contentsOf: primary)
+        do {
+            try await repository.removeObjectMetadataIfMatching([first, live])
+            XCTFail("An invalid last record must prevent all deletions")
+        } catch { XCTAssertEqual(error as? WorldMapCheckpointRepositoryError, .objectAnnotationConflict(live.object.id)) }
+        XCTAssertEqual(try Data(contentsOf: primary), before)
+        try await repository.removeObjectMetadataIfMatching([first, second])
+        try await repository.removeObjectMetadataIfMatching([first, second])
+        try FileManager.default.removeItem(at: primary)
+        let recovered = try await makeRepository(root: root).metadataSnapshot()
+        XCTAssertEqual(recovered.objects, [live], "The backup cannot resurrect reclaimed object history")
+    }
+
     private func manualRegistration(mapID: MapID, frameID: CoordinateFrameID, id: ObjectID, time: TimeInterval) throws -> SpatialObjectMetadata {
         let object = try SpatialObject(id: id, semanticLabel: UserObjectRegistrationAccumulator.semanticLabel,
             position: Vec3(x: time, y: 0, z: -2), certainty: .confirmed, presence: .lastSeen,
@@ -59,6 +144,16 @@ final class WorldMapCheckpointRepositoryTests: XCTestCase {
             firstSeenAt: 1, lastSeenAt: time, displayName: "내 지갑")
         return try SpatialObjectMetadata(mapID: mapID, object: object,
             position: FramedPosition(coordinateFrameID: frameID, value: object.position, observedAt: time,
+                trackingQuality: .normal, uncertainty: .highConfidenceDepth))
+    }
+
+    private func removedMetadata(mapID: MapID, frameID: CoordinateFrameID, id: ObjectID) throws -> SpatialObjectMetadata {
+        let object = try SpatialObject(id: id, semanticLabel: "chair", position: .zero,
+            certainty: .confirmed, presence: .removed,
+            confidence: ConfidenceVector(semantic: .one, geometry: .one, tracking: .one, place: .one, identity: .one, objectState: .one),
+            firstSeenAt: 1, lastSeenAt: 2, stateUpdatedAt: 10, temporalRevision: 4)
+        return try SpatialObjectMetadata(mapID: mapID, object: object,
+            position: FramedPosition(coordinateFrameID: frameID, value: .zero, observedAt: 2,
                 trackingQuality: .normal, uncertainty: .highConfidenceDepth))
     }
 

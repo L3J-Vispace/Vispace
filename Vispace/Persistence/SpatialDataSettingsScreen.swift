@@ -8,6 +8,7 @@ struct SpatialDataSettingsScreen: View {
     @State private var confirmsDeletion = false
     @State private var selectedPlace: MapID?
     @State private var confirmsPlaceDeletion = false
+    @State private var confirmsRemovedHistoryCleanup = false
     @State private var selectsImportFile = false
     @State private var selectedImportFile: SelectedSpatialPlaceArchive?
     @State private var fileSelectionFailed = false
@@ -74,6 +75,13 @@ struct SpatialDataSettingsScreen: View {
                 }
                 Button("data.delete.confirm.cancel", role: .cancel) {}
             } message: { Text("data.place.delete.detail") }
+            .confirmationDialog("data.history.cleanup.action", isPresented: $confirmsRemovedHistoryCleanup,
+                                titleVisibility: .visible) {
+                Button("data.history.cleanup.action", role: .destructive) {
+                    if let selectedPlace { controller.cleanupRemovedObjectHistory(selectedPlace) }
+                }
+                Button("data.delete.confirm.cancel", role: .cancel) {}
+            } message: { Text("data.history.cleanup.confirm") }
             .interactiveDismissDisabled(controller.isBusy)
     }
 
@@ -120,8 +128,13 @@ struct SpatialDataSettingsScreen: View {
                     place: place,
                     isBusy: controller.isBusy,
                     supportsTransfer: controller.supportsPlaceTransfer,
+                    supportsHistoryCleanup: controller.supportsRemovedHistoryCleanup,
                     select: { controller.selectPlace(place.id) },
                     export: { controller.preparePlaceExport(place.id) },
+                    cleanupHistory: {
+                        selectedPlace = place.id
+                        confirmsRemovedHistoryCleanup = true
+                    },
                     delete: {
                         selectedPlace = place.id
                         confirmsPlaceDeletion = true
@@ -178,7 +191,7 @@ struct SpatialDataSettingsScreen: View {
 
     private var showsStatusFeedback: Bool {
         switch controller.state {
-        case .deleting, .deleted, .failed: true
+        case .deleting, .deleted, .cleaningRemovedHistory, .cleanedRemovedHistory, .failed: true
         default: false
         }
     }
@@ -210,6 +223,13 @@ struct SpatialDataSettingsScreen: View {
                 .foregroundStyle(.green)
                 .accessibilityElement(children: .combine)
                 .accessibilityIdentifier("vispace.data.delete.success")
+        case .cleaningRemovedHistory:
+            HStack { ProgressView(); Text("data.history.cleanup.progress") }
+                .accessibilityElement(children: .combine)
+        case .cleanedRemovedHistory:
+            Label("data.history.cleanup.success", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .accessibilityIdentifier("vispace.data.history.cleanup.success")
         case .failed(let message):
             Label(message, systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.red)
@@ -244,8 +264,10 @@ private struct SpatialStoredPlaceRow: View {
     let place: SpatialStoredPlace
     let isBusy: Bool
     let supportsTransfer: Bool
+    let supportsHistoryCleanup: Bool
     let select: () -> Void
     let export: () -> Void
+    let cleanupHistory: () -> Void
     let delete: () -> Void
 
     private var shortIdentifier: String {
@@ -260,11 +282,22 @@ private struct SpatialStoredPlaceRow: View {
                     .font(.caption)
                 Text("\(place.objectCount) objects")
                     .font(.caption)
+                LabeledContent("data.place.checkpoint.bytes", value: ByteCountFormatter.string(
+                    fromByteCount: place.checkpointBytes, countStyle: .file)).font(.caption)
+                if place.olderCheckpointBytes > 0 {
+                    LabeledContent("data.place.checkpoint.older.bytes", value: ByteCountFormatter.string(
+                        fromByteCount: place.olderCheckpointBytes, countStyle: .file)).font(.caption)
+                }
                 Button("data.place.select", action: select)
                     .disabled(isBusy)
                 if supportsTransfer {
                     Button("data.transfer.export", action: export)
                         .disabled(isBusy)
+                }
+                if supportsHistoryCleanup && place.removedObjectCount > 0 {
+                    Button("data.history.cleanup.action", role: .destructive, action: cleanupHistory)
+                        .disabled(isBusy)
+                        .accessibilityIdentifier("vispace.data.history.cleanup")
                 }
             }
             Spacer()

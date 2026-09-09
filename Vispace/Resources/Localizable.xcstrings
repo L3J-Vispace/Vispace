@@ -1,6 +1,48 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "data.history.cleanup.action": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Clear removed-object history" } },
+        "ko": { "stringUnit": { "state": "translated", "value": "삭제된 물체 이력 정리" } }
+      }
+    },
+    "data.history.cleanup.confirm": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Permanently erase the locations and history of automatically recognized objects marked as removed in this place. Manual registrations and current, last-seen, or temporarily hidden objects stay saved. This cannot be undone." } },
+        "ko": { "stringUnit": { "state": "translated", "value": "이 장소에서 ‘삭제됨’으로 기록된 자동 인식 물체의 위치와 변경 이력을 영구적으로 지웁니다. 수동 등록한 물체와 현재·마지막 위치 기록, 잠시 보이지 않는 물체는 유지됩니다. 되돌릴 수 없습니다." } }
+      }
+    },
+    "data.history.cleanup.progress": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Clearing removed-object history…" } },
+        "ko": { "stringUnit": { "state": "translated", "value": "삭제된 물체 이력을 정리하고 있어요" } }
+      }
+    },
+    "data.history.cleanup.success": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Removed-object history cleared." } },
+        "ko": { "stringUnit": { "state": "translated", "value": "삭제된 물체 이력을 정리했어요." } }
+      }
+    },
+    "data.history.cleanup.failed": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "History cleanup could not finish. Try again." } },
+        "ko": { "stringUnit": { "state": "translated", "value": "이력 정리를 마치지 못했어요. 다시 시도해 주세요." } }
+      }
+    },
+    "data.place.checkpoint.bytes": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Map files" } },
+        "ko": { "stringUnit": { "state": "translated", "value": "지도 파일" } }
+      }
+    },
+    "data.place.checkpoint.older.bytes": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Older map files" } },
+        "ko": { "stringUnit": { "state": "translated", "value": "이전 지도 파일" } }
+      }
+    },
   "data.transfer.title": {
     "localizations": {
       "en": {

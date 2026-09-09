@@ -6,6 +6,19 @@ public struct SpatialStoredPlace: Identifiable, Sendable {
     public let id: MapID
     public let updatedAt: TimeInterval
     public let objectCount: Int
+    public let checkpointBytes: Int64
+    public let olderCheckpointBytes: Int64
+    public let removedObjectCount: Int
+
+    public init(id: MapID, updatedAt: TimeInterval, objectCount: Int,
+                checkpointBytes: Int64 = 0, olderCheckpointBytes: Int64 = 0, removedObjectCount: Int = 0) {
+        self.id = id
+        self.updatedAt = updatedAt
+        self.objectCount = objectCount
+        self.checkpointBytes = checkpointBytes
+        self.olderCheckpointBytes = olderCheckpointBytes
+        self.removedObjectCount = removedObjectCount
+    }
 }
 
 public struct SpatialStorageOverview: Sendable {
@@ -22,6 +35,8 @@ public enum SpatialDataManagementState: Equatable, Sendable {
     case importing
     case imported
     case deleted
+    case cleaningRemovedHistory
+    case cleanedRemovedHistory
     case failed(message: String)
 }
 
@@ -47,11 +62,14 @@ public final class SpatialDataManagementController: ObservableObject {
     private let selectPlaceAction: (@MainActor @Sendable (MapID) async throws -> Void)?
     private let exportPlaceAction: ExportPlaceAction?
     private let importPlaceAction: ImportPlaceAction?
+    private let cleanupRemovedHistoryAction: (@MainActor @Sendable (MapID) async throws -> Void)?
 
     public var isBusy: Bool {
-        state == .deleting || state == .switching || state == .exporting || state == .importing || preparedExport != nil
+        state == .deleting || state == .switching || state == .exporting || state == .importing
+            || state == .cleaningRemovedHistory || preparedExport != nil
     }
     public var supportsPlaceTransfer: Bool { exportPlaceAction != nil && importPlaceAction != nil }
+    public var supportsRemovedHistoryCleanup: Bool { cleanupRemovedHistoryAction != nil }
 
     public init(
         overviewProvider: (@Sendable () async throws -> SpatialStorageOverview)? = nil,
@@ -59,6 +77,7 @@ public final class SpatialDataManagementController: ObservableObject {
         selectPlaceAction: (@MainActor @Sendable (MapID) async throws -> Void)? = nil,
         exportPlaceAction: ExportPlaceAction? = nil,
         importPlaceAction: ImportPlaceAction? = nil,
+        cleanupRemovedHistoryAction: (@MainActor @Sendable (MapID) async throws -> Void)? = nil,
         deleteAction: @escaping DeleteAction
     ) {
         self.deleteAction = deleteAction
@@ -67,6 +86,7 @@ public final class SpatialDataManagementController: ObservableObject {
         self.selectPlaceAction = selectPlaceAction
         self.exportPlaceAction = exportPlaceAction
         self.importPlaceAction = importPlaceAction
+        self.cleanupRemovedHistoryAction = cleanupRemovedHistoryAction
     }
 
     deinit {
@@ -85,6 +105,11 @@ public final class SpatialDataManagementController: ObservableObject {
     public func selectPlace(_ mapID: MapID) {
         guard let selectPlaceAction else { return }
         performDeletion({ try await selectPlaceAction(mapID) }, switching: true)
+    }
+
+    public func cleanupRemovedObjectHistory(_ mapID: MapID) {
+        guard let cleanupRemovedHistoryAction else { return }
+        performDeletion({ try await cleanupRemovedHistoryAction(mapID) }, cleaningRemovedHistory: true)
     }
 
     public func preparePlaceExport(_ mapID: MapID) {
@@ -171,14 +196,15 @@ public final class SpatialDataManagementController: ObservableObject {
         }
     }
 
-    private func performDeletion(_ action: @escaping DeleteAction, switching: Bool = false) {
+    private func performDeletion(_ action: @escaping DeleteAction, switching: Bool = false,
+                                 cleaningRemovedHistory: Bool = false) {
         guard deletionTask == nil, preparedExport == nil else {
             return
         }
         overviewGeneration &+= 1
         overview = nil
         overviewFailed = false
-        state = switching ? .switching : .deleting
+        state = switching ? .switching : (cleaningRemovedHistory ? .cleaningRemovedHistory : .deleting)
         deletionTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
@@ -186,12 +212,14 @@ public final class SpatialDataManagementController: ObservableObject {
                 try Task.checkCancellation()
                 await refreshOverview(duringMaintenance: true)
                 try Task.checkCancellation()
-                state = switching ? .idle : .deleted
+                state = switching ? .idle : (cleaningRemovedHistory ? .cleanedRemovedHistory : .deleted)
             } catch is CancellationError {
                 state = .idle
             } catch {
                 await refreshOverview(duringMaintenance: true)
-                state = .failed(message: switching ? String(localized: "data.place.select.failed") : String(localized: "data.delete.failed"))
+                state = .failed(message: switching ? String(localized: "data.place.select.failed")
+                    : (cleaningRemovedHistory ? String(localized: "data.history.cleanup.failed")
+                       : String(localized: "data.delete.failed")))
             }
             deletionTask = nil
         }

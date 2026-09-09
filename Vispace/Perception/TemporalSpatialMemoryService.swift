@@ -15,6 +15,7 @@ public enum TemporalSpatialMemoryServiceError: Error, Equatable, Sendable {
     case committedJournalProjectionPending
     case captureAuthorityRequired
     case captureAuthorityMismatch
+    case removedHistoryCleanupUnavailable
 }
 
 /// Recognition output accepted by temporal memory. The contained Core
@@ -60,6 +61,7 @@ public actor TemporalSpatialMemoryService {
     public typealias MetadataBatchWriter =
         @Sendable ([SpatialObjectMetadata]) async throws
         -> Void
+    public typealias MetadataRemover = @Sendable ([SpatialObjectMetadata]) async throws -> Void
     public typealias PoseValidator = @Sendable (ARPoseSnapshot) -> Bool
 
     private struct MapFrameKey: Hashable, Sendable {
@@ -88,6 +90,7 @@ public actor TemporalSpatialMemoryService {
     private let metadataProvider: MetadataProvider
     private let metadataWriter: MetadataWriter
     private let metadataBatchWriter: MetadataBatchWriter?
+    private let metadataRemover: MetadataRemover?
     private let policy: TemporalSpatialMemoryPolicy
     private let poseValidator: PoseValidator?
     private var coordinators: [MapFrameKey: TemporalSpatialMemoryCoordinator] = [:]
@@ -110,6 +113,7 @@ public actor TemporalSpatialMemoryService {
         metadataBatchWriter = { metadata in
             _ = try await checkpointRepository.upsertObjectMetadataBatch(metadata)
         }
+        metadataRemover = { try await checkpointRepository.removeObjectMetadataIfMatching($0) }
         self.policy = policy
         self.poseValidator = poseValidator
     }
@@ -120,6 +124,7 @@ public actor TemporalSpatialMemoryService {
         metadataProvider: @escaping MetadataProvider,
         metadataWriter: @escaping MetadataWriter,
         metadataBatchWriter: MetadataBatchWriter? = nil,
+        metadataRemover: MetadataRemover? = nil,
         poseValidator: PoseValidator? = nil
     ) {
         self.journalRepository = journalRepository
@@ -128,6 +133,7 @@ public actor TemporalSpatialMemoryService {
         self.metadataProvider = metadataProvider
         self.metadataWriter = metadataWriter
         self.metadataBatchWriter = metadataBatchWriter
+        self.metadataRemover = metadataRemover
     }
 
     /// Restores a map from a compact checkpoint plus the bounded journal
@@ -146,7 +152,8 @@ public actor TemporalSpatialMemoryService {
     }
 
     private func recoverWhileOwningOperation(
-        mapID: MapID, coordinateFrameID: CoordinateFrameID, generation: UInt64
+        mapID: MapID, coordinateFrameID: CoordinateFrameID, generation: UInt64,
+        projectsMetadata: Bool = true
     ) async throws -> TemporalSpatialMemorySnapshot {
         let key = MapFrameKey(mapID: mapID, coordinateFrameID: coordinateFrameID)
         let document = try await validatedMetadataDocument(
@@ -154,7 +161,7 @@ public actor TemporalSpatialMemoryService {
             coordinateFrameID: coordinateFrameID
         )
         try validateGeneration(generation)
-        let durableObjects = objects(
+        var durableObjects = objects(
             in: document,
             mapID: mapID,
             coordinateFrameID: coordinateFrameID
@@ -162,14 +169,15 @@ public actor TemporalSpatialMemoryService {
 
         if let cached = coordinators[key] {
             let shouldRetryProjection = projectionPending.contains(key)
-            if shouldRetryProjection {
+            if shouldRetryProjection || !projectsMetadata {
                 try await reconcile(
                     snapshot: cached.snapshot,
                     durableObjects: durableObjects,
-                    generation: generation
+                    generation: generation,
+                    publishesMetadata: projectsMetadata
                 )
                 try validateGeneration(generation)
-                projectionPending.remove(key)
+                if projectsMetadata { projectionPending.remove(key) }
             }
             return cached.snapshot
         }
@@ -183,6 +191,13 @@ public actor TemporalSpatialMemoryService {
             guard recovery.policy == policy else {
                 throw TemporalSpatialMemoryServiceError.journalPolicyMismatch(mapID)
             }
+            if !recovery.pendingRemovedObjects.isEmpty {
+                try await finishRemovedObjectReclamation(recovery.pendingRemovedObjects,
+                    mapID: mapID, coordinateFrameID: coordinateFrameID, generation: generation)
+                let refreshed = try await validatedMetadataDocument(mapID: mapID, coordinateFrameID: coordinateFrameID)
+                try validateGeneration(generation)
+                durableObjects = objects(in: refreshed, mapID: mapID, coordinateFrameID: coordinateFrameID)
+            }
             coordinator = try TemporalSpatialMemoryCoordinator(
                 restoring: recovery.snapshot,
                 policy: policy
@@ -190,7 +205,8 @@ public actor TemporalSpatialMemoryService {
             try await reconcile(
                 snapshot: recovery.snapshot,
                 durableObjects: durableObjects,
-                generation: generation
+                generation: generation,
+                publishesMetadata: projectsMetadata
             )
         } else {
             coordinator = try TemporalSpatialMemoryCoordinator(
@@ -205,13 +221,61 @@ public actor TemporalSpatialMemoryService {
             try await reconcile(
                 snapshot: coordinator.snapshot,
                 durableObjects: durableObjects,
-                generation: generation
+                generation: generation,
+                publishesMetadata: projectsMetadata
             )
         }
         try validateGeneration(generation)
-        coordinators[key] = coordinator
-        projectionPending.remove(key)
+        if projectsMetadata {
+            coordinators[key] = coordinator
+            projectionPending.remove(key)
+        }
         return coordinator.snapshot
+    }
+
+    /// Call from the app's quiesced storage-maintenance boundary. Interrupted
+    /// projection deletion remains journaled and is completed on cold recovery.
+    @discardableResult
+    public func reclaimRemovedObjectHistory(mapID: MapID, coordinateFrameID: CoordinateFrameID) async throws -> Int {
+        guard metadataRemover != nil else { throw TemporalSpatialMemoryServiceError.removedHistoryCleanupUnavailable }
+        let key = MapFrameKey(mapID: mapID, coordinateFrameID: coordinateFrameID)
+        let lease = try await acquireOperation(for: key)
+        defer { releaseOperation(lease) }
+        let snapshot = try await recoverWhileOwningOperation(
+            mapID: mapID, coordinateFrameID: coordinateFrameID, generation: lease.generation,
+            projectsMetadata: false)
+        let removed = snapshot.reclaimableRemovedObjects
+        guard !removed.isEmpty else { return 0 }
+        let document = try await validatedMetadataDocument(mapID: mapID, coordinateFrameID: coordinateFrameID)
+        let byID = Dictionary(uniqueKeysWithValues: document.objects.map { ($0.object.id, $0) })
+        let expected = removed.map { byID[$0.object.id] ?? $0 }
+        try validateGeneration(lease.generation)
+        let intents = try await journalRepository.beginRemovedObjectReclamation(
+            expectedSnapshot: snapshot, policy: policy, expectedRemovedObjects: expected)
+        // Publication can precede cancellation. Never retain the old coordinator
+        // after the journal has committed the pruned snapshot.
+        coordinators[key] = nil
+        projectionPending.remove(key)
+        try validateGeneration(lease.generation)
+        try await finishRemovedObjectReclamation(intents, mapID: mapID,
+            coordinateFrameID: coordinateFrameID, generation: lease.generation)
+        // Normal projection replay is deferred until the next recovery. Requiring
+        // an unrelated write here would make space reclamation depend on the
+        // very capacity or projection failure the user is trying to recover from.
+        return intents.count
+    }
+
+    private func finishRemovedObjectReclamation(
+        _ intents: [SpatialObjectMetadata], mapID: MapID,
+        coordinateFrameID: CoordinateFrameID, generation: UInt64
+    ) async throws {
+        guard let metadataRemover else { throw TemporalSpatialMemoryServiceError.removedHistoryCleanupUnavailable }
+        try validateGeneration(generation)
+        try await metadataRemover(intents)
+        try validateGeneration(generation)
+        try await journalRepository.completeRemovedObjectReclamation(mapID: mapID,
+            coordinateFrameID: coordinateFrameID, expectedRemovedObjects: intents)
+        try validateGeneration(generation)
     }
 
     @discardableResult
@@ -551,7 +615,8 @@ public actor TemporalSpatialMemoryService {
     private func reconcile(
         snapshot: TemporalSpatialMemorySnapshot,
         durableObjects: [SpatialObjectMetadata],
-        generation: UInt64
+        generation: UInt64,
+        publishesMetadata: Bool = true
     ) async throws {
         let durableByID = Dictionary(
             uniqueKeysWithValues: durableObjects.map { ($0.object.id, $0) }
@@ -590,6 +655,7 @@ public actor TemporalSpatialMemoryService {
         {
             throw TemporalSpatialMemoryServiceError.untrackedDurableObject(untracked)
         }
+        guard publishesMetadata else { return }
         // Equal metadata does not prove that downstream projections committed.
         // Replay the whole validated snapshot, using a single catalog transaction
         // when the caller supplies a writer that also reconciles its projections.
@@ -611,11 +677,15 @@ public actor TemporalSpatialMemoryService {
         objectIDs: Set<ObjectID>,
         generation: UInt64
     ) async throws {
-        for objectID in objectIDs.sorted() {
+        let metadata = objectIDs.sorted().compactMap { snapshot.metadata(for: $0) }
+        try validateGeneration(generation)
+        if metadata.count > 1, let metadataBatchWriter {
+            try await metadataBatchWriter(metadata)
             try validateGeneration(generation)
-            guard let metadata = snapshot.metadata(for: objectID) else {
-                continue
-            }
+            return
+        }
+        for metadata in metadata {
+            try validateGeneration(generation)
             try await metadataWriter(metadata)
             try validateGeneration(generation)
         }

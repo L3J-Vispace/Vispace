@@ -204,11 +204,29 @@ public actor WorldMapCheckpointRepository {
         document.maps.removeAll { removableSet.contains($0.worldMapBlobID) }
 
         try Task.checkCancellation()
-        _ = try await blobStore.saveArchive(
-            archive,
-            id: blobID,
-            createdAt: savedAt
-        )
+        let encodedMetadataBytes = try JSONEncoder().encode(document).count
+        guard encodedMetadataBytes <= Self.maximumMetadataBytes else {
+            throw WorldMapCheckpointRepositoryError.metadataTooLarge(actual: encodedMetadataBytes, maximum: Self.maximumMetadataBytes)
+        }
+        let previousMetadataBytes = fileManager.fileExists(atPath: metadataURL.path)
+            ? try readBoundedMetadata().count : 0
+        let publicationReserve = encodedMetadataBytes + previousMetadataBytes
+        do {
+            _ = try await blobStore.saveArchive(archive, id: blobID, createdAt: savedAt,
+                reservingAdditionalBytes: publicationReserve)
+        } catch let error as SpatialStorageError {
+            guard case .capacityExceeded = error else { throw error }
+            // Prune only verified older history from this place, keeping TWO
+            // durable restore points. Publish that smaller catalog before any
+            // old blob is removed. A failed replacement still has both points.
+            let reclaimed = try await reclaimOlderCheckpointsLocked(mapID: mapID)
+            guard !reclaimed.isEmpty else { throw error }
+            document.maps.removeAll { reclaimed.contains($0.worldMapBlobID) }
+            removableBlobIDs.removeAll { reclaimed.contains($0) }
+            try Task.checkCancellation()
+            _ = try await blobStore.saveArchive(archive, id: blobID, createdAt: savedAt,
+                reservingAdditionalBytes: publicationReserve)
+        }
         try Task.checkCancellation()
         do {
             try commit(document)
@@ -246,6 +264,63 @@ public actor WorldMapCheckpointRepository {
             }
         }
         return metadata
+    }
+
+    private func reclaimOlderCheckpointsLocked(mapID: MapID) async throws -> Set<UUID> {
+        var durable = try loadDocumentRecoveringInvalidCatalog()
+        let ordered = durable.maps.filter { $0.mapID == mapID && $0.availability == .active }
+            .sorted { $0.updatedAt == $1.updatedAt
+                ? $0.worldMapBlobID.uuidString > $1.worldMapBlobID.uuidString : $0.updatedAt > $1.updatedAt }
+        var verified: [SpatialMapMetadata] = []
+        for metadata in ordered {
+            try Task.checkCancellation()
+            do {
+                _ = try await blobStore.loadArchive(id: WorldMapBlobID(rawValue: metadata.worldMapBlobID))
+                verified.append(metadata)
+            } catch {
+                try Task.checkCancellation()
+                // An unverified or future-format file is never reclaimed.
+                // Ordinary restore/recovery owns its eventual handling.
+                continue
+            }
+        }
+        let removable = verified.dropFirst(2)
+        let ids = Set(removable.map(\.worldMapBlobID))
+        guard !ids.isEmpty else { return [] }
+        durable.maps.removeAll { ids.contains($0.worldMapBlobID) }
+        try Task.checkCancellation()
+        try commit(durable, preservePrevious: false)
+        for metadata in removable {
+            try Task.checkCancellation()
+            try await blobStore.removeSupersededArchive(id: WorldMapBlobID(rawValue: metadata.worldMapBlobID))
+        }
+        return ids
+    }
+
+    public func storageUsageByMap() async throws -> [MapID: (checkpointBytes: Int64, olderCheckpointBytes: Int64)] {
+        try Task.checkCancellation()
+        await operationGate.acquire()
+        do {
+            let document = try loadDocumentRecoveringInvalidCatalog()
+            var result: [MapID: (checkpointBytes: Int64, olderCheckpointBytes: Int64)] = [:]
+            for (mapID, maps) in Dictionary(grouping: document.maps, by: \.mapID) {
+                var total: Int64 = 0, older: Int64 = 0
+                let ordered = maps.sorted { $0.updatedAt == $1.updatedAt
+                    ? $0.worldMapBlobID.uuidString > $1.worldMapBlobID.uuidString : $0.updatedAt > $1.updatedAt }
+                for (index, map) in ordered.enumerated() {
+                    try Task.checkCancellation()
+                    let size = try await blobStore.storedByteCount(id: WorldMapBlobID(rawValue: map.worldMapBlobID))
+                    total += size
+                    if index >= 2 { older += size }
+                }
+                result[mapID] = (total, older)
+            }
+            await operationGate.release()
+            return result
+        } catch {
+            await operationGate.release()
+            throw error
+        }
     }
 
     /// Returns the newest valid checkpoint. Invalid candidates are preserved in
@@ -440,6 +515,43 @@ public actor WorldMapCheckpointRepository {
             try commit(document)
             await operationGate.release()
             return document
+        } catch {
+            await operationGate.release()
+            throw error
+        }
+    }
+
+    /// Completes an explicit, journaled reclamation. Already absent records are
+    /// idempotent; a concurrent annotation or live observation aborts the whole
+    /// batch. The recovery copy is updated before publishing the deletion.
+    public func removeObjectMetadataIfMatching(_ expected: [SpatialObjectMetadata]) async throws {
+        guard let first = expected.first else { return }
+        try Task.checkCancellation()
+        await operationGate.acquire()
+        do {
+            try Task.checkCancellation()
+            var document = try loadDocumentRecoveringInvalidCatalog()
+            guard document.maps.contains(where: {
+                $0.mapID == first.mapID && $0.coordinateFrameID == first.position.coordinateFrameID
+                    && $0.availability == .active
+            }) else { throw WorldMapCheckpointRepositoryError.unknownOrQuarantinedMap }
+            var ids: Set<ObjectID> = []
+            for metadata in expected {
+                guard metadata.mapID == first.mapID,
+                    metadata.position.coordinateFrameID == first.position.coordinateFrameID,
+                    metadata.object.presence == .removed,
+                    metadata.object.semanticLabel != UserObjectRegistrationAccumulator.semanticLabel,
+                    ids.insert(metadata.object.id).inserted
+                else { throw WorldMapCheckpointRepositoryError.objectAnnotationConflict(metadata.object.id) }
+                if let current = document.objects.first(where: { $0.object.id == metadata.object.id }), current != metadata {
+                    throw WorldMapCheckpointRepositoryError.objectAnnotationConflict(metadata.object.id)
+                }
+            }
+            let previousCount = document.objects.count
+            document.objects.removeAll { ids.contains($0.object.id) }
+            try Task.checkCancellation()
+            if document.objects.count != previousCount { try commit(document, preservePrevious: false) }
+            await operationGate.release()
         } catch {
             await operationGate.release()
             throw error

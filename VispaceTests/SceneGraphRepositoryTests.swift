@@ -5,6 +5,95 @@ import XCTest
 @testable import Vispace
 
 final class SceneGraphRepositoryTests: XCTestCase {
+    func testRemovedObjectCleanupPreservesUnrelatedEvidenceAndHistoryAtQuotaAfterRestart() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = SceneGraphRepository(directoryURL: directory)
+        let mapID = MapID(), frameID = CoordinateFrameID(), otherMapID = MapID()
+        let removedID = ObjectID(), survivingID = ObjectID(), otherSurvivingID = ObjectID()
+        func relation(_ subject: ObjectID, _ predicate: SpatialRelationPredicate,
+                      _ object: ObjectID, until: TimeInterval? = nil) throws -> SpatialRelation {
+            try SpatialRelation(key: RelationKey(subject: .object(subject), predicate: predicate,
+                                                object: .object(object)),
+                confidence: ConfidenceScore(clamping: 0.95), certainty: .confirmed,
+                validFrom: 1, validUntil: until)
+        }
+        let outgoing = try relation(removedID, .blocking, survivingID)
+        let incoming = try relation(survivingID, .accessibleFrom, removedID)
+        let retained = try relation(survivingID, .connectedTo, otherSurvivingID)
+        let removedHistory = try relation(removedID, .connectedTo, survivingID, until: 3)
+        let retainedHistory = try relation(survivingID, .blocking, otherSurvivingID, until: 3)
+        var graph = SceneGraph()
+        for relation in [outgoing, incoming, retained] { try graph.upsert(relation) }
+        let original = SceneGraphMapUpdate(mapID: mapID, coordinateFrameID: frameID,
+            baseRevision: 0, graph: graph, geometryProjection: .onDemand,
+            expiredRelationHistory: [removedHistory, retainedHistory], timestamp: 10)
+        _ = try await repository.apply(original)
+        let other = SceneGraphMapUpdate(mapID: otherMapID, coordinateFrameID: CoordinateFrameID(),
+            baseRevision: 0, graph: graph, expiredRelationHistory: [removedHistory], timestamp: 10)
+        _ = try await repository.apply(other)
+
+        let catalogURL = directory.appendingPathComponent(SceneGraphRepository.catalogFileName)
+        let before = try Data(contentsOf: catalogURL)
+        do {
+            try await repository.removeObjectHistory(mapID: mapID,
+                coordinateFrameID: CoordinateFrameID(), objectIDs: [removedID])
+            XCTFail("A stale coordinate frame must not delete evidence")
+        } catch { XCTAssertEqual(error as? SceneGraphRepositoryError, .mapCoordinateFrameConflict(mapID)) }
+        XCTAssertEqual(try Data(contentsOf: catalogURL), before)
+        let filler = directory.appendingPathComponent("unrelated-retained-file")
+        try Data().write(to: filler)
+        let current = try SpatialStorageDirectory.totalBytes(at: directory)
+        let handle = try FileHandle(forWritingTo: filler)
+        try handle.truncate(atOffset: UInt64(SpatialStorageDirectory.maximumTotalBytes - current))
+        try handle.close()
+
+        try await repository.removeObjectHistory(mapID: mapID, coordinateFrameID: frameID, objectIDs: [removedID])
+        let restarted = SceneGraphRepository(directoryURL: directory)
+        let loaded = try await restarted.load(mapID: mapID)
+        let record = try XCTUnwrap(loaded)
+        XCTAssertEqual(record.graph.relations(includeProvisional: true), [retained])
+        XCTAssertEqual(record.expiredRelationHistory, [retainedHistory])
+        XCTAssertEqual(record.geometryProjection, .onDemand)
+        XCTAssertEqual(record.appliedUpdateIDs, [original.id])
+        XCTAssertEqual(record.appliedUpdateOrder, [original.id])
+        XCTAssertEqual(record.revision, 2)
+        XCTAssertEqual(record.updatedAt, 10, "Cleanup must not manufacture a fresh observation")
+        let unaffected = try await restarted.load(mapID: otherMapID)
+        XCTAssertEqual(unaffected?.graph.relations(includeProvisional: true), graph.relations(includeProvisional: true))
+        XCTAssertEqual(unaffected?.expiredRelationHistory, [removedHistory])
+        let prunedBytes = try Data(contentsOf: catalogURL)
+        try await restarted.removeObjectHistory(mapID: mapID, coordinateFrameID: frameID, objectIDs: [removedID])
+        XCTAssertEqual(try Data(contentsOf: catalogURL), prunedBytes)
+        guard case .alreadyApplied = try await restarted.apply(original) else {
+            return XCTFail("Acknowledging an old update must not restore removed evidence")
+        }
+        do {
+            _ = try await restarted.apply(SceneGraphMapUpdate(mapID: mapID, coordinateFrameID: frameID,
+                baseRevision: 1, graph: graph, expiredRelationHistory: [removedHistory], timestamp: 11))
+            XCTFail("A writer from before reclamation must fail its revision check")
+        } catch { XCTAssertEqual(error as? SceneGraphRepositoryError, .revisionConflict(expected: 2, actual: 1)) }
+        XCTAssertEqual(try Data(contentsOf: catalogURL), prunedBytes)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: filler.path))
+    }
+
+    func testRemovedObjectCleanupRetainsEmptyMapRevisionAgainstStaleWrites() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = SceneGraphRepository(directoryURL: directory)
+        let mapID = MapID(), frameID = CoordinateFrameID()
+        let relation = try makeRelation()
+        guard case .object(let removedID) = relation.key.object else { return XCTFail("Expected object endpoint") }
+        var graph = SceneGraph()
+        try graph.upsert(relation)
+        _ = try await repository.apply(SceneGraphMapUpdate(mapID: mapID, coordinateFrameID: frameID,
+            baseRevision: 0, graph: graph, expiredRelationHistory: [], timestamp: 1))
+        try await repository.removeObjectHistory(mapID: mapID, coordinateFrameID: frameID, objectIDs: [removedID])
+        let recovered = try await SceneGraphRepository(directoryURL: directory).load(mapID: mapID)
+        XCTAssertEqual(recovered?.revision, 2)
+        XCTAssertTrue(recovered?.graph.relations(includeProvisional: true).isEmpty == true)
+    }
+
     @MainActor
     func testClockRollbackRebuildsRelationsAtRealTimeAndFencesOlderEndpointRevisions() async throws {
         let directory = temporaryDirectory()
