@@ -4,6 +4,55 @@ import XCTest
 @testable import VispaceCore
 
 final class UserObjectRegistrationTests: XCTestCase {
+    func testMovingAnExplicitlySelectedManualObjectPreservesIdentityAndOrigin() throws {
+        let identity = makeIdentity()
+        let original = try registeredObject(identity: identity, offset: 0)
+        var update = try UserObjectRegistrationAccumulator(name: "내 스피커", replacing: original)
+        _ = try update.append(sample(identity: identity, offset: 10, x: 2))
+        _ = try update.append(sample(identity: identity, offset: 10.15, x: 2.02))
+        let moved = try XCTUnwrap(update.append(sample(identity: identity, offset: 10.31, x: 2.03)))
+        XCTAssertEqual(moved.object.id, original.object.id)
+        XCTAssertEqual(moved.object.firstSeenAt, original.object.firstSeenAt)
+        XCTAssertEqual(moved.object.displayName, original.object.displayName)
+        XCTAssertEqual(moved.position.value.x, 2.02, accuracy: 0.000_001)
+        XCTAssertGreaterThan(moved.object.lastSeenAt, original.object.lastSeenAt)
+        XCTAssertTrue(UserObjectRegistrationAccumulator.isManualRegistration(moved))
+    }
+
+    func testSameNameAloneNeverMergesTwoPhysicalObjects() throws {
+        let identity = makeIdentity()
+        let first = try registeredObject(identity: identity, offset: 0)
+        let second = try registeredObject(identity: identity, offset: 10)
+        XCTAssertEqual(first.object.displayName, second.object.displayName)
+        XCTAssertNotEqual(first.object.id, second.object.id)
+    }
+
+    func testManualUpdateRejectsDifferentSpaceOldEvidenceAndImplicitRename() throws {
+        let identity = makeIdentity()
+        let original = try registeredObject(identity: identity, offset: 0)
+        XCTAssertThrowsError(try UserObjectRegistrationAccumulator(name: "다른 이름", replacing: original)) {
+            XCTAssertEqual($0 as? UserObjectRegistrationError, .invalidExistingObject)
+        }
+        for other in [makeIdentity(), makeIdentity(mapID: identity.mapID)] {
+            var update = try UserObjectRegistrationAccumulator(name: "내 스피커", replacing: original)
+            XCTAssertThrowsError(try update.append(sample(identity: other, offset: 10))) {
+                XCTAssertEqual($0 as? UserObjectRegistrationError, .staleExistingObject)
+            }
+        }
+        var update = try UserObjectRegistrationAccumulator(name: "내 스피커", replacing: original)
+        XCTAssertThrowsError(try update.append(sample(identity: identity, offset: 0.15))) {
+            XCTAssertEqual($0 as? UserObjectRegistrationError, .staleExistingObject)
+        }
+    }
+
+    private func registeredObject(identity: UserObjectRegistrationIdentity,
+                                  offset: TimeInterval) throws -> SpatialObjectMetadata {
+        var accumulator = try UserObjectRegistrationAccumulator(name: "내 스피커")
+        _ = try accumulator.append(sample(identity: identity, offset: offset))
+        _ = try accumulator.append(sample(identity: identity, offset: offset + 0.15))
+        return try XCTUnwrap(accumulator.append(sample(identity: identity, offset: offset + 0.31)))
+    }
+
     func testThreeIndependentSustainedSamplesSaveHonestNamedLastSeenPoint() throws {
         var accumulator = try UserObjectRegistrationAccumulator(name: "  내 스피커  ")
         let identity = makeIdentity()

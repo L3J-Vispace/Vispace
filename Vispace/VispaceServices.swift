@@ -127,7 +127,37 @@ final class VispaceServices: ObservableObject {
         let registrationController = UserObjectRegistrationController(
             frameStreamProvider: { sessionController.frames },
             confirmedIdentityProvider: { sessionController.confirmedCaptureIdentity(for: $0) },
-            metadataWriter: durableMetadataWriter
+            metadataWriter: { metadata, expected in
+                objectMutationFence.begin()
+                defer { objectMutationFence.end() }
+                // This return value means the annotation is durable. Optional
+                // graph projection cannot turn that success into a failed save.
+                _ = try await repository.commitUserObjectRegistration(metadata, replacing: expected)
+            },
+            existingObjectsProvider: {
+                let identity = await sessionController.captureIdentity
+                let objects = try await repository.metadataSnapshot().objects
+                return objects.filter {
+                    $0.mapID == identity.mapID
+                        && $0.position.coordinateFrameID == identity.coordinateFrameID
+                }
+            },
+            projectionRefresher: {
+                objectMutationFence.begin()
+                defer { objectMutationFence.end() }
+                let document = try await repository.metadataSnapshot()
+                let manualMaps = Set(document.objects.filter(
+                    UserObjectRegistrationAccumulator.isManualRegistration).map(\.mapID))
+                for mapID in manualMaps.sorted() {
+                    try Task.checkCancellation()
+                    guard let map = document.maps.first(where: {
+                        $0.mapID == mapID && $0.availability == .active
+                    }) else { continue }
+                    try await sceneGraphService.rebuild(mapID: mapID,
+                        coordinateFrameID: map.coordinateFrameID,
+                        allObjects: document.objects, at: Date().timeIntervalSince1970)
+                }
+            }
         )
         let placeRecognitionController = PlaceRecognitionController(
             surfaceStreamProvider: { sessionController.surfaces },

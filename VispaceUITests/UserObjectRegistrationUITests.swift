@@ -6,6 +6,21 @@ final class UserObjectRegistrationUITests: XCTestCase {
     }
 
     @MainActor
+    func testExistingObjectPickerCanBeOpenedAndCancelledWithoutCreatingARegistration() throws {
+        let app = launchWithoutCameraEvidence()
+        let name = openRegistration(in: app)
+        let existing = app.buttons["vispace.registration.choose-existing"]
+        XCTAssertTrue(existing.isHittable)
+        existing.tap()
+        XCTAssertTrue(app.navigationBars["위치를 바꿀 물체"].waitForExistence(timeout: 3))
+        app.navigationBars["위치를 바꿀 물체"].buttons["취소"].tap()
+        XCTAssertTrue(name.waitForExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["vispace.registration.capture"].isEnabled)
+        XCTAssertFalse(app.buttons["기억한 위치 검색"].exists)
+        app.buttons["vispace.registration.close"].tap()
+    }
+
+    @MainActor
     func testRegistrationActionsRemainReachableAtLargestAccessibilityTextSize() throws {
         let app = XCUIApplication()
         app.launchArguments = [
@@ -18,12 +33,19 @@ final class UserObjectRegistrationUITests: XCTestCase {
         let name = openRegistration(in: app)
         name.tap()
         name.typeText("my speaker")
+        name.typeText("\n")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 3),
+                      "Done must dismiss the keyboard so the primary action is reachable")
         let capture = app.buttons["vispace.registration.capture"]
         for _ in 0..<5 {
             if capture.isHittable { break }
-            app.swipeUp()
+            app.scrollViews["vispace.registration.form"].swipeUp()
         }
         XCTAssertTrue(capture.isHittable)
+        let formCapture = XCTAttachment(screenshot: app.screenshot())
+        formCapture.name = "registration-largest-accessibility-form"
+        formCapture.lifetime = .keepAlways
+        add(formCapture)
         capture.tap()
         let close = app.buttons["vispace.registration.close"]
         XCTAssertTrue(close.isHittable)

@@ -138,6 +138,18 @@ struct CameraScreen: View {
                 if let registrationName {
                     UserObjectRegistrationOverlay(
                         controller: registrationController, initialName: registrationName,
+                        distanceDescription: { metadata in
+                            guard let frame = sessionController.latestDepthFrame,
+                                frame.pose.mapID == metadata.mapID,
+                                frame.pose.coordinateFrameID == metadata.position.coordinateFrameID else {
+                                return "현재 거리 확인 불가"
+                            }
+                            let camera = frame.pose.cameraTransform.column3
+                            let position = metadata.position.value
+                            let distance = hypot(hypot(position.x - Double(camera.x), position.y - Double(camera.y)),
+                                position.z - Double(camera.z))
+                            return "저장 위치는 카메라에서 약 \(distance.formatted(.number.precision(.fractionLength(1))))m"
+                        },
                         onClose: {
                             registrationController.cancel()
                             self.registrationName = nil

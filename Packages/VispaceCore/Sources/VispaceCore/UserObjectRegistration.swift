@@ -6,6 +6,8 @@ public enum UserObjectRegistrationError: Error, Equatable, Sendable {
     case identityChanged
     case inconsistentTime
     case unstablePosition
+    case invalidExistingObject
+    case staleExistingObject
 }
 
 /// The complete capture identity, including the session attachment/run, is
@@ -63,11 +65,13 @@ public struct UserObjectRegistrationAccumulator: Sendable {
     public static let semanticLabel = "user_registered_object"
     public let name: String
     public private(set) var sampleCount = 0
-    private let objectID: ObjectID
+    public let objectID: ObjectID
+    public let replacing: SpatialObjectMetadata?
     private var samples: [UserObjectRegistrationSample] = []
     private var completedMetadata: SpatialObjectMetadata?
 
-    public init(name: String, objectID: ObjectID = ObjectID()) throws {
+    public init(name: String, objectID: ObjectID = ObjectID(),
+                replacing: SpatialObjectMetadata? = nil) throws {
         let normalized = name.precomposedStringWithCanonicalMapping
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty,
@@ -75,8 +79,22 @@ public struct UserObjectRegistrationAccumulator: Sendable {
             normalized.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }),
             normalized.unicodeScalars.contains(where: CharacterSet.alphanumerics.contains)
         else { throw UserObjectRegistrationError.invalidName }
+        if let replacing {
+            guard Self.isManualRegistration(replacing), replacing.object.displayName == normalized else {
+                throw UserObjectRegistrationError.invalidExistingObject
+            }
+        }
         self.name = normalized
-        self.objectID = objectID
+        self.objectID = replacing?.object.id ?? objectID
+        self.replacing = replacing
+    }
+
+    public static func isManualRegistration(_ metadata: SpatialObjectMetadata) -> Bool {
+        let object = metadata.object
+        return object.semanticLabel == semanticLabel && object.displayName != nil
+            && object.detectorSemanticLabel == nil && object.bounds == nil
+            && object.certainty == .confirmed && object.presence == .lastSeen
+            && object.temporalRevision == nil
     }
 
     public mutating func append(_ sample: UserObjectRegistrationSample) throws -> SpatialObjectMetadata? {
@@ -88,6 +106,14 @@ public struct UserObjectRegistrationAccumulator: Sendable {
             sample.capturedAt.isFinite, sample.capturedAt >= 0,
             sample.position.x.isFinite, sample.position.y.isFinite, sample.position.z.isFinite
         else { throw UserObjectRegistrationError.invalidSample }
+        if let replacing {
+            guard sample.identity.mapID == replacing.mapID,
+                sample.identity.coordinateFrameID == replacing.position.coordinateFrameID,
+                sample.capturedAt > replacing.object.stateUpdatedAt,
+                sample.capturedAt > replacing.position.observedAt else {
+                throw UserObjectRegistrationError.staleExistingObject
+            }
+        }
 
         if let first = samples.first, let previous = samples.last {
             guard sample.identity == first.identity else {
@@ -139,7 +165,7 @@ public struct UserObjectRegistrationAccumulator: Sendable {
                 semantic: .one, geometry: ConfidenceScore(clamping: 0.8),
                 tracking: .one, place: .one, identity: .one, objectState: .one
             ),
-            firstSeenAt: first.capturedAt, lastSeenAt: medoid.capturedAt,
+            firstSeenAt: replacing?.object.firstSeenAt ?? first.capturedAt, lastSeenAt: medoid.capturedAt,
             stateUpdatedAt: sample.capturedAt,
             displayName: name
         )

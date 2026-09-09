@@ -395,6 +395,57 @@ public actor WorldMapCheckpointRepository {
         _ = try await upsertObjectMetadataBatch([metadata])
     }
 
+    /// User-selected identity updates are compare-and-swap transactions. An
+    /// exact retry acknowledges the durable record without duplicating it;
+    /// stale selections cannot undo a rename, move, or deletion.
+    @discardableResult
+    public func commitUserObjectRegistration(
+        _ metadata: SpatialObjectMetadata,
+        replacing expected: SpatialObjectMetadata? = nil
+    ) async throws -> SpatialMetadataDocument {
+        try Task.checkCancellation()
+        await operationGate.acquire()
+        do {
+            try Task.checkCancellation()
+            var document = try loadDocumentRecoveringInvalidCatalog()
+            let conflict = WorldMapCheckpointRepositoryError.objectAnnotationConflict(metadata.object.id)
+            guard UserObjectRegistrationAccumulator.isManualRegistration(metadata),
+                document.maps.contains(where: {
+                    $0.mapID == metadata.mapID && $0.availability == .active
+                        && $0.coordinateFrameID == metadata.position.coordinateFrameID
+                })
+            else { throw conflict }
+            let index = document.objects.firstIndex { $0.object.id == metadata.object.id }
+            if let index, document.objects[index] == metadata {
+                await operationGate.release()
+                return document
+            }
+            if let expected {
+                guard let index, document.objects[index] == expected,
+                    UserObjectRegistrationAccumulator.isManualRegistration(expected),
+                    expected.mapID == metadata.mapID,
+                    expected.position.coordinateFrameID == metadata.position.coordinateFrameID,
+                    expected.object.id == metadata.object.id,
+                    expected.object.displayName == metadata.object.displayName,
+                    expected.object.firstSeenAt == metadata.object.firstSeenAt,
+                    metadata.object.stateUpdatedAt > expected.object.stateUpdatedAt,
+                    metadata.position.observedAt > expected.position.observedAt
+                else { throw conflict }
+                document.objects[index] = metadata
+            } else {
+                guard index == nil else { throw conflict }
+                document.objects.append(metadata)
+            }
+            try Task.checkCancellation()
+            try commit(document)
+            await operationGate.release()
+            return document
+        } catch {
+            await operationGate.release()
+            throw error
+        }
+    }
+
     /// Applies one complete projection against a freshly loaded catalog. No
     /// object is published until every incoming update passes the same identity,
     /// revision and annotation checks as an individual observation. The returned

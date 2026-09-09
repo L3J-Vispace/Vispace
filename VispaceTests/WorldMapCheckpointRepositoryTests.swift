@@ -5,6 +5,63 @@ import XCTest
 @testable import Vispace
 
 final class WorldMapCheckpointRepositoryTests: XCTestCase {
+    func testManualRegistrationRetryAndExplicitMovePreserveOneIdentity() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = makeRepository(root: root)
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let map = try await repository.saveCheckpoint(archive: Data("world-map".utf8), captureIdentity: identity)
+        let original = try manualRegistration(mapID: map.mapID, frameID: identity.coordinateFrameID, id: ObjectID(), time: 2)
+        _ = try await repository.commitUserObjectRegistration(original)
+        let before = try Data(contentsOf: root.appendingPathComponent("spatial-metadata-v1.json"))
+        _ = try await repository.commitUserObjectRegistration(original)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("spatial-metadata-v1.json")), before)
+        let moved = try manualRegistration(mapID: map.mapID, frameID: identity.coordinateFrameID, id: original.object.id, time: 3)
+        let updated = try await repository.commitUserObjectRegistration(moved, replacing: original)
+        XCTAssertEqual(updated.objects, [moved])
+        let restarted = makeRepository(root: root)
+        let retried = try await restarted.commitUserObjectRegistration(moved, replacing: original)
+        XCTAssertEqual(retried.objects, [moved])
+        XCTAssertEqual(moved.object.firstSeenAt, original.object.firstSeenAt)
+        // Same-name distinct objects are deliberately not merged.
+        let distinct = try manualRegistration(mapID: map.mapID, frameID: identity.coordinateFrameID, id: ObjectID(), time: 4)
+        let both = try await restarted.commitUserObjectRegistration(distinct)
+        XCTAssertEqual(Set(both.objects), Set([moved, distinct]))
+    }
+
+    func testManualMoveRejectsStaleSelectionAfterRenameOrDeletion() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = makeRepository(root: root)
+        let identity = ARCaptureIdentity(status: .confirmed)
+        let map = try await repository.saveCheckpoint(archive: Data("world-map".utf8), captureIdentity: identity)
+        let original = try manualRegistration(mapID: map.mapID, frameID: identity.coordinateFrameID, id: ObjectID(), time: 2)
+        _ = try await repository.commitUserObjectRegistration(original)
+        let renamed = try await repository.renameObject(expected: original, displayName: "다른 지갑")
+        let moved = try manualRegistration(mapID: map.mapID, frameID: identity.coordinateFrameID, id: original.object.id, time: 3)
+        do {
+            _ = try await repository.commitUserObjectRegistration(moved, replacing: original)
+            XCTFail("A stale selection cannot undo an intervening name change")
+        } catch { XCTAssertEqual(error as? WorldMapCheckpointRepositoryError, .objectAnnotationConflict(original.object.id)) }
+        let current = try await repository.metadataSnapshot()
+        XCTAssertEqual(current.objects, [renamed])
+        try await repository.deleteMap(mapID: map.mapID)
+        do {
+            _ = try await repository.commitUserObjectRegistration(moved, replacing: original)
+            XCTFail("Deleted records must not be recreated by a pending move")
+        } catch { XCTAssertEqual(error as? WorldMapCheckpointRepositoryError, .objectAnnotationConflict(original.object.id)) }
+    }
+
+    private func manualRegistration(mapID: MapID, frameID: CoordinateFrameID, id: ObjectID, time: TimeInterval) throws -> SpatialObjectMetadata {
+        let object = try SpatialObject(id: id, semanticLabel: UserObjectRegistrationAccumulator.semanticLabel,
+            position: Vec3(x: time, y: 0, z: -2), certainty: .confirmed, presence: .lastSeen,
+            confidence: ConfidenceVector(semantic: .one, geometry: .one, tracking: .one, place: .one, identity: .one, objectState: .one),
+            firstSeenAt: 1, lastSeenAt: time, displayName: "내 지갑")
+        return try SpatialObjectMetadata(mapID: mapID, object: object,
+            position: FramedPosition(coordinateFrameID: frameID, value: object.position, observedAt: time,
+                trackingQuality: .normal, uncertainty: .highConfidenceDepth))
+    }
+
     func testBatchUpsertPublishesOnceAndPreservesNamesAcrossClockRollback() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
