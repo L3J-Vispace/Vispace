@@ -19,6 +19,7 @@
 | C11 | 일반 projection 실패 뒤 이력 정리를 누르면 삭제 전·후의 일반 쓰기 재시도가 정리를 막음 | 정리에서는 저널·메타데이터를 검증하고 정확히 일치하는 삭제 기록과 연결된 관계만 제거. 일반 projection은 다음 정상 복구에서 재시도. 512MiB 한도·재시작 전후·미반영 메타데이터 보존 회귀 검사 |
 | C12 | 영어 UI에서도 물체 도구 메뉴·기록 연결의 접근성 이름과 경로 설명이 한국어로 고정됨 | 메뉴 항목·접근성 이름·경로 버튼과 힌트 10개를 영어/한국어 리소스로 연결. 가구 버튼도 문자열 키를 번역하도록 수정. 실제 영어/한국어 메뉴의 이름·항목·터치 가능 여부 검사 |
 | C13 | 패널 전체의 접근성 표시 설정이 장식 아이콘의 숨김을 덮어 원시 심볼 이름이 읽기 대상으로 노출됨 | 등록 중에는 패널이 소유한 입력 상태를 유지하고 컨트롤 레이아웃만 제외. 전환·배경 조작 차단·검색어 보존 검사와 실제 최대 글자 크기의 필터 없는 감사를 추가. 최종 전체 UI 19개 통과 |
+| C14 | 등록 폼의 고정 최대 높이 420pt가 iPhone의 실제 카메라 중심을 덮어 안내문의 조준 표시가 보이지 않음 | 카메라 전체 뷰포트와 컨트롤 안전 영역을 구분해 폼 높이를 계산. 이름 입력 중에는 입력 공간을 확보하고 완료 후 중앙 여백 복구. iPhone 17 관련 6개·iPhone SE 소형 화면 2개 통과. 일반/최대 글자 크기와 키보드 완료 후 여백 확인 |
 
 ## 검증 기록
 
@@ -41,6 +42,8 @@
 - C13 중간 수정본의 전체 UI 검사 `TestResults/AccessibilityUIFinal.xcresult`는 19개 중 18개 통과, 등록 화면의 잘림 감사 1개 실패로 종료했다. 전체 성공으로 계산하지 않는다. 이후 요소별 진단에서 이름 입력창 예외는 적용됐고, 남은 경고는 `vispace.registration.status` 안내문의 큰 글자 예측이었다.
 - 안내문에 세로 고유 높이를 확보하는 수정을 추가했지만 일반 크기의 예측 경고는 남았다. 로그의 진단 출력/줄번호 불일치가 보여 설치 바이너리와 빌드 산출물 해시를 대조했고 일치했다. 원인을 단정하지 않고 전용 Simulator 앱을 재설치하고 새 `TestResults/accessibility-clean-20260909/DerivedData`에서 `RegistrationAuditCleanInventory.xcresult`를 실행했다. 새 테스트 이름과 진단 출력으로 현재 코드 실행을 확인했다. 검색→등록→복귀·입력 보존 assertion 실패는 없었으나 안내문 예측 경고로 테스트는 실패했다. 이 단계에서는 안내문 경고에 예외를 추가하지 않고 실제 최대 글자 크기를 후속 검사했다.
 - `RegistrationInstructionsLargestAudit.xcresult`는 1개 통과로 종료했다. 최대 글자 크기에서 안내문 첫 화면과 이름 입력 후 화면의 필터 없는 잘림 감사를 통과했으며, 캡처에서 안내문 스크롤과 등록 버튼 접근을 확인했다. 2026-09-10 연결 복구 후 결과를 회수했다. 최종 전체 UI 검사 `AccessibilityUIVerified20260910.xcresult` / `accessibility-ui-verified-20260910.log`는 19개 모두 통과, 실패·건너뜀 0개로 종료했다. Windows/Mac의 변경 Swift 파일 5개 해시가 일치한다. 후속 전체 CI는 PR의 해당 head 결과를 확인한다.
+
+- C14는 `445d667` 상태에서 재현했다. 폼 상단 406pt가 카메라 중앙 조준 영역을 비우는 최소 469pt보다 위에 있어 UI 검사가 실패했다. 증거: `RegistrationAimReproduction.xcresult`, `registration-aim-reproduction.log`. 수정 후 등록 UI 전체와 검색/등록 접근성 회귀 6개가 `RegistrationAimFixed.xcresult` / `registration-aim-fixed.log`에서 모두 통과했다. iPhone SE 3세대 전용 Simulator의 `RegistrationAimCompact.xcresult`에서도 최대 글자 접근성과 일반/최대 글자·키보드 완료 후 조준 여백 검사 2개가 통과했다. 두 화면 크기의 실제 캡처에서 중앙 노란 조준 표시가 폼에 가리지 않고 보임을 확인했다. 증거 캡처: `registration-aim-fixed-captures/`, `registration-aim-compact-captures/`. 이는 실제 카메라 측정 정확도 검증을 대체하지 않는다.
 
 ## 남은 게이트
 

@@ -36,93 +36,95 @@ struct UserObjectRegistrationOverlay: View {
             .allowsHitTesting(false)
             .accessibilityHidden(true)
 
-            VStack {
-                HStack {
-                    Text("물체 위치 직접 기억").font(.headline)
-                    Spacer()
-                    Button(action: onClose) {
-                        Text("닫기")
-                            .frame(minWidth: 44, minHeight: 44)
-                            .contentShape(Rectangle())
+            GeometryReader { geometry in
+                VStack {
+                    HStack {
+                        Text("물체 위치 직접 기억").font(.headline)
+                        Spacer()
+                        Button(action: onClose) {
+                            Text("닫기")
+                                .frame(minWidth: 44, minHeight: 44)
+                                .contentShape(Rectangle())
+                        }
+                            .accessibilityIdentifier("vispace.registration.close")
                     }
-                        .accessibilityIdentifier("vispace.registration.close")
-                }
-                .padding()
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
-                Spacer()
-                ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text(message).font(.callout)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .accessibilityIdentifier("vispace.registration.status")
-                    if case .saved(let metadata) = controller.state {
-                        Button("기억한 위치 검색") {
-                            onSearch(metadata.object.displayName ?? name)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        Button("기존 물체 위치 바꾸기") { showsExistingObjects = true }
-                            .accessibilityIdentifier("vispace.registration.choose-existing")
-                        if let message = controller.spatialRefreshMessage {
-                            Text(message).font(.callout)
-                            Button("주변 물체 정보 다시 확인") {
-                                controller.refreshSpatialRelationships()
-                            }
-                            .accessibilityIdentifier("vispace.registration.refresh")
-                        }
-                    } else {
-                        if !isBusy && !controller.canRetrySave {
-                            Button("기존 물체 위치 바꾸기") {
-                                editsName = false
-                                showsExistingObjects = true
-                            }
-                            .accessibilityIdentifier("vispace.registration.choose-existing")
-                            if let selectedObject {
-                                Text("선택한 기록: \(selectedObject.object.displayLabel)")
-                                    .font(.subheadline.weight(.semibold))
-                                Text("마지막 확인 \(Date(timeIntervalSince1970: selectedObject.object.lastSeenAt).formatted(date: .abbreviated, time: .shortened))")
-                                    .font(.caption)
-                                Button("다른 새 물체로 등록") {
-                                    controller.cancel()
-                                    self.selectedObject = nil
-                                }
-                                .accessibilityIdentifier("vispace.registration.choose-new")
-                            }
-                        }
-                        TextField("물체 이름 (예: 내 스피커)", text: $name)
-                            .textFieldStyle(.roundedBorder)
-                            .textInputAutocapitalization(.never)
-                            .focused($editsName)
-                            .submitLabel(.done)
-                            .onSubmit { editsName = false }
-                            .disabled(isBusy || controller.canRetrySave || selectedObject != nil)
-                            .accessibilityIdentifier("vispace.registration.name")
-                        if isBusy {
-                            HStack {
-                                ProgressView()
-                                Text("같은 물체를 계속 비춰 주세요")
-                            }
-                        } else {
-                            Button(controller.canRetrySave ? "저장 다시 시도"
-                                : (selectedObject == nil ? "현재 위치 기억" : "선택한 물체 위치 바꾸기")) {
-                                editsName = false
-                                if controller.canRetrySave { controller.retrySave() }
-                                else { controller.start(name: name, replacing: selectedObject) }
+                    .padding()
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    Spacer()
+                    ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(message).font(.callout)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("vispace.registration.status")
+                        if case .saved(let metadata) = controller.state {
+                            Button("기억한 위치 검색") {
+                                onSearch(metadata.object.displayName ?? name)
                             }
                             .buttonStyle(.borderedProminent)
-                            .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                            .accessibilityIdentifier("vispace.registration.capture")
+                            Button("기존 물체 위치 바꾸기") { showsExistingObjects = true }
+                                .accessibilityIdentifier("vispace.registration.choose-existing")
+                            if let message = controller.spatialRefreshMessage {
+                                Text(message).font(.callout)
+                                Button("주변 물체 정보 다시 확인") {
+                                    controller.refreshSpatialRelationships()
+                                }
+                                .accessibilityIdentifier("vispace.registration.refresh")
+                            }
+                        } else {
+                            if !isBusy && !controller.canRetrySave {
+                                Button("기존 물체 위치 바꾸기") {
+                                    editsName = false
+                                    showsExistingObjects = true
+                                }
+                                .accessibilityIdentifier("vispace.registration.choose-existing")
+                                if let selectedObject {
+                                    Text("선택한 기록: \(selectedObject.object.displayLabel)")
+                                        .font(.subheadline.weight(.semibold))
+                                    Text("마지막 확인 \(Date(timeIntervalSince1970: selectedObject.object.lastSeenAt).formatted(date: .abbreviated, time: .shortened))")
+                                        .font(.caption)
+                                    Button("다른 새 물체로 등록") {
+                                        controller.cancel()
+                                        self.selectedObject = nil
+                                    }
+                                    .accessibilityIdentifier("vispace.registration.choose-new")
+                                }
+                            }
+                            TextField("물체 이름 (예: 내 스피커)", text: $name)
+                                .textFieldStyle(.roundedBorder)
+                                .textInputAutocapitalization(.never)
+                                .focused($editsName)
+                                .submitLabel(.done)
+                                .onSubmit { editsName = false }
+                                .disabled(isBusy || controller.canRetrySave || selectedObject != nil)
+                                .accessibilityIdentifier("vispace.registration.name")
+                            if isBusy {
+                                HStack {
+                                    ProgressView()
+                                    Text("같은 물체를 계속 비춰 주세요")
+                                }
+                            } else {
+                                Button(controller.canRetrySave ? "저장 다시 시도"
+                                    : (selectedObject == nil ? "현재 위치 기억" : "선택한 물체 위치 바꾸기")) {
+                                    editsName = false
+                                    if controller.canRetrySave { controller.retrySave() }
+                                    else { controller.start(name: name, replacing: selectedObject) }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                .accessibilityIdentifier("vispace.registration.capture")
+                            }
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+                    }
+                    .frame(maxHeight: maximumFormHeight(in: geometry))
+                    .scrollDismissesKeyboard(.interactively)
+                    .accessibilityIdentifier("vispace.registration.form")
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding()
-                }
-                .frame(maxHeight: 420)
-                .scrollDismissesKeyboard(.interactively)
-                .accessibilityIdentifier("vispace.registration.form")
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                .padding(14)
             }
-            .padding(14)
         }
         .sheet(isPresented: $showsExistingObjects) {
             UserRegisteredObjectPicker(controller: controller, distanceDescription: distanceDescription) { selected in
@@ -132,6 +134,15 @@ struct UserObjectRegistrationOverlay: View {
                 showsExistingObjects = false
             }
         }
+    }
+
+    private func maximumFormHeight(in geometry: GeometryProxy) -> CGFloat {
+        if editsName { return 420 }
+        // Controls respect safe areas; the aiming point uses the full AR viewport.
+        let cameraCenterY = (geometry.size.height - geometry.safeAreaInsets.top
+            + geometry.safeAreaInsets.bottom) / 2
+        let spaceBelowAim = geometry.size.height - 14 - cameraCenterY - 44
+        return max(44, min(420, spaceBelowAim))
     }
 
     private var isBusy: Bool {

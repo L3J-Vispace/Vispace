@@ -6,6 +6,37 @@ final class UserObjectRegistrationUITests: XCTestCase {
     }
 
     @MainActor
+    func testRegistrationFormLeavesCameraAimVisibleBeforeAndAfterNameEntry() throws {
+        for largestText in [false, true] {
+            let app = XCUIApplication()
+            app.launchArguments = [
+                "-AppleLanguages", "(ko)", "-AppleLocale", "ko_KR",
+                "-VispaceDisableARSession", "-VispaceSkipOnboarding",
+            ]
+            if largestText {
+                app.launchArguments += ["-UIPreferredContentSizeCategoryName",
+                                        "UICTContentSizeCategoryAccessibilityXXXL"]
+            }
+            app.launch()
+            let name = openRegistration(in: app)
+            let form = app.scrollViews["vispace.registration.form"]
+            let cameraCenterY = app.windows.firstMatch.frame.midY
+            let capture = XCTAttachment(screenshot: app.screenshot())
+            capture.name = "registration-aim-\(largestText ? "largest" : "standard")"
+            capture.lifetime = .keepAlways
+            add(capture)
+            XCTAssertGreaterThanOrEqual(form.frame.minY, cameraCenterY + 32,
+                                        "The form must leave the camera's central aiming region visible")
+            name.tap()
+            name.typeText("phone\n")
+            XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 3))
+            XCTAssertGreaterThanOrEqual(form.frame.minY, cameraCenterY + 32)
+            app.buttons["vispace.registration.close"].tap()
+            app.terminate()
+        }
+    }
+
+    @MainActor
     func testExistingObjectPickerCanBeOpenedAndCancelledWithoutCreatingARegistration() throws {
         let app = launchWithoutCameraEvidence()
         let name = openRegistration(in: app)
