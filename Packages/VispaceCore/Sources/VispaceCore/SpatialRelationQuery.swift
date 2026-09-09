@@ -184,6 +184,9 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
         guard let predicate = detectedPredicate(in: utterance, excluding: targets) else { return nil }
         let labels = targets.map(\.mention)
         guard (1...2).contains(labels.count) else { return nil }
+        if labels.count == 1, !isListReference(in: utterance, predicate: predicate, targets: targets) {
+            return nil
+        }
         if labels.count == 2,
             resolvedRoles(in: utterance, predicate: predicate, targets: targets) == nil
         {
@@ -266,6 +269,11 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
                 graph: graph,
                 at: currentTime
             )
+        }
+        guard isListReference(in: utterance, predicate: predicate, targets: targets) else {
+            return emptyResult(
+                mode: .listRelatedObjects, predicate: predicate, status: .unsupported,
+                issue: .unresolvedRelationRoles)
         }
         return listRelated(
             predicate: predicate,
@@ -519,23 +527,19 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
     private func detectedPredicate(
         in utterance: String, excluding targets: [GroundedRelationTarget]
     ) -> SpatialRelationPredicate? {
-        relationSignals(in: utterance, excluding: targets).first?.predicate
+        let signals = relationSignals(in: utterance, excluding: targets)
+        // A one-reference list request has no later role-resolution step.
+        // Reject compound relations here too, instead of picking a predicate
+        // by vocabulary order and answering only part of the user's question.
+        guard targets.count != 1 || signals.count == 1 else { return nil }
+        return signals.first?.predicate
     }
 
     private func relationSignals(
         in utterance: String, excluding targets: [GroundedRelationTarget]
     ) -> [RelationLanguageSignal] {
         let tokens = lexicalTokens(utterance)
-        let lexemes: [(SpatialRelationPredicate, [String])] = [
-            (.accessibleFrom, ["갈 수", "접근 가능", "accessible from", "reachable from"]),
-            (.connectedTo, ["연결", "연결돼", "연결되어", "connected to"]),
-            (.blocking, ["가로막고", "가로막아", "막고", "막아", "blocking", "blocks"]),
-            (.intersects, ["겹쳐", "겹치고", "intersects", "overlaps"]),
-            (.inside, ["안에", "내부", "inside"]),
-            (.under, ["아래", "밑에", "under", "below"]),
-            (.on, ["위에", "위의", "on top of", " on "]),
-            (.near, ["근처", "가까이", "주변", "near", "next to"]),
-        ]
+        let lexemes = SpatialRelationLanguage.lexemes
         var found: [RelationLanguageSignal] = []
         for (predicate, signals) in lexemes {
             for signal in signals {
@@ -574,6 +578,31 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
             return nil
         }
         if isSymmetric(predicate) { return (targets[0].mention, targets[1].mention) }
+        let references = referenceTargets(in: utterance, signal: signal, targets: targets)
+        guard references.count == 1, let reference = references.first,
+            let subject = targets.first(where: { $0.mention != reference.mention })
+        else { return nil }
+        return (subject.mention, reference.mention)
+    }
+
+    /// Listing incoming directional edges is valid only when the grounded
+    /// name is the reference. "What is the cup on?" cannot become "what is
+    /// on the cup?", including when the actual reference has no saved record.
+    private func isListReference(
+        in utterance: String, predicate: SpatialRelationPredicate, targets: [GroundedRelationTarget]
+    ) -> Bool {
+        guard targets.count == 1, targets[0].ranges.count == 1 else { return false }
+        let signals = relationSignals(in: utterance, excluding: targets)
+        guard signals.count == 1, let signal = signals.first, signal.predicate == predicate else {
+            return false
+        }
+        return isSymmetric(predicate)
+            || referenceTargets(in: utterance, signal: signal, targets: targets).count == 1
+    }
+
+    private func referenceTargets(
+        in utterance: String, signal: RelationLanguageSignal, targets: [GroundedRelationTarget]
+    ) -> [GroundedRelationTarget] {
         let tokens = lexicalTokens(utterance)
         func particle(_ target: GroundedRelationTarget) -> String? {
             guard let range = target.ranges.first, let last = lexicalTokens(target.mention).last else {
@@ -600,7 +629,7 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
                 }
             }
         } else {
-            switch predicate {
+            switch signal.predicate {
             case .on, .under, .inside:
                 references = targets.filter { target in
                     target.ranges.first?.upperBound == signal.range.lowerBound
@@ -609,19 +638,17 @@ public struct DeterministicSpatialRelationQueryEngine: Sendable {
             case .blocking:
                 references = targets.filter { ["을", "를"].contains(particle($0) ?? "") }
                 guard allNamesBeforeRelation,
-                    targets.contains(where: { ["이", "가", "은", "는"].contains(particle($0) ?? "") })
-                else { return nil }
+                    targets.count == 1
+                        || targets.contains(where: { ["이", "가", "은", "는"].contains(particle($0) ?? "") })
+                else { return [] }
             case .accessibleFrom:
                 references = targets.filter { ["에서", "에서는"].contains(particle($0) ?? "") }
-                guard allNamesBeforeRelation else { return nil }
+                guard allNamesBeforeRelation else { return [] }
             default:
-                return nil
+                return []
             }
         }
-        guard references.count == 1, let reference = references.first,
-            let subject = targets.first(where: { $0.mention != reference.mention })
-        else { return nil }
-        return (subject.mention, reference.mention)
+        return references
     }
 
     private func groundedMatch(

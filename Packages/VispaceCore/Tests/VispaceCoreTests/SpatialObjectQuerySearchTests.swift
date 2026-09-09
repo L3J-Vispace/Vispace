@@ -3,6 +3,55 @@ import XCTest
 @testable import VispaceCore
 
 final class SpatialObjectQuerySearchTests: XCTestCase {
+    func testPagesReachCandidatesBeyondSixtyFourWithoutResolvingAmbiguity() throws {
+        let records = try (0..<73).map { index in
+            record(try makeMetadata(id: objectID(80_000 + index), mapID: currentMapID,
+                frameID: currentFrameID, label: "cup", uncertainty: .highConfidenceDepth))
+        }
+        let result = DeterministicSpatialObjectSearchEngine().search(
+            utterance: "컵 찾아줘", records: records.reversed(), context: try context())
+        XCTAssertEqual(result.status, .ambiguous)
+        XCTAssertNil(result.selectedCandidate)
+        XCTAssertEqual(result.candidates.count, 8)
+        XCTAssertEqual(result.totalCandidateCount, 73)
+        let pages = stride(from: 0, to: result.totalCandidateCount, by: 8).flatMap {
+            result.candidatePage(startingAt: $0)
+        }
+        XCTAssertEqual(pages.map(\.record.metadata.object.id), records.map(\.metadata.object.id))
+        XCTAssertEqual(result.candidatePage(startingAt: 72).count, 1)
+        XCTAssertTrue(result.candidatePage(startingAt: -1).isEmpty)
+        XCTAssertTrue(result.candidatePage(startingAt: 73).isEmpty)
+        XCTAssertEqual(result.candidatePage(startingAt: 0, count: .max).count, 64)
+    }
+
+    func testRepeatedTermsKeepAllIdentitiesAndCancelDuringMatching() throws {
+        let records = try (0..<100).map { index in
+            record(try makeMetadata(id: objectID(81_000 + index), mapID: currentMapID,
+                frameID: currentFrameID, label: "cup", uncertainty: .highConfidenceDepth))
+        }
+        let utterance = String(repeating: "컵 ", count: 120) + "찾아줘"
+        XCTAssertLessThanOrEqual(utterance.count, SpatialCommandParser.maximumCharacters)
+        let engine = DeterministicSpatialObjectSearchEngine()
+        var checks = 0
+        let result = try engine.search(utterance: utterance, records: records, context: context(), checkCancellation: {
+            checks += 1
+        })
+        XCTAssertEqual(result.status, .ambiguous)
+        XCTAssertEqual(result.matchedSemanticLabels, ["cup"])
+        XCTAssertEqual(result.totalCandidateCount, 100)
+        XCTAssertLessThan(checks, 100_000, "Matching work must stay bounded for repeated terms and shared classes")
+        var cancellationChecks = 0
+        XCTAssertThrowsError(try engine.search(utterance: utterance, records: records, context: context(), checkCancellation: {
+            cancellationChecks += 1
+            if cancellationChecks == 1_000 { throw CancellationError() }
+        })) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(cancellationChecks, 1_000, "A cancelled search must stop before publishing a partial ranking")
+        let recovered = engine.search(utterance: utterance, records: records.reversed(), context: try context())
+        XCTAssertEqual(recovered, result)
+    }
+
     func testFutureObservationAndStateDatesCannotGroundOrGainJustSeenRecency() throws {
         let engine = DeterministicSpatialObjectSearchEngine()
         for observedAt in [90.0, 110.0] {
@@ -777,6 +826,34 @@ final class SpatialObjectQuerySearchTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? SpatialObjectSearchError, .invalidAmbiguityThreshold)
         }
+    }
+
+    func testPersistedNameWordsDoNotBecomeRelationOrHistoryInstructions() throws {
+        let engine = DeterministicSpatialObjectSearchEngine()
+        for name in ["주변 컵", "near cup", "마지막 컵", "route cup"] {
+            let item = try makeMetadata(id: objectID(59_100), mapID: currentMapID,
+                frameID: currentFrameID, label: "cup", uncertainty: .highConfidenceDepth,
+                displayName: name)
+            for query in [name, "find \(name)"] {
+                let result = engine.search(utterance: query, records: [record(item)], context: try context())
+                XCTAssertEqual(result.route.kind, .searchObject, query)
+                XCTAssertEqual(result.selectedCandidate?.record.metadata.object.id, item.object.id, query)
+                XCTAssertEqual(result.route.normalizedUtterance, query.lowercased())
+            }
+            let relation = engine.search(utterance: "what is near \(name)", records: [record(item)], context: try context())
+            XCTAssertEqual(relation.route.kind, .relationQuery)
+        }
+        let removed = try makeMetadata(id: objectID(59_101), mapID: currentMapID,
+            frameID: currentFrameID, label: "cup", presence: .removed,
+            uncertainty: .highConfidenceDepth, displayName: "마지막 컵")
+        let lookup = engine.search(utterance: "마지막 컵 찾아줘", records: [record(removed)],
+                                  context: try context(includeRemoved: true))
+        XCTAssertEqual(lookup.route.kind, .searchObject)
+        XCTAssertTrue(lookup.candidates.isEmpty)
+        let history = engine.search(utterance: "where was 마지막 컵", records: [record(removed)],
+                                   context: try context(includeRemoved: true))
+        XCTAssertEqual(history.route.kind, .lastSeen)
+        XCTAssertEqual(history.candidates.first?.record.metadata.object.id, removed.object.id)
     }
 
     private func context(includeRemoved: Bool = false) throws -> SpatialObjectSearchContext {

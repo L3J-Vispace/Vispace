@@ -153,7 +153,20 @@ public struct SpatialObjectSearchResult: Hashable, Sendable {
     public let status: SpatialObjectSearchStatus
     public let matchedSemanticLabels: [String]
     public let candidates: [GroundedSpatialObjectCandidate]
+    /// Ranking is retained so every stored candidate remains reachable. The
+    /// initial page stays bounded by policy and never decides ambiguity.
+    private let remainingCandidates: [GroundedSpatialObjectCandidate]
     public let issues: [SpatialObjectSearchIssue]
+
+    public var totalCandidateCount: Int { candidates.count + remainingCandidates.count }
+
+    public func candidatePage(startingAt offset: Int, count: Int = 8) -> [GroundedSpatialObjectCandidate] {
+        guard offset >= 0, offset < totalCandidateCount, count > 0 else { return [] }
+        let end = min(totalCandidateCount, offset + min(count, SpatialObjectSearchPolicy.maximumAllowedResultCount))
+        return (offset..<end).map { index in
+            index < candidates.count ? candidates[index] : remainingCandidates[index - candidates.count]
+        }
+    }
 
     /// Only a resolved identity above the confidence floor exposes a candidate.
     /// The controller may also resolve ambiguity through an explicit user choice.
@@ -179,12 +192,14 @@ public struct SpatialObjectSearchResult: Hashable, Sendable {
         status: SpatialObjectSearchStatus,
         matchedSemanticLabels: [String],
         candidates: [GroundedSpatialObjectCandidate],
-        issues: [SpatialObjectSearchIssue]
+        issues: [SpatialObjectSearchIssue],
+        remainingCandidates: [GroundedSpatialObjectCandidate] = []
     ) {
         self.route = route
         self.status = status
         self.matchedSemanticLabels = matchedSemanticLabels
         self.candidates = candidates
+        self.remainingCandidates = remainingCandidates
         self.issues = issues
     }
 }
@@ -220,9 +235,35 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
         records: [StoredSpatialObjectRecord],
         context: SpatialObjectSearchContext
     ) -> SpatialObjectSearchResult {
-        let termMatches = semanticMatches(in: utterance, records: records)
+        // The synchronous API has no cancellation source. Async coordinators
+        // use the throwing overload and propagate cancellation to their worker.
+        search(utterance: utterance, records: records, context: context, checkCancellation: {})
+    }
+
+    public func search(
+        utterance: String,
+        records: [StoredSpatialObjectRecord],
+        context: SpatialObjectSearchContext,
+        checkCancellation: () throws -> Void
+    ) rethrows -> SpatialObjectSearchResult {
+        try checkCancellation()
+        let termMatches = try semanticMatches(in: utterance, records: records, checkCancellation: checkCancellation)
         let canonicalLabels = canonicalLabels(from: termMatches)
-        let initialRoute = intentRouter.route(utterance)
+        let tokens = lexicalTokens(utterance)
+        // A word in a persisted object's name is identity, not an instruction.
+        // Keep placeholders so masking cannot join unrelated words into a signal.
+        var namedTokenIndices: Set<Int> = []
+        for match in termMatches where match.objectID != nil {
+            try checkCancellation()
+            namedTokenIndices.formUnion(match.range)
+        }
+        let intentText = tokens.enumerated().map { index, token in
+            namedTokenIndices.contains(index) ? "__object__" : token
+        }.joined(separator: " ")
+        let namedRoute = intentRouter.route(intentText)
+        let initialRoute = namedTokenIndices.isEmpty ? intentRouter.route(utterance) : IntentRoute(
+            kind: namedRoute.kind, normalizedUtterance: normalizeText(utterance),
+            matchedSignals: namedRoute.matchedSignals, requiresLLM: namedRoute.requiresLLM)
         let route = routeForBareSemanticLabelIfNeeded(
             initialRoute,
             utterance: utterance,
@@ -250,15 +291,19 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
         }
 
         let matchingIDs = Set(termMatches.compactMap(\.objectID))
-        let matchingRecords = records.filter { record in
-            matchingIDs.contains(record.metadata.object.id)
+        let matchingRecords = try records.filter { record in
+            try checkCancellation()
+            return matchingIDs.contains(record.metadata.object.id)
                 && record.metadata.object.certainty == .confirmed
-                && (context.includeRemoved || record.metadata.object.presence != .removed)
+                && ((context.includeRemoved && route.kind == .lastSeen)
+                    || record.metadata.object.presence != .removed)
         }
         var ranked = matchingRecords.map { rankedCandidate(for: $0, context: context) }
         ranked.sort(by: ranksBefore)
+        try checkCancellation()
         ranked = deduplicatingObjectIDs(ranked)
         let candidates = Array(ranked.prefix(policy.maximumResultCount).map(\.candidate))
+        let remaining = Array(ranked.dropFirst(policy.maximumResultCount).map(\.candidate))
 
         if canonicalLabels.count > 1 {
             return SpatialObjectSearchResult(
@@ -266,7 +311,7 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
                 status: .ambiguous,
                 matchedSemanticLabels: canonicalLabels,
                 candidates: candidates,
-                issues: [.multipleSemanticTargets]
+                issues: [.multipleSemanticTargets], remainingCandidates: remaining
             )
         }
 
@@ -300,7 +345,7 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
                 status: .ambiguous,
                 matchedSemanticLabels: canonicalLabels,
                 candidates: candidates,
-                issues: issues
+                issues: issues, remainingCandidates: remaining
             )
         }
 
@@ -312,7 +357,7 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
                 candidates: candidates,
                 issues: ranked[0].candidate.hasFutureObservationTime
                     ? [.groundedPositionLowConfidence, .observationTimeInFuture]
-                    : [.groundedPositionLowConfidence]
+                    : [.groundedPositionLowConfidence], remainingCandidates: remaining
             )
         }
 
@@ -321,7 +366,7 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
             status: .found,
             matchedSemanticLabels: canonicalLabels,
             candidates: candidates,
-            issues: []
+            issues: [], remainingCandidates: remaining
         )
     }
 
@@ -540,82 +585,101 @@ public struct DeterministicSpatialObjectSearchEngine: Sendable {
 
     private func semanticMatches(
         in utterance: String,
-        records: [StoredSpatialObjectRecord]
-    ) -> [SemanticTermMatch] {
+        records: [StoredSpatialObjectRecord],
+        checkCancellation: () throws -> Void
+    ) rethrows -> [SemanticTermMatch] {
         let queryTokens = lexicalTokens(utterance)
         guard !queryTokens.isEmpty else {
             return []
         }
 
-        var matches: [SemanticTermMatch] = []
+        // Match each unique term once, independently of the number of records
+        // carrying it. Keep identities attached to terms until span precedence
+        // is settled; repeated words must not cause pairwise object comparisons.
+        var targetsByTerm: [String: Set<SemanticTermTarget>] = [:]
         for record in records {
+            try checkCancellation()
             let label = searchLabel(for: record.metadata.object)
             let canonicalLabel = normalizeLabel(label)
             let terms = [label] + record.semanticAliases
                 + ObjectSemanticCatalog.default.aliases(for: label)
                 + [record.metadata.object.displayName].compactMap { $0 }
             for term in Set(terms.map(normalizeLabel)).sorted() {
-                let termTokens = lexicalTokens(term)
-                guard !termTokens.isEmpty, termTokens.count <= queryTokens.count else {
-                    continue
-                }
-                for start in 0...(queryTokens.count - termTokens.count) {
-                    let range = start..<(start + termTokens.count)
-                    guard tokensMatch(query: Array(queryTokens[range]), term: termTokens) else {
-                        continue
-                    }
-                    matches.append(
-                        SemanticTermMatch(
-                            canonicalLabel: canonicalLabel,
-                            objectID: record.metadata.object.id,
-                            range: range,
-                            specificity: termTokens.count
-                        )
-                    )
-                }
+                targetsByTerm[term, default: []].insert(SemanticTermTarget(
+                    canonicalLabel: canonicalLabel, objectID: record.metadata.object.id))
             }
         }
 
-        // Understanding an object name must not depend on having seen it before.
-        // Vocabulary matches deliberately carry no object identity or coordinate.
-        // A stored custom name wins over a dictionary term at the same range.
-        let storedMatches = matches
+        var storedByRange: [Range<Int>: Set<SemanticTermTarget>] = [:]
+        for term in targetsByTerm.keys.sorted() {
+            for range in try matchingRanges(term: term, tokens: queryTokens, checkCancellation: checkCancellation) {
+                storedByRange[range, default: []].formUnion(targetsByTerm[term] ?? [])
+            }
+        }
+        // A custom stored name takes precedence over vocabulary at exactly the
+        // same span. Dictionary knowledge never supplies an object identity.
+        var vocabularyByTerm: [String: Set<SemanticTermTarget>] = [:]
         for entry in ObjectSemanticCatalog.default.entries {
+            try checkCancellation()
             for term in Set(entry.searchTerms.map(normalizeLabel)).sorted() {
-                let termTokens = lexicalTokens(term)
-                guard !termTokens.isEmpty, termTokens.count <= queryTokens.count else { continue }
-                for start in 0...(queryTokens.count - termTokens.count) {
-                    let range = start..<(start + termTokens.count)
-                    guard tokensMatch(query: Array(queryTokens[range]), term: termTokens),
-                        !storedMatches.contains(where: { $0.range == range })
-                    else { continue }
-                    matches.append(SemanticTermMatch(
-                        canonicalLabel: entry.canonicalLabel, objectID: nil,
-                        range: range, specificity: termTokens.count))
-                }
+                vocabularyByTerm[term, default: []].insert(SemanticTermTarget(
+                    canonicalLabel: entry.canonicalLabel, objectID: nil))
+            }
+        }
+        var targetsByRange = storedByRange
+        for term in vocabularyByTerm.keys.sorted() {
+            for range in try matchingRanges(term: term, tokens: queryTokens, checkCancellation: checkCancellation)
+                where storedByRange[range] == nil {
+                targetsByRange[range, default: []].formUnion(vocabularyByTerm[term] ?? [])
             }
         }
 
-        let unshadowed = matches.filter { match in
-            !matches.contains { other in
-                other.specificity > match.specificity
-                    && other.range.lowerBound <= match.range.lowerBound
-                    && other.range.upperBound >= match.range.upperBound
+        // With starts ascending and ends descending, a preceding span contains
+        // this distinct span iff its furthest end reaches this end. This sweep
+        // replaces the former O(matches²) containment scan.
+        let ranges = targetsByRange.keys.sorted {
+            $0.lowerBound != $1.lowerBound ? $0.lowerBound < $1.lowerBound : $0.upperBound > $1.upperBound
+        }
+        var furthestEnd = -1
+        var matches: [SemanticTermMatch] = []
+        for range in ranges {
+            try checkCancellation()
+            guard range.upperBound > furthestEnd else { continue }
+            furthestEnd = range.upperBound
+            for target in targetsByRange[range] ?? [] {
+                try checkCancellation()
+                matches.append(SemanticTermMatch(canonicalLabel: target.canonicalLabel,
+                    objectID: target.objectID, range: range, specificity: range.count))
             }
         }
-        return Array(Set(unshadowed)).sorted { lhs, rhs in
+        return matches.sorted { lhs, rhs in
             if lhs.range.lowerBound != rhs.range.lowerBound {
                 return lhs.range.lowerBound < rhs.range.lowerBound
             }
             if lhs.specificity != rhs.specificity {
                 return lhs.specificity > rhs.specificity
             }
-            return lhs.canonicalLabel < rhs.canonicalLabel
+            if lhs.canonicalLabel != rhs.canonicalLabel { return lhs.canonicalLabel < rhs.canonicalLabel }
+            return (lhs.objectID?.description ?? "") < (rhs.objectID?.description ?? "")
         }
     }
 
+    private func matchingRanges(term: String, tokens: [String], checkCancellation: () throws -> Void) rethrows -> [Range<Int>] {
+        try checkCancellation()
+        let termTokens = lexicalTokens(term)
+        guard !termTokens.isEmpty, termTokens.count <= tokens.count else { return [] }
+        var result: [Range<Int>] = []
+        for start in 0...(tokens.count - termTokens.count) {
+            try checkCancellation()
+            let range = start..<(start + termTokens.count)
+            if tokensMatch(query: Array(tokens[range]), term: termTokens) { result.append(range) }
+        }
+        return result
+    }
+
     private func canonicalLabels(from matches: [SemanticTermMatch]) -> [String] {
-        Array(Set(matches.map { ObjectSemanticCatalog.default.canonicalLabel(for: $0.canonicalLabel) })).sorted()
+        let labels = Set(matches.map(\.canonicalLabel))
+        return Array(Set(labels.map { ObjectSemanticCatalog.default.canonicalLabel(for: $0) })).sorted()
     }
 
     private func searchLabel(for object: SpatialObject) -> String {
@@ -720,4 +784,9 @@ private struct SemanticTermMatch: Hashable, Sendable {
     let objectID: ObjectID?
     let range: Range<Int>
     let specificity: Int
+}
+
+private struct SemanticTermTarget: Hashable, Sendable {
+    let canonicalLabel: String
+    let objectID: ObjectID?
 }

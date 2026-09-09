@@ -5,6 +5,17 @@ import XCTest
 final class SpatialCommandParserTests: XCTestCase {
     private let parser = SpatialCommandParser()
 
+    func testSupportedRelationPhrasesReachTheRelationEngine() {
+        for text in ["책상 근처에 뭐가 있어?", "책상 주변에 뭐가 있어?", "컵과 책상이 겹쳐?",
+                     "의자에서 책상으로 갈 수 있어?", "cup overlaps table", "table reachable from chair"] {
+            XCTAssertEqual(DeterministicIntentRouter().route(text).kind, .relationQuery, text)
+            XCTAssertEqual(parser.parse(text), .relationQuery(text), text)
+        }
+        for text in ["주변기기 찾아줘", "근처보관함 찾아줘", "겹쳐진상자 찾아줘", "overlapscase find"] {
+            XCTAssertEqual(parser.parse(text), .objectQuery(text), text)
+        }
+    }
+
     func testPlacementIsSpecificAndEnglishTokenBounded() {
         XCTAssertEqual(parser.parse("소파 놓으면 어때?"), .placement(.sofa))
         XCTAssertEqual(parser.parse("Can I place a bed here?"), .placement(.bed))

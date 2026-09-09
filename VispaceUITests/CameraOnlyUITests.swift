@@ -36,6 +36,56 @@ final class CameraOnlyUITests: XCTestCase {
     }
 
     @MainActor
+    func testQueryControlsHaveUsableTouchTargetsWithKeyboard() throws {
+        try verifyQueryControlTouchTargets(accessibilitySize: false)
+    }
+
+    @MainActor
+    func testQueryControlsRemainUsableAtLargestAccessibilitySize() throws {
+        try verifyQueryControlTouchTargets(accessibilitySize: true)
+    }
+
+    @MainActor
+    private func verifyQueryControlTouchTargets(accessibilitySize: Bool) throws {
+        let app = XCUIApplication()
+        app.launchArguments = [
+            "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
+            "-VispaceDisableARSession", "-VispaceSkipOnboarding",
+        ]
+        if accessibilitySize {
+            app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
+        }
+        app.launch()
+        let field = app.textFields["vispace.query.field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        field.tap()
+        field.typeText("phone")
+        let settings = app.buttons["vispace.data.settings"]
+        let menu = app.buttons["vispace.placement.menu"]
+        let submit = app.buttons["vispace.query.submit"]
+        XCTAssertTrue(submit.waitForExistence(timeout: 3))
+        for control in [settings, menu, submit] {
+            XCTAssertTrue(control.isHittable)
+            XCTAssertGreaterThanOrEqual(control.frame.width, 44)
+            XCTAssertGreaterThanOrEqual(control.frame.height, 44)
+            XCTAssertTrue(app.windows.firstMatch.frame.contains(control.frame))
+            XCTAssertFalse(control.frame.intersects(field.frame))
+        }
+        if accessibilitySize {
+            XCTAssertGreaterThanOrEqual(settings.frame.minY, field.frame.maxY)
+        }
+        // Tapping beyond the visible glyph exercises the expanded hit region.
+        submit.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.9)).tap()
+        XCTAssertTrue(app.otherElements["vispace.query.result"].waitForExistence(timeout: 5))
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = accessibilitySize ? "query-controls-accessibility-xxxl" : "query-controls-standard"
+        capture.lifetime = .keepAlways
+        add(capture)
+        settings.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.9)).tap()
+        XCTAssertTrue(app.navigationBars["Spatial Data"].waitForExistence(timeout: 5))
+    }
+
+    @MainActor
     func testCameraSurfaceKeepsFullScreenCaptureWithGroundedSearchControl() throws {
         let app = XCUIApplication()
         app.launchArguments = [

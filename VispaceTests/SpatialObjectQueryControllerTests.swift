@@ -6,6 +6,96 @@ import XCTest
 
 @MainActor
 final class SpatialObjectQueryControllerTests: XCTestCase {
+    func testPersistedNameLookupPrecedesRelationHandoff() async throws {
+        let map = mapID(1_300), frame = frameID(1_300)
+        let current = identity(mapID: map, frameID: frame)
+        let original = try metadata(id: objectID(1_300), mapID: map, frameID: frame, label: "cup")
+        var object = original.object
+        try object.setDisplayName("주변 컵")
+        let named = try SpatialObjectMetadata(mapID: map, object: object, position: original.position)
+        let value = snapshot(records: [record(named)])
+        let controller = SpatialObjectQueryController(snapshotProvider: { _ in value },
+            currentIdentityProvider: { current }, uptimeProvider: { 10 })
+        var relationQueries: [String] = []
+        controller.submit("주변 컵 찾아줘", now: 100, onRelationQuery: { relationQueries.append($0) })
+        try await waitForIdle(controller)
+        XCTAssertTrue(relationQueries.isEmpty)
+        XCTAssertEqual(controller.latestGroundedTarget?.objectID, named.object.id)
+        controller.submit("주변 컵 근처에 뭐가 있어?", now: 100, onRelationQuery: { relationQueries.append($0) })
+        try await waitForIdle(controller)
+        XCTAssertEqual(relationQueries, ["주변 컵 근처에 뭐가 있어?"])
+        XCTAssertNil(controller.latestPresentation)
+        XCTAssertNil(controller.latestGroundedTarget)
+        XCTAssertEqual(controller.state, .idle)
+    }
+
+    func testCancelledOrIncompatibleSnapshotCannotStartRelationHandoff() async throws {
+        for changesIdentity in [false, true] {
+            let map = mapID(1_301), frame = frameID(1_301)
+            let box = QueryIdentityBox(identity(mapID: map, frameID: frame))
+            let provider = SuspendedQuerySnapshotProvider()
+            let controller = SpatialObjectQueryController(
+                snapshotProvider: { try await provider.load(currentMapID: $0) },
+                currentIdentityProvider: { box.value }, uptimeProvider: { 10 })
+            var wasCalled = false
+            controller.submit("what is near cup", now: 100, onRelationQuery: { _ in wasCalled = true })
+            try await waitForRequestCount(provider, 1)
+            if changesIdentity {
+                box.value = identity(mapID: map, frameID: frameID(1_302))
+            } else {
+                controller.cancelCurrentQuery()
+            }
+            await provider.resume(requestIndex: 0, with: snapshot(records: []))
+            if changesIdentity { try await waitForIdle(controller) }
+            await controller.invalidateAndWaitForPendingWork()
+            XCTAssertFalse(wasCalled)
+            XCTAssertNil(controller.latestPresentation)
+            XCTAssertNil(controller.latestGroundedTarget)
+        }
+    }
+
+    func testLaterCandidatePagesRemainSelectableAndRereadBeforeGuidance() async throws {
+        let map = mapID(1_200), frame = frameID(1_200)
+        let current = identity(mapID: map, frameID: frame)
+        let identityBox = QueryIdentityBox(current)
+        let objects = try (0..<73).map { index in
+            try metadata(id: objectID(1_200 + index), mapID: map, frameID: frame,
+                label: "cup", position: vec(Double(index), 0, -2))
+        }
+        let value = snapshot(records: objects.map { record($0) })
+        let provider = SuspendedQuerySnapshotProvider()
+        let controller = SpatialObjectQueryController(
+            snapshotProvider: { try await provider.load(currentMapID: $0) },
+            currentIdentityProvider: { identityBox.value }, uptimeProvider: { 10 })
+        controller.submit("컵 찾아줘", now: 100)
+        try await waitForRequestCount(provider, 1)
+        await provider.resume(requestIndex: 0, with: value)
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.latestPresentation?.result.status, .ambiguous)
+        XCTAssertNil(controller.latestGroundedTarget)
+        XCTAssertEqual(controller.visibleCandidates.count, 8)
+        for _ in 0..<9 { controller.showCandidatePage(next: true) }
+        XCTAssertEqual(controller.candidatePageOffset, 72)
+        XCTAssertEqual(controller.visibleCandidates.map(\.record.metadata.object.id), [objects[72].object.id])
+        XCTAssertFalse(controller.canShowNextCandidatePage)
+        controller.showCandidatePage(next: true)
+        XCTAssertEqual(controller.candidatePageOffset, 72)
+        identityBox.value = identity(mapID: map, frameID: frameID(1_201))
+        controller.showCandidatePage(next: false)
+        controller.selectCandidate(objectID: objects[72].object.id, mapID: map, now: 101)
+        XCTAssertEqual(controller.candidatePageOffset, 72)
+        XCTAssertEqual(controller.metrics.requestsStarted, 1)
+        identityBox.value = current
+        controller.selectCandidate(objectID: objects[72].object.id, mapID: map, now: 101)
+        try await waitForRequestCount(provider, 2)
+        XCTAssertNil(controller.latestGroundedTarget)
+        await provider.resume(requestIndex: 1, with: value)
+        try await waitForIdle(controller)
+        XCTAssertEqual(controller.latestGroundedTarget?.objectID, objects[72].object.id)
+        XCTAssertEqual(controller.latestGroundedTarget?.position, objects[72].position.value)
+        XCTAssertEqual(controller.candidatePageOffset, 0)
+    }
+
     func testExpiredNavigationCanExplicitlyRefreshTheSameObjectAndCurrentAlignment() async throws {
         let sourceMap = mapID(1_170), sourceFrame = frameID(1_170)
         let map = mapID(1_171), frame = frameID(1_171)
