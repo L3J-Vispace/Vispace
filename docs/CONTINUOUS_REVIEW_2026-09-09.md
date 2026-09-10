@@ -33,7 +33,7 @@
 - 로컬 증거: `TestResults/continuous-review-20260909/`. 실행 중인 검사는 완료로 계산하지 않는다.
 - 검증한 소스는 기능별 커밋을 합친 `c093ab6`과 일치한다. 문서 수정은 실행 코드에 영향을 주지 않는다.
 - 새 전용 Simulator에 Release 앱을 새로 설치하고 Debug 인수 없이 실행했다. 첫 설명 화면을 캡처하고 동일 프로세스가 55초 후에도 실행 중임을 확인했다. 실제 카메라·방 검증은 아니다.
-- 실기기 시도는 코드 서명에서 `errSecInternalComponent`로 실패했다. 키체인 조회도 `User interaction is not allowed`로 거절됐다. iPhone 연결은 정상이나 이번 수정본의 실기기 테스트·설치는 실행되지 않았다. Mac 로그인 키체인/서명 키 접근 준비를 사용자에게 요청했다.
+- 초기 실기기 시도는 코드 서명에서 `errSecInternalComponent`로 실패했다. 키체인 조회도 `User interaction is not allowed`로 거절됐다. 당시 실기기 테스트·설치는 실행되지 않아 Mac 로그인 키체인/서명 키 접근 준비를 사용자에게 요청했다. 이후 해결 결과는 아래 2026-09-10 검증 기록에 구분한다.
 - C01–C11은 7개 커밋으로 [PR #7](https://github.com/L3J-Vispace/Vispace/pull/7)에 게시했다. 게시 커밋 `68088ca`의 [iOS CI 34303914465](https://github.com/L3J-Vispace/Vispace/actions/runs/34303914465)는 Core·전체 Simulator 643개 통과/2개 건너뜀·이력 회귀 5회 반복·Release·archive·정적 분석·결과 업로드까지 성공했다.
 - 같은 커밋의 [Core CI 34303913660](https://github.com/L3J-Vispace/Vispace/actions/runs/34303913660)는 실행 전 결제·사용 한도 차단이었다. 코드 테스트 실패와 구분한다. 후속 커밋의 CI는 PR의 최신 Checks에서 해당 head와 대조한다.
 - C12는 수정 전 영어 메뉴의 접근성 이름이 `물체 등록 및 가구 배치`로 반환되는 실패를 실제 UI 검사로 재현했다. 수정 후 전체 UI 18개가 모두 통과했고, 영어/한국어 메뉴 캡처에서 등록 항목과 가구 이름이 온전히 표시되는 것을 확인했다. 증거: `TestResults/localization-reproduction.log`, `TestResults/LocalizationUI.xcresult`, `TestResults/localization-captures-all/`. VoiceOver의 실제 음성 출력과 모든 결과 문장의 다국어 지원을 검사한 것은 아니다.
@@ -50,12 +50,19 @@
 - C15는 검색어가 패널의 독립 상태인 반면 등록 성공 콜백은 조회 컨트롤러만 갱신하는 경로에서 확인했다. 수정 후 `TestResults/query-draft.RRUipn/Tests.xcresult`는 렌더링 2개와 실제 UI 3개, 총 5개 통과/실패·건너뜀 0개로 종료했다. 새 검사는 실제 UITextField의 제거·복귀·외부 이름 반영과 조회 대상의 일치, 완료 결과의 버튼 픽셀을 확인한다. 기존 UI 검사는 검색→등록→취소와 최대 글자 접근성을 확인한다. 등록 저장 성공이나 성공 버튼의 실제 탭을 실행한 검사로 표현하지 않는다.
 - C15 검사 준비 중 `query-draft.cPUVha`는 UI 3개가 통과했지만 별도 창 렌더링 2개가 실패했다. 첫 캡처는 검은 화면이었고, 입력 검사는 SwiftUI 접근성 식별자가 UIKit의 UITextField에는 전달되지 않아 대상을 놓쳤다. `query-draft.Nx2pKQ`의 진단에서는 입력창에 실제 `phone`이 있었고 UIKit 식별자는 nil이었다. 고립된 패널의 유일한 입력창을 검사하도록 바로잡고 캡처 전에 활성 창·입력 뷰의 준비를 확인했다. 원래 픽셀 기준은 유지하며 최종 5개 검사에서 모두 통과했다. 진단 출력은 최종 코드에서 제거했다.
 
+### 2026-09-10 최신 검증 상태
+
+- C15까지 포함한 `736eaefbc9d5901b6d364ba63738778e0cc5ea10`의 [iOS CI 34421929937](https://github.com/L3J-Vispace/Vispace/actions/runs/34421929937)는 최종 성공했다. 전체 Simulator 649개 중 647개 통과/실기기 전용 2개 건너뜀/실패 0개, 장소 이력 회귀 5회 반복, Core·Debug·Release·리소스·unsigned archive·개인정보·정적 분석·결과 업로드가 모두 통과했다. 내려받은 artifact의 SHA-256이 GitHub digest와 일치하며 두 xcresult 요약을 확인했다. 증거: `TestResults/continuous-review-20260909/ios-ci-736eaef-summaries.json`.
+- 후속 문서 정정 커밋 `7c12c3f7ca943ffdf5524ae835e30e1b028dd713`은 Markdown 두 개만 변경하며 위 CI 기준과 앱·테스트·패키지·스크립트·빌드 설정·워크플로가 동일하다. 아래 Mac 빌드와 기기 시도는 해시를 확인해 전송한 이 소스를 사용했다. 이 검증 상태 갱신도 문서만 변경하며 앱 동작을 바꾸지 않는다.
+- Mac 로그인 세션에서 키체인을 잠금 해제한 뒤 복사한 테스트 지원 dylib의 실제 서명·검증과 원본 해시 보존을 확인했다. 동일 소스의 signed Debug `build-for-testing`과 별도 generic iOS signed Release 빌드는 모두 exit 0으로 성공했고, 생성 앱의 deep/strict 서명 검증을 통과했다. Release는 Apple anchor 검증과 대상 iPhone의 프로비저닝 포함도 확인했다. SSH는 별도 보안 세션이므로 후속 서명 작업은 준비된 GUI Terminal 도우미에서 실행한다. 비밀번호를 저장하거나 키체인 접근 정책을 변경하지 않았다. 증거: `TestResults/continuous-review-20260909/keychain-resolved-7c12c3f/`, `signed-release-7c12c3f/`.
+- iPhone 16 Pro / iOS 26.6.2 실기기 테스트는 완료하지 못했다. 초기 시도는 기기 잠금에 따른 개발자 디스크 이미지 준비 실패로 exit 70, 테스트 0개였다. 키체인 해결 후 GUI 시도는 테스트 시작 전에 기기가 다시 잠겼고, 사용자의 조작 불가 확인 뒤 잠금 대기 중인 해당 Xcode 프로세스만 중단했다(exit 73). native xcresult의 실패 1개는 `Vispace encountered an error / Testing was canceled`라는 취소 항목이며 실제 테스트 단언 실패가 아니다. 완료된 실기기 테스트는 없고, 취소 후 action log 저장이 끝나지 못한 제한도 남겼다. 별도 Release 빌드는 설치·실행하지 않았다. 증거: `TestResults/continuous-review-20260909/device-gui-attempt-AU41wL/`.
+- 실기기 전용 자동 검사 두 개는 합성 CVPixelBuffer의 Vision 특징 추출과 임시 저장 디렉터리의 실제 Data Protection 속성 확인이다. 실제 카메라 촬영이나 방 재인식, 전체 잠금 상태의 개인정보 보호 검수를 대신하지 않는다.
+
 ## 남은 게이트
 
-- `abdaa41`의 iOS CI와 C15의 관련 검사 5개는 통과했다. 같은 head의 [Core CI 34418552204](https://github.com/L3J-Vispace/Vispace/actions/runs/34418552204)는 계정 결제/사용 한도 문제로 실행 전에 차단됐다. C15 게시 커밋의 전체 CI는 PR의 head와 대조한다.
-
 - 실기기·현장 검수와 Core CI 계정 차단이 남아 PR은 Draft로 유지한다. 후속 수정마다 해당 커밋의 검증 결과를 확인한다.
-- 이번 수정본의 실기기 설치·실행 및 `DEVICE_ACCEPTANCE.md`의 실제 방, LiDAR/비 LiDAR, VoiceOver, 오차·열·메모리·배터리 측정. 11:23 KST 재조회에서 iPhone 16 Pro / iOS 26.6.1의 개발 서비스와 연결을 확인했다. 현재 남은 실행 전제는 Mac 서명 키 접근이다.
+- 현재 앱 코드에 대응하는 전체 iOS CI는 위와 같이 통과했다. 별도 문서 커밋 `7c12c3f`의 [Core CI 34424417571](https://github.com/L3J-Vispace/Vispace/actions/runs/34424417571)는 GitHub 계정 결제/사용 한도 문제로 작업 시작 전에 차단됐다. 코드 테스트 실패와 구분하며, 이후 PR head의 Checks는 그 커밋과 대조한다.
+- 이번 수정본의 실기기 설치·실행 및 [DEVICE_ACCEPTANCE.md](DEVICE_ACCEPTANCE.md)의 실제 방, LiDAR/비 LiDAR, VoiceOver, 오차·열·메모리·배터리 측정이 남아 있다. 사용자가 iPhone 조작 불가를 확인했으므로 잠금 해제 요청이나 실행을 반복하지 않는다. 사용 가능해지면 GUI Terminal 도우미에서 재개하고, 프로비저닝 유효성을 다시 확인해 필요한 경우 갱신·재빌드한다. 보존한 Release 프로파일의 확인 당시 만료 시각은 2026-09-11 03:42:18 UTC(한국 시간 12:42:18)다.
 - 저널의 삭제 상태가 메타데이터에 아직 반영되지 않은 기록은 정리에서 삭제하지 않는다. 일반 복구로 정확한 상태를 먼저 반영해야 한다. 실제 디스크에 원자적 교체용 최소 공간조차 없으면 정리도 실패할 수 있다.
 - 소스와 Simulator 통과를 현장 정확도·경로 안전성·배포 완료로 간주하지 않는다.
 
