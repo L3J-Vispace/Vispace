@@ -132,15 +132,10 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
                 meshes: [mesh]
             )
 
-            XCTAssertEqual(
-                try unwrapIssue(
-                    ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
-                        snapshot,
-                        currentIdentity: context.identity
-                    )
-                ),
-                .coverageAttestationUnavailable
-            )
+            let evidence = try unwrapReady(ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
+                snapshot, currentIdentity: context.identity))
+            XCTAssertTrue(evidence.mesh.allSatisfy { $0.occupancy == .blocked })
+            XCTAssertNil(try routeFromCurrentFootprint(evidence: evidence, identity: context.identity).path)
         }
     }
 
@@ -155,11 +150,79 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
                 planes: [floorPlane(), verticalPlane(classification: classification)]
             )
 
-            XCTAssertEqual(
-                try unwrapIssue(builder.adaptStaticGeometry(snapshot, currentIdentity: context.identity)),
-                .coverageAttestationUnavailable
-            )
+            let evidence = try unwrapReady(builder.adaptStaticGeometry(snapshot, currentIdentity: context.identity))
+            XCTAssertTrue(evidence.mesh.contains { $0.occupancy == .blocked })
+            XCTAssertNil(try routeFromCurrentFootprint(evidence: evidence, identity: context.identity).path)
         }
+    }
+
+    func testUnrelatedUnclassifiedSurfacesDoNotDenyDepthVerifiedLocalRoute() throws {
+        let context = makeContext()
+        let current = try depthFrame(identity: context.identity, timestamp: 10, cameraZ: 0.25, meters: 5)
+        let previous = try depthFrame(identity: context.identity, timestamp: 9, cameraZ: 3, meters: 5)
+        for classification in [ARMeshClassificationSnapshot.none, .unknown] {
+            let snapshot = surface(mapID: context.mapID, frameID: context.frameID,
+                segmentID: context.segmentID,
+                planes: [floorPlane(), shiftedUnknownPlane(x: 5)],
+                meshes: [denseFloorMesh(), unclassifiedMesh(classification: classification, x: 5)])
+            let evidence = try unwrapReady(ARVerifiedNavigationEvidenceBuilder().adapt(
+                snapshot, currentIdentity: context.identity, currentDepthFrame: current,
+                recentDepthFrames: [try XCTUnwrap(ARNavigationDepthFrame(previous))]))
+            XCTAssertEqual(try routeFromCurrentFootprint(evidence: evidence, identity: context.identity).status,
+                           .success)
+        }
+    }
+
+    func testDepthCannotClearUnclassifiedFootprintIntersectingRoute() throws {
+        let context = makeContext()
+        let current = try depthFrame(identity: context.identity, timestamp: 10, cameraZ: 0.25, meters: 5)
+        let previous = try depthFrame(identity: context.identity, timestamp: 9, cameraZ: 3, meters: 5)
+        for classification in [ARMeshClassificationSnapshot.none, .unknown] {
+            let snapshot = surface(mapID: context.mapID, frameID: context.frameID,
+                segmentID: context.segmentID,
+                meshes: [denseFloorMesh(), unclassifiedMesh(classification: classification, x: 0)])
+            let evidence = try unwrapReady(ARVerifiedNavigationEvidenceBuilder().adapt(
+                snapshot, currentIdentity: context.identity, currentDepthFrame: current,
+                recentDepthFrames: [try XCTUnwrap(ARNavigationDepthFrame(previous))]))
+            XCTAssertTrue(evidence.mesh.contains { $0.occupancy == .blocked })
+            XCTAssertNil(try routeFromCurrentFootprint(evidence: evidence, identity: context.identity).path)
+        }
+    }
+
+    func testUnclassifiedGeometryStillRequiresActualFreshAnchorEvidence() throws {
+        let context = makeContext()
+        let unknown = unclassifiedMesh(classification: .unknown, x: 0)
+        let original = surface(mapID: context.mapID, frameID: context.frameID,
+            segmentID: context.segmentID, meshes: [denseFloorMesh(), unknown])
+        let observationTimes: [TimeInterval?] = [4, nil]
+        for observedAt in observationTimes {
+            var observations = original.anchorObservedAt
+            observations[unknown.anchorID] = observedAt
+            let snapshot = ARSurfaceStateSnapshot(
+                coordinateFrameID: original.coordinateFrameID, segmentID: original.segmentID,
+                mapID: original.mapID, coordinateFrameStatus: original.coordinateFrameStatus,
+                revision: original.revision, timestamp: original.timestamp,
+                planes: original.planes, meshes: original.meshes, unresolvedFailures: [],
+                isCurrentSessionData: true, anchorObservedAt: observations)
+            XCTAssertEqual(try unwrapIssue(ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
+                snapshot, currentIdentity: context.identity)), .surfaceObservationStale)
+        }
+    }
+
+    func testUnclassifiedGeometryWithMalformedBoundsStillFailsClosed() throws {
+        let context = makeContext()
+        for invalidX in [Float.nan, Float.greatestFiniteMagnitude] {
+            let snapshot = surface(mapID: context.mapID, frameID: context.frameID,
+                segmentID: context.segmentID,
+                meshes: [denseFloorMesh(), unclassifiedMesh(classification: .unknown, x: invalidX)])
+            XCTAssertEqual(try unwrapIssue(ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
+                snapshot, currentIdentity: context.identity)), .coverageAttestationUnavailable)
+        }
+        let invalidPlane = shiftedUnknownPlane(x: .nan)
+        let snapshot = surface(mapID: context.mapID, frameID: context.frameID,
+            segmentID: context.segmentID, planes: [floorPlane(), invalidPlane])
+        XCTAssertEqual(try unwrapIssue(ARVerifiedNavigationEvidenceBuilder().adaptStaticGeometry(
+            snapshot, currentIdentity: context.identity)), .coverageAttestationUnavailable)
     }
 
     func testSparseFloorAndMissingFloorPlaneFailClosed() throws {
@@ -850,6 +913,25 @@ final class ARVerifiedNavigationEvidenceBuilderTests: XCTestCase {
         case .door: return 7
         case .unknown: return 8
         }
+    }
+
+    private func shiftedUnknownPlane(x: Float) -> ARPlaneObservationSnapshot {
+        let original = verticalPlane(classification: .unknown)
+        var transform = original.transform.simdValue
+        transform.columns.3.x = x
+        return ARPlaneObservationSnapshot(anchorID: original.anchorID,
+            transform: Matrix4x4Snapshot(transform), center: original.center, extent: original.extent,
+            extentRotationOnYAxis: original.extentRotationOnYAxis,
+            boundaryVertices: original.boundaryVertices, alignment: original.alignment,
+            classification: original.classification)
+    }
+
+    private func unclassifiedMesh(
+        classification: ARMeshClassificationSnapshot, x: Float
+    ) -> ARMeshObservationSnapshot {
+        mesh(id: uuid(10_100), vertices: [
+            SIMD3<Float>(x, 0, -1), SIMD3<Float>(x, 2, -1), SIMD3<Float>(x, 2, 1),
+        ], indices: [0, 1, 2], classifications: [classification])
     }
 
     private func denseFloorMesh(

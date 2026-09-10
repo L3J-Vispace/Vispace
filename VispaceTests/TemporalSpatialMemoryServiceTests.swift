@@ -4,6 +4,209 @@ import XCTest
 @testable import Vispace
 
 final class TemporalSpatialMemoryServiceTests: XCTestCase {
+    func testReclamationAtQuotaDoesNotRequireFailedProjectionReplayBeforeOrAfterRestart() async throws {
+        for restart in [false, true] {
+            let root = temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let mapID = temporalTestMapID(125), frameID = temporalTestFrameID(125)
+            let removedID = temporalTestObjectID(125), liveID = temporalTestObjectID(126)
+            let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+                maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)]))
+            let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+            func service() -> TemporalSpatialMemoryService {
+                TemporalSpatialMemoryService(journalRepository: journal,
+                    policy: temporalTestPolicy(), metadataProvider: { try await store.snapshot() },
+                    metadataWriter: { try await store.upsert($0) },
+                    metadataRemover: { try await store.removeMatching($0) })
+            }
+            let active = service()
+            _ = try await active.process(TemporalSpatialRecognitionBatch(sequence: 1,
+                observations: [removedID, liveID].map { temporalTestNewObservation(
+                    mapID: mapID, coordinateFrameID: frameID, objectID: $0, at: 100) },
+                expectedVisibleObjectIDs: []),
+                pose: temporalTestPose(mapID: mapID, coordinateFrameID: frameID,
+                    capturedAt: 100, sessionTimestamp: 1, sequence: 1))
+            for sequence in UInt64(2)...4 {
+                _ = try await active.process(TemporalSpatialRecognitionBatch(sequence: sequence,
+                    observations: [], expectedVisibleObjectIDs: [removedID]),
+                    pose: temporalTestPose(mapID: mapID, coordinateFrameID: frameID,
+                        capturedAt: 99 + Double(sequence), sessionTimestamp: Double(sequence), sequence: sequence))
+            }
+            let beforeRemovalObjects = await store.allObjects()
+            // Metadata publication succeeds, but its downstream projection fails.
+            await store.failAfterNextWrites(1)
+            do {
+                _ = try await active.process(TemporalSpatialRecognitionBatch(sequence: 5,
+                    observations: [], expectedVisibleObjectIDs: [removedID]),
+                    pose: temporalTestPose(mapID: mapID, coordinateFrameID: frameID,
+                        capturedAt: 104, sessionTimestamp: 5, sequence: 5))
+                XCTFail("Expected a committed journal with a pending projection")
+            } catch TemporalSpatialMemoryServiceError.committedJournalProjectionPending {}
+            let before = try await journal.recover(mapID: mapID, coordinateFrameID: frameID)
+            XCTAssertEqual(before?.snapshot.metadata(for: removedID)?.object.presence, .removed)
+            // If metadata itself was never updated, it must not be deleted just
+            // because the journal is newer. Preserve the exact-match boundary.
+            let staleStore = TemporalMetadataStore(document: SpatialMetadataDocument(
+                maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)],
+                objects: beforeRemovalObjects))
+            let staleService = TemporalSpatialMemoryService(journalRepository: journal,
+                policy: temporalTestPolicy(), metadataProvider: { try await staleStore.snapshot() },
+                metadataWriter: { try await staleStore.upsert($0) },
+                metadataRemover: { try await staleStore.removeMatching($0) })
+            do {
+                _ = try await staleService.reclaimRemovedObjectHistory(mapID: mapID, coordinateFrameID: frameID)
+                XCTFail("Unprojected removal must not bypass exact metadata matching")
+            } catch TemporalSpatialMemoryJournalError.journalDiverged(mapID: let actual) {
+                XCTAssertEqual(actual, mapID)
+            }
+            let untouched = try await journal.recover(mapID: mapID, coordinateFrameID: frameID)
+            XCTAssertEqual(untouched?.snapshot, before?.snapshot)
+            let staleObjects = await staleStore.allObjects()
+            XCTAssertEqual(staleObjects, beforeRemovalObjects)
+            let survivor = await store.metadata(for: liveID)
+            let filler = root.appendingPathComponent("unrelated-retained-file")
+            try Data().write(to: filler)
+            let current = try SpatialStorageDirectory.totalBytes(at: root)
+            let handle = try FileHandle(forWritingTo: filler)
+            try handle.truncate(atOffset: UInt64(SpatialStorageDirectory.maximumTotalBytes - current))
+            try handle.close()
+            await store.failNextWrite()
+            let writesBefore = await store.writeAttemptCount()
+            let maintenance = restart ? service() : active
+            let count = try await maintenance.reclaimRemovedObjectHistory(mapID: mapID, coordinateFrameID: frameID)
+            XCTAssertEqual(count, 1)
+            let writesAfter = await store.writeAttemptCount()
+            XCTAssertEqual(writesAfter, writesBefore, "Reclamation must not require ordinary writes")
+            let remaining = await store.allObjects()
+            XCTAssertEqual(remaining, [try XCTUnwrap(survivor)])
+            let recovered = try await journal.recover(mapID: mapID, coordinateFrameID: frameID)
+            XCTAssertNil(recovered?.snapshot.metadata(for: removedID))
+            XCTAssertEqual(recovered?.pendingRemovedObjects, [])
+            XCTAssertTrue(FileManager.default.fileExists(atPath: filler.path))
+            // Skipping projection is specific to cleanup: normal recovery still
+            // retries the survivor's downstream projection, even if metadata matches.
+            do {
+                _ = try await maintenance.recover(mapID: mapID, coordinateFrameID: frameID)
+                XCTFail("Normal recovery must still retry the failed projection")
+            } catch TemporalMetadataStoreError.injectedFailure {}
+        }
+    }
+
+    func testLegacyRemovedMetadataCanBeExplicitlyReclaimedWithoutTemporalRevision() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(124), frameID = temporalTestFrameID(124)
+        let original = temporalTestMetadata(mapID: mapID, coordinateFrameID: frameID,
+            objectID: temporalTestObjectID(124), at: 100)
+        var object = original.object
+        object.presence = .removed
+        XCTAssertNil(object.temporalRevision)
+        let removed = try SpatialObjectMetadata(mapID: mapID, object: object, position: original.position)
+        let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)], objects: [removed]))
+        let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let service = TemporalSpatialMemoryService(journalRepository: journal,
+            policy: temporalTestPolicy(), metadataProvider: { try await store.snapshot() },
+            metadataWriter: { try await store.upsert($0) }, metadataRemover: { try await store.removeMatching($0) })
+        let count = try await service.reclaimRemovedObjectHistory(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertEqual(count, 1)
+        let durable = await store.allObjects()
+        XCTAssertTrue(durable.isEmpty)
+        let recovery = try await TemporalSpatialMemoryJournalRepository(directoryURL: root)
+            .recover(mapID: mapID, coordinateFrameID: frameID)
+        XCTAssertTrue(recovery?.snapshot.objects.isEmpty == true)
+        XCTAssertEqual(recovery?.pendingRemovedObjects, [])
+    }
+
+    func testRemovedHistoryReclamationResumesAcrossBothProjectionCrashBoundaries() async throws {
+        for failAfterDeletion in [false, true] {
+            let root = temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let mapID = temporalTestMapID(121), frameID = temporalTestFrameID(121)
+            let removedID = temporalTestObjectID(121), liveID = temporalTestObjectID(122)
+            let manual = try manualMetadata(mapID: mapID, frameID: frameID, objectID: temporalTestObjectID(123))
+            let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+                maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)], objects: [manual]))
+            let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+            let service = TemporalSpatialMemoryService(journalRepository: journal,
+                policy: temporalTestPolicy(), metadataProvider: { try await store.snapshot() },
+                metadataWriter: { try await store.upsert($0) },
+                metadataRemover: { expected in
+                    if failAfterDeletion { try await store.removeMatching(expected) }
+                    throw TemporalMetadataStoreError.injectedFailure
+                })
+            _ = try await service.process(TemporalSpatialRecognitionBatch(sequence: 1,
+                observations: [removedID, liveID].map { temporalTestNewObservation(
+                    mapID: mapID, coordinateFrameID: frameID, objectID: $0, at: 100) },
+                expectedVisibleObjectIDs: []),
+                pose: temporalTestPose(mapID: mapID, coordinateFrameID: frameID,
+                    capturedAt: 100, sessionTimestamp: 1, sequence: 1))
+            for sequence in UInt64(2)...5 {
+                _ = try await service.process(TemporalSpatialRecognitionBatch(sequence: sequence,
+                    observations: [], expectedVisibleObjectIDs: [removedID]),
+                    pose: temporalTestPose(mapID: mapID, coordinateFrameID: frameID,
+                        capturedAt: 99 + Double(sequence), sessionTimestamp: Double(sequence), sequence: sequence))
+            }
+            let before = try await service.recover(mapID: mapID, coordinateFrameID: frameID)
+            XCTAssertEqual(before.metadata(for: removedID)?.object.presence, .removed)
+            try await store.renameAnnotation(expected: XCTUnwrap(before.metadata(for: removedID)),
+                                            displayName: "예전 의자")
+            do {
+                _ = try await service.reclaimRemovedObjectHistory(mapID: mapID, coordinateFrameID: frameID)
+                XCTFail("Injected projection failure must leave a recoverable intent")
+            } catch TemporalMetadataStoreError.injectedFailure {}
+            let committed = try await journal.recover(mapID: mapID, coordinateFrameID: frameID)
+            XCTAssertNil(committed?.snapshot.metadata(for: removedID))
+            XCTAssertEqual(committed?.pendingRemovedObjects.map { $0.object.id }, [removedID])
+            XCTAssertEqual(committed?.pendingRemovedObjects.first?.object.displayName, "예전 의자")
+
+            let restartedJournal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+            let restarted = TemporalSpatialMemoryService(journalRepository: restartedJournal,
+                policy: temporalTestPolicy(), metadataProvider: { try await store.snapshot() },
+                metadataWriter: { try await store.upsert($0) },
+                metadataRemover: { try await store.removeMatching($0) })
+            let recovered = try await restarted.recover(mapID: mapID, coordinateFrameID: frameID)
+            XCTAssertNil(recovered.metadata(for: removedID))
+            XCTAssertEqual(recovered.metadata(for: liveID), before.metadata(for: liveID))
+            XCTAssertEqual(recovered.revision, before.revision)
+            let durableManual = await store.metadata(for: manual.object.id)
+            let durableRemoved = await store.metadata(for: removedID)
+            XCTAssertEqual(durableManual, manual)
+            XCTAssertNil(durableRemoved)
+            let finalJournal = try await restartedJournal.recover(mapID: mapID, coordinateFrameID: frameID)
+            XCTAssertEqual(finalJournal?.pendingRemovedObjects, [])
+            let raw = try Data(contentsOf: root.appendingPathComponent(TemporalSpatialMemoryJournalRepository.catalogFileName))
+            XCTAssertFalse(String(decoding: raw, as: UTF8.self).lowercased()
+                .contains(removedID.rawValue.uuidString.lowercased()))
+        }
+    }
+    func testMultiObjectObservationUsesOneProjectionTransaction() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mapID = temporalTestMapID(119), frameID = temporalTestFrameID(119)
+        let store = TemporalMetadataStore(document: SpatialMetadataDocument(
+            maps: [temporalTestMapMetadata(mapID: mapID, coordinateFrameID: frameID)]))
+        let batches = TemporalBatchProjectionRecorder()
+        let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
+        let service = TemporalSpatialMemoryService(journalRepository: journal,
+            policy: temporalTestPolicy(), metadataProvider: { try await store.snapshot() },
+            metadataWriter: { _ in XCTFail("A multi-object delta must use the batch transaction") },
+            metadataBatchWriter: { metadata in
+                await batches.record(metadata)
+                for item in metadata { try await store.upsert(item) }
+            })
+        let ids = (1...32).map { temporalTestObjectID(1_190 + $0) }
+        _ = try await service.process(TemporalSpatialRecognitionBatch(sequence: 1,
+            observations: ids.map { temporalTestNewObservation(mapID: mapID, coordinateFrameID: frameID, objectID: $0, at: 100) },
+            expectedVisibleObjectIDs: []),
+            pose: temporalTestPose(mapID: mapID, coordinateFrameID: frameID, capturedAt: 100, sessionTimestamp: 1, sequence: 1))
+        let calls = await batches.objectIDs
+        XCTAssertEqual(calls, [ids.sorted()])
+        let durable = try await journal.recover(mapID: mapID, coordinateFrameID: frameID)
+        let stored = await store.allObjects()
+        XCTAssertEqual(Set(stored), Set(durable?.snapshot.objects.values.map { $0 } ?? []))
+    }
+
     func testManualRegistrationAfterJournalCommitSurvivesRestartAndAutomaticProjection() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1468,6 +1671,16 @@ private actor TemporalMetadataStore {
 
     func clearObjects() {
         document.objects.removeAll()
+    }
+
+    func removeMatching(_ expected: [SpatialObjectMetadata]) throws {
+        for metadata in expected {
+            guard TemporalSpatialMemorySnapshot.isReclaimableRemovedObject(metadata),
+                self.metadata(for: metadata.object.id).map({ $0 == metadata }) ?? true
+            else { throw TemporalMetadataStoreError.staleWrite }
+        }
+        let ids = Set(expected.map { $0.object.id })
+        document.objects.removeAll { ids.contains($0.object.id) }
     }
 
     func failNextWrite() {

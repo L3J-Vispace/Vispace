@@ -5,6 +5,24 @@ import XCTest
 @testable import Vispace
 
 final class SpatialStorageDirectoryTests: XCTestCase {
+    func testJournalRootAndNestedSnapshotVersionsHaveIndependentBounds() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try SpatialStorageDirectory.prepare(at: root)
+        let bytes = Data("{\"schemaVersion\":4,\"journals\":[{\"checkpoint\":{\"schemaVersion\":4}}]}".utf8)
+        let file = root.appendingPathComponent(TemporalSpatialMemoryJournalRepository.catalogFileName)
+        try bytes.write(to: file)
+        do {
+            _ = try await TemporalSpatialMemoryJournalRepository(directoryURL: root).catalogSnapshot()
+            XCTFail("A future nested snapshot must be preserved before decoding")
+        } catch { XCTAssertEqual(error as? SpatialStorageError, .unsupportedSchema(actual: 4)) }
+        XCTAssertEqual(try Data(contentsOf: file), bytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Quarantine").path))
+        XCTAssertNoThrow(try SpatialStorageDirectory.validateJSONSchemas(
+            Data("{\"schemaVersion\":4,\"checkpoint\":{\"schemaVersion\":3}}".utf8),
+            maximumSchemaVersion: 4, maximumNestedSchemaVersion: 3))
+    }
+
     func testFutureCatalogSchemasStayInPlaceForEveryRepository() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

@@ -164,7 +164,9 @@ jobs:
             -destination "platform=iOS Simulator,id=${SIMULATOR_UDID}" \
             -derivedDataPath "${RUNNER_TEMP}/VispaceDerivedData" \
             -resultBundlePath "${RUNNER_TEMP}/VispaceTests.xcresult" \
+            -parallel-testing-enabled NO \
             -test-timeouts-enabled YES \
+            -maximum-test-execution-time-allowance 180 \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \

@@ -7,13 +7,14 @@ struct SpatialQueryPanel: View {
     @ObservedObject var relationQueryController: SpatialRelationQueryController
     @ObservedObject var placementController: FurniturePlacementController
     @ObservedObject var navigationController: IndoorNavigationController
+    @Binding var query: String
     let onManageData: () -> Void
     let distanceDescription: (Vec3) -> String
     var onRegisterObject: (String) -> Void = { _ in }
+    var isVisible = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @FocusState private var queryIsFocused: Bool
-    @State private var query = ""
     @State private var rejection: SpatialCommandRejection?
     @State private var editsFurniture = false
     @State private var selectedFurniture: FurnitureKind = .sofa
@@ -26,97 +27,13 @@ struct SpatialQueryPanel: View {
     @State private var reviewsIdentity = false
 
     var body: some View {
-        VStack(spacing: 10) {
-            if !dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 0) }
-
-            if dynamicTypeSize.isAccessibilitySize {
-                ScrollView {
-                    resultContent
-                        .frame(maxWidth: .infinity)
-                }
-            } else {
-                resultContent
-            }
-
-            HStack(spacing: 10) {
-                Image(systemName: "sparkle.magnifyingglass")
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-
-                TextField("query.placeholder", text: $query)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(false)
-                    .submitLabel(.search)
-                    .focused($queryIsFocused)
-                    .onSubmit(submit)
-                    .accessibilityIdentifier("vispace.query.field")
-
-                Button {
-                    queryIsFocused = false
-                    dismissAll()
-                    onManageData()
-                } label: {
-                    Image(systemName: "gearshape.fill")
-                        .font(.title3)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(Text("data.title"))
-                .accessibilityIdentifier("vispace.data.settings")
-
-                if !perceptionController.identityConfirmationCandidates.isEmpty {
-                    Button {
-                        queryIsFocused = false; reviewsIdentity = true
-                    } label: {
-                        Image(systemName: "link.badge.plus")
-                    }
-                    .accessibilityLabel("관측한 물체의 이전 기록 연결")
-                    .accessibilityIdentifier("vispace.identity.review")
-                }
-
-                Menu {
-                    Button("물체 위치 직접 등록") {
-                        queryIsFocused = false
-                        dismissAll()
-                        onRegisterObject("")
-                    }
-                    Divider()
-                    placementButton(title: "소파", kind: .sofa)
-                    placementButton(title: "침대", kind: .bed)
-                    placementButton(title: "책상", kind: .desk)
-                } label: {
-                    Image(systemName: "square.grid.2x2.fill")
-                        .font(.title3)
-                }
-                .accessibilityLabel("물체 등록 및 가구 배치")
-                .accessibilityIdentifier("vispace.placement.menu")
-
-                if isSearching {
-                    ProgressView()
-                        .controlSize(.small)
-                        .accessibilityLabel(Text("query.searching"))
-                } else if !query.isEmpty {
-                    Button(action: submit) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.title2)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(Text("query.submit"))
-                    .accessibilityIdentifier("vispace.query.submit")
-                }
-            }
-            .padding(.leading, 15)
-            .padding(.trailing, 10)
-            .frame(minHeight: 50)
-            // Camera luminance must not wash out the query or settings controls.
-            .background(Color(uiColor: .secondarySystemBackground), in: Capsule())
-            .overlay {
-                Capsule()
-                    .strokeBorder(.white.opacity(0.22), lineWidth: 0.5)
+        // Keep the parent's search draft while removing controls during registration.
+        // A global accessibilityHidden(false) would override decorative child visibility.
+        Group {
+            if isVisible {
+                queryLayout
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.bottom, 10)
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: queryController.latestPresentation)
         .onChange(of: perceptionController.metrics.promotedObjects) { _, _ in
             queryController.refreshUnresolvedQueryAfterObservation()
         }
@@ -145,6 +62,138 @@ struct SpatialQueryPanel: View {
         }
     }
 
+    private var queryLayout: some View {
+        VStack(spacing: 10) {
+            if !dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 0) }
+
+            if dynamicTypeSize.isAccessibilitySize {
+                ScrollView {
+                    resultContent
+                        .frame(maxWidth: .infinity)
+                }
+            } else {
+                resultContent
+            }
+
+            queryControls
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 10)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: queryController.latestPresentation)
+    }
+
+    private var queryControls: some View {
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(spacing: 2) {
+                    queryInput
+                    HStack(spacing: 4) {
+                        Spacer(minLength: 0)
+                        queryActions
+                    }
+                }
+            } else {
+                HStack(spacing: 4) {
+                    queryInput
+                    queryActions
+                }
+            }
+        }
+        .padding(.leading, 15)
+        .padding(.trailing, 10)
+        .padding(.vertical, dynamicTypeSize.isAccessibilitySize ? 8 : 0)
+        .frame(minHeight: 50)
+        .background(Color(uiColor: .secondarySystemBackground),
+                    in: RoundedRectangle(cornerRadius: 25))
+        .overlay {
+            RoundedRectangle(cornerRadius: 25)
+                .strokeBorder(.white.opacity(0.22), lineWidth: 0.5)
+        }
+    }
+
+    private var queryInput: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "sparkle.magnifyingglass")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+
+            TextField("query.placeholder", text: $query)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(false)
+                .submitLabel(.search)
+                .focused($queryIsFocused)
+                .onSubmit(submit)
+                .accessibilityIdentifier("vispace.query.field")
+                .frame(minWidth: 44, minHeight: 44)
+                .layoutPriority(1)
+        }
+    }
+
+    @ViewBuilder
+    private var queryActions: some View {
+        Button {
+            queryIsFocused = false
+            dismissAll()
+            onManageData()
+        } label: {
+            Image(systemName: "gearshape.fill")
+                .font(.title3)
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text("data.title"))
+        .accessibilityIdentifier("vispace.data.settings")
+
+        if !perceptionController.identityConfirmationCandidates.isEmpty {
+            Button {
+                queryIsFocused = false; reviewsIdentity = true
+            } label: {
+                Image(systemName: "link.badge.plus")
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
+            }
+            .accessibilityLabel(Text("query.identityReview"))
+            .accessibilityIdentifier("vispace.identity.review")
+        }
+
+        Menu {
+            Button("query.registerObject") {
+                queryIsFocused = false
+                dismissAll()
+                onRegisterObject("")
+            }
+            Divider()
+            placementButton(title: "placement.kind.sofa", kind: .sofa)
+            placementButton(title: "placement.kind.bed", kind: .bed)
+            placementButton(title: "placement.kind.desk", kind: .desk)
+        } label: {
+            Image(systemName: "square.grid.2x2.fill")
+                .font(.title3)
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel(Text("query.objectTools"))
+        .accessibilityIdentifier("vispace.placement.menu")
+
+        if isSearching {
+            ProgressView()
+                .controlSize(.small)
+                .accessibilityLabel(Text("query.searching"))
+                .frame(minWidth: 44, minHeight: 44)
+        } else if !query.isEmpty {
+            Button(action: submit) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.title2)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(Text("query.submit"))
+            .accessibilityIdentifier("vispace.query.submit")
+        }
+    }
+
     @ViewBuilder
     private var resultContent: some View {
     if let rejection {
@@ -166,14 +215,14 @@ struct SpatialQueryPanel: View {
                         navigationController.clearRoute()
                     }
                 } label: {
-                    Label("경로 다시 확인", systemImage: "arrow.clockwise")
+                    Label("query.retryRoute", systemImage: "arrow.clockwise")
                         .font(.body.weight(.semibold))
                         .frame(maxWidth: .infinity, minHeight: 44)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Color(uiColor: .systemCyan))
                 .foregroundStyle(.black)
-                .accessibilityHint("같은 물체의 최신 위치와 통로를 다시 확인합니다.")
+                .accessibilityHint(Text("query.routeRetryHint"))
                 .accessibilityIdentifier("vispace.navigation.retry")
             }
         }
@@ -266,7 +315,7 @@ struct SpatialQueryPanel: View {
             cancelPlacement: { placementController.cancelCurrentEvaluation() },
             clearRoute: { navigationController.clearRoute() },
             submitObjectQuery: { queryController.submit($0) },
-            submitRelationQuery: { relationQueryController.submit($0) },
+            submitRelationQuery: { queryController.submit($0, onRelationQuery: { relationQueryController.submit($0) }) },
             evaluatePlacement: { placementController.evaluate($0) }
         )
     }
@@ -285,7 +334,7 @@ struct SpatialQueryPanel: View {
     }
 
     @ViewBuilder
-    private func placementButton(title: String, kind: FurnitureKind) -> some View {
+    private func placementButton(title: LocalizedStringKey, kind: FurnitureKind) -> some View {
         Button(title) {
             queryIsFocused = false
             selectedFurniture = kind
@@ -352,27 +401,27 @@ struct SpatialQueryPanel: View {
                         navigationController.clearRoute()
                     }
                 } label: {
-                    Label("이 위치까지 길 안내", systemImage: "point.topleft.down.to.point.bottomright.curvepath.fill")
+                    Label("query.navigate", systemImage: "point.topleft.down.to.point.bottomright.curvepath.fill")
                         .font(.body.weight(.semibold))
                         .frame(maxWidth: .infinity, minHeight: 44)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Color(uiColor: .systemCyan))
                 .foregroundStyle(.black)
-                .accessibilityHint("선택한 물체 위치와 이동할 수 있는 바닥을 확인한 뒤 경로를 표시합니다.")
+                .accessibilityHint(Text("query.routeStartHint"))
                 .accessibilityIdentifier("vispace.query.navigate")
             }
-            if presentation.result.candidates.count > 1 {
+            if presentation.result.totalCandidateCount > 1 {
                 ScrollView {
-                    VStack(spacing: 6) {
-                        ForEach(Array(presentation.result.candidates.enumerated()), id: \.element.record.metadata.object.id) { index, candidate in
+                    LazyVStack(spacing: 6) {
+                        ForEach(Array(queryController.visibleCandidates.enumerated()), id: \.element.record.metadata.object.id) { index, candidate in
                             Button {
                                 navigationController.clearRoute()
                                 queryController.selectCandidate(objectID: candidate.record.metadata.object.id,
                                     mapID: candidate.record.metadata.mapID)
                             } label: {
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text("\(candidate.record.metadata.object.displayName ?? ObjectSemanticCatalog.default.displayName(for: candidate.record.metadata.object.semanticLabel)) · 후보 \(index + 1)")
+                                    Text("\(candidate.record.metadata.object.displayName ?? ObjectSemanticCatalog.default.displayName(for: candidate.record.metadata.object.semanticLabel)) · 후보 \(queryController.candidatePageOffset + index + 1)")
                                         .font(.subheadline.weight(.semibold))
                                     Text(candidateDescription(candidate))
                                         .font(.caption)
@@ -383,11 +432,33 @@ struct SpatialQueryPanel: View {
                             .buttonStyle(.plain)
                             .foregroundStyle(.white)
                             .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 12))
-                            .accessibilityIdentifier("vispace.query.candidate.\(index)")
+                            .accessibilityIdentifier("vispace.query.candidate.\(queryController.candidatePageOffset + index)")
                         }
                     }
                 }
                 .frame(maxHeight: 190)
+                if presentation.result.totalCandidateCount > presentation.result.candidates.count {
+                    HStack {
+                        Button { queryController.showCandidatePage(next: false) } label: {
+                            Text("이전 후보").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+                        }
+                        .disabled(!queryController.canShowPreviousCandidatePage)
+                        .accessibilityIdentifier("vispace.query.candidates.previous")
+                        Spacer()
+                        Text("\(queryController.candidatePageOffset + 1)–\(queryController.candidatePageOffset + queryController.visibleCandidates.count) / \(presentation.result.totalCandidateCount)")
+                        Spacer()
+                        Button { queryController.showCandidatePage(next: true) } label: {
+                            Text("다음 후보").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+                        }
+                        .disabled(!queryController.canShowNextCandidatePage)
+                        .accessibilityIdentifier("vispace.query.candidates.next")
+                    }
+                    .font(.subheadline)
+                    .frame(minHeight: 44)
+                    .padding(.horizontal, 12)
+                    .foregroundStyle(.white)
+                    .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 12))
+                }
             }
             if let selected = presentation.result.selectedCandidate {
                 HStack {

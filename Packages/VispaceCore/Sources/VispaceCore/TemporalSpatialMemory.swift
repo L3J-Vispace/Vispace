@@ -618,6 +618,40 @@ public struct TemporalSpatialDelta: Codable, Hashable, Sendable {
         )
         self.changes = changes
     }
+
+    fileprivate init(removing objectIDs: Set<ObjectID>, from original: Self) {
+        id = original.id
+        baseRevision = original.baseRevision
+        newRevision = original.newRevision
+        sequence = original.sequence
+        timestamp = original.timestamp
+        clock = original.clock
+        mapID = original.mapID
+        coordinateFrameID = original.coordinateFrameID
+        spatialDelta = SpatialDelta(id: original.spatialDelta.id,
+            baseRevision: original.spatialDelta.baseRevision,
+            events: original.spatialDelta.events.filter { event in
+                let objectID: ObjectID
+                switch event {
+                case .upsert(let object): objectID = object.id
+                case .observed(let id, _, _, _, _), .becameNotVisible(let id, _),
+                    .becameLastSeen(let id, _), .moved(let id, _, _, _, _),
+                    .removed(let id, _, _), .discardProvisional(let id): objectID = id
+                }
+                return !objectIDs.contains(objectID)
+            })
+        changes = original.changes.filter { change in
+            let objectID: ObjectID
+            switch change {
+            case .clockEpochStarted, .calendarClockMovedBackward: return true
+            case .added(let object, _): objectID = object.object.id
+            case .reclassified(let id, _, _, _), .deferredDueToCapacity(let id, _),
+                .moved(let id, _, _, _, _), .stateChanged(let id, _, _, _),
+                .missing(let id, _, _, _), .removed(let id, _, _, _): objectID = id
+            }
+            return !objectIDs.contains(objectID)
+        }
+    }
 }
 
 public struct TemporalObjectLifecycleEvidence: Codable, Hashable, Sendable {
@@ -686,6 +720,26 @@ public struct TemporalSpatialMemorySnapshot: Codable, Hashable, Sendable {
 
     public var rememberedUpdateCount: Int {
         rememberedUpdateIDs.count
+    }
+
+    public static func isReclaimableRemovedObject(_ metadata: SpatialObjectMetadata) -> Bool {
+        metadata.object.presence == .removed
+            && metadata.object.semanticLabel != UserObjectRegistrationAccumulator.semanticLabel
+    }
+
+    public var reclaimableRemovedObjects: [SpatialObjectMetadata] {
+        objects.values.filter(Self.isReclaimableRemovedObject).sorted { $0.object.id < $1.object.id }
+    }
+
+    /// Explicit history reclamation retains replay ordering and deduplication
+    /// fences. It does not turn last-seen or temporarily hidden objects into removals.
+    public func reclaimingRemovedObjectHistory() -> Self {
+        let removedIDs = Set(reclaimableRemovedObjects.map { $0.object.id })
+        guard !removedIDs.isEmpty else { return self }
+        var compacted = self
+        compacted.objectStates = objectStates.filter { !removedIDs.contains($0.key) }
+        compacted.recentDeltas = recentDeltas.map { TemporalSpatialDelta(removing: removedIDs, from: $0) }
+        return compacted
     }
 
     public func metadata(for objectID: ObjectID) -> SpatialObjectMetadata? {

@@ -8,6 +8,156 @@ import XCTest
 final class SpatialPlaceArchiveServiceTests: XCTestCase {
     private let codec = SpatialPlaceArchiveCodec(archiveValidator: { _ in })
 
+    func testLegacyVersionOneStillImportsWithOriginalBounds() throws {
+        let candidate = try fixture()
+        let manifest = try manifestDictionary(candidate)
+        let legacy = try encryptedFixture(manifest: manifest)
+        let restored = try codec.open(legacy.data, recoveryKey: legacy.key)
+        XCTAssertEqual(restored.metadata, candidate.metadata)
+        XCTAssertEqual(restored.objects, candidate.objects)
+        XCTAssertEqual(restored.archive, candidate.archive)
+        var oversized = Data("VISPACE-PLACE".utf8) + Data([0, 1])
+        oversized.append(Data(repeating: 0, count: SpatialPlaceArchiveCodec.legacyMaximumEncryptedFileBytes))
+        XCTAssertThrowsError(try codec.open(oversized, recoveryKey: legacy.key)) {
+            XCTAssertEqual($0 as? SpatialPlaceArchiveError, .fileTooLarge)
+        }
+    }
+
+    func testChunkedRoundTripExportsMapBeyondLegacyThirtyTwoMiB() throws {
+        let source = try fixture()
+        let bytes = Data(repeating: 0xA7, count: SpatialPlaceArchiveCodec.legacyMaximumWorldMapBytes + 17)
+        let candidate = WorldMapRestoreCandidate(metadata: source.metadata, archive: bytes, objects: source.objects)
+        let exported = try codec.seal(candidate)
+        XCTAssertEqual(exported.encryptedData[Data("VISPACE-PLACE".utf8).count + 1], 2)
+        let restored = try codec.open(exported.encryptedData, recoveryKey: exported.recoveryKey)
+        XCTAssertEqual(restored.archive, bytes)
+        XCTAssertEqual(restored.objects, source.objects)
+        XCTAssertEqual(SpatialPlaceArchiveCodec.maximumWorldMapBytes, ARWorldMapArchiveCodec.maximumArchiveBytes)
+    }
+
+    func testChunkAuthenticationRejectsReorderTruncationTrailingDataAndManifestSplicing() throws {
+        let source = try fixture()
+        let candidate = WorldMapRestoreCandidate(metadata: source.metadata,
+            archive: Data(repeating: 0x71, count: SpatialPlaceArchiveCodec.archiveChunkBytes * 2 + 17), objects: source.objects)
+        let exported = try codec.seal(candidate)
+        let headerCount = Data("VISPACE-PLACE".utf8).count + 2
+        let manifestLength = exported.encryptedData[headerCount..<(headerCount + 4)].reduce(0) { ($0 << 8) | Int($1) }
+        let chunkStart = headerCount + 4 + manifestLength
+        let chunkBytes = SpatialPlaceArchiveCodec.archiveChunkBytes + 28
+        var reordered = exported.encryptedData
+        let first = reordered.subdata(in: chunkStart..<(chunkStart + chunkBytes))
+        let second = reordered.subdata(in: (chunkStart + chunkBytes)..<(chunkStart + chunkBytes * 2))
+        reordered.replaceSubrange(chunkStart..<(chunkStart + chunkBytes), with: second)
+        reordered.replaceSubrange((chunkStart + chunkBytes)..<(chunkStart + chunkBytes * 2), with: first)
+        XCTAssertThrowsError(try codec.open(reordered, recoveryKey: exported.recoveryKey)) {
+            XCTAssertEqual($0 as? SpatialPlaceArchiveError, .authenticationFailed)
+        }
+        for malformed in [Data(exported.encryptedData.dropLast()), exported.encryptedData + Data([0])] {
+            XCTAssertThrowsError(try codec.open(malformed, recoveryKey: exported.recoveryKey)) {
+                XCTAssertEqual($0 as? SpatialPlaceArchiveError, .invalidDocument)
+            }
+        }
+        // Re-encrypting even an identical manifest with the SAME key must not
+        // make the existing chunks valid for a different manifest ciphertext.
+        let key = SymmetricKey(data: try XCTUnwrap(Data(base64Encoded: exported.recoveryKey)))
+        let header = Data(exported.encryptedData.prefix(headerCount))
+        let originalManifest = exported.encryptedData.subdata(in: (headerCount + 4)..<chunkStart)
+        let plaintext = try AES.GCM.open(AES.GCM.SealedBox(combined: originalManifest), using: key, authenticating: header)
+        let replacement = try XCTUnwrap(AES.GCM.seal(plaintext, using: key, authenticating: header).combined)
+        var spliced = exported.encryptedData
+        spliced.replaceSubrange((headerCount + 4)..<chunkStart, with: replacement)
+        XCTAssertThrowsError(try codec.open(spliced, recoveryKey: exported.recoveryKey)) {
+            XCTAssertEqual($0 as? SpatialPlaceArchiveError, .authenticationFailed)
+        }
+        var changedManifest = exported.encryptedData
+        changedManifest[headerCount + 4] ^= 1
+        XCTAssertThrowsError(try codec.open(changedManifest, recoveryKey: exported.recoveryKey)) {
+            XCTAssertEqual($0 as? SpatialPlaceArchiveError, .authenticationFailed)
+        }
+    }
+
+    func testChunkedAuthenticatedBoundsFailBeforeMetadataAndSecureArchiveDecoding() throws {
+        let invalidLength = try chunkedFixture(manifest: ["schemaVersion": 1], claimedArchiveLength: UInt64.max)
+        XCTAssertThrowsError(try codec.open(invalidLength.data, recoveryKey: invalidLength.key)) {
+            XCTAssertEqual($0 as? SpatialPlaceArchiveError, .fileTooLarge)
+        }
+        let excessiveObjects = try chunkedFixture(manifest: [
+            "schemaVersion": 1, "metadata": [:],
+            "objects": Array(repeating: NSNull(), count: SpatialPlaceArchiveCodec.maximumObjectCount + 1)
+        ])
+        XCTAssertThrowsError(try codec.open(excessiveObjects.data, recoveryKey: excessiveObjects.key)) {
+            XCTAssertEqual($0 as? SpatialPlaceArchiveError, .fileTooLarge)
+        }
+        let source = try fixture()
+        let incorrectDigest = try chunkedFixture(manifest: manifestDictionary(source), validChecksum: false)
+        XCTAssertThrowsError(try codec.open(incorrectDigest.data, recoveryKey: incorrectDigest.key)) {
+            XCTAssertEqual($0 as? SpatialPlaceArchiveError, .checksumMismatch)
+        }
+        var oversizedManifest = Data("VISPACE-PLACE".utf8) + Data([0, 2, 255, 255, 255, 255])
+        oversizedManifest.append(Data(repeating: 0, count: 50))
+        XCTAssertThrowsError(try codec.open(oversizedManifest, recoveryKey: incorrectDigest.key)) {
+            XCTAssertEqual($0 as? SpatialPlaceArchiveError, .invalidDocument)
+        }
+    }
+
+    func testManualRecordsBeyondAutomaticCapacityRoundTripAndImport() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let candidate = try manualFixture(count: 2_049)
+        XCTAssertEqual(candidate.objects.filter { UserObjectRegistrationAccumulator.isManualRegistration($0) }.count, 2_049)
+        let exported = try codec.seal(candidate)
+        let restored = try codec.open(exported.encryptedData, recoveryKey: exported.recoveryKey)
+        XCTAssertEqual(restored.objects, candidate.objects)
+        let repository = makeRepository(root)
+        let mapID = try await repository.importPortableCheckpoint(restored)
+        let reloaded = try await repository.loadLatestValidCheckpoint(mapID: mapID)
+        XCTAssertEqual(reloaded?.objects.count, candidate.objects.count)
+    }
+
+    func testAutomaticCapacityStillRejectsBeforeSecureArchiveDecodeAndStoreCreation() async throws {
+        let source = try fixture()
+        let record = try XCTUnwrap(source.objects.first)
+        let objects = try (0...SpatialPlaceArchiveCodec.maximumAutomaticObjectCount).map { _ in
+            var object = record.object
+            object = try SpatialObject(id: ObjectID(), semanticLabel: object.semanticLabel, position: object.position,
+                certainty: object.certainty, confidence: object.confidence, firstSeenAt: object.firstSeenAt,
+                lastSeenAt: object.lastSeenAt, temporalRevision: object.temporalRevision)
+            return try SpatialObjectMetadata(mapID: source.metadata.mapID, object: object, position: record.position)
+        }
+        let candidate = WorldMapRestoreCandidate(metadata: source.metadata, archive: source.archive, objects: objects)
+        XCTAssertThrowsError(try codec.seal(candidate)) {
+            XCTAssertEqual($0 as? SpatialPlaceArchiveError, .fileTooLarge)
+        }
+        let crafted = try chunkedFixture(manifest: manifestDictionary(candidate))
+        XCTAssertThrowsError(try codec.open(crafted.data, recoveryKey: crafted.key)) {
+            XCTAssertEqual($0 as? SpatialPlaceArchiveError, .fileTooLarge)
+        }
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        do { _ = try await makeRepository(root).importPortableCheckpoint(candidate); XCTFail("Expected automatic object limit") }
+        catch { XCTAssertEqual(error as? SpatialPlaceArchiveError, .fileTooLarge) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+    }
+
+    func testCancellationInterruptsArchiveChunkEncryptionAndDecryption() throws {
+        let source = try fixture()
+        let candidate = WorldMapRestoreCandidate(metadata: source.metadata,
+            archive: Data(repeating: 0x31, count: SpatialPlaceArchiveCodec.archiveChunkBytes * 5), objects: source.objects)
+        for decrypts in [false, true] {
+            let counter = ArchiveCancellationCounter(cancelAt: 5)
+            let cancellable = SpatialPlaceArchiveCodec(archiveValidator: { _ in }, checkCancellation: { try counter.check() })
+            if decrypts {
+                let exported = try codec.seal(candidate)
+                XCTAssertThrowsError(try cancellable.open(exported.encryptedData, recoveryKey: exported.recoveryKey)) {
+                    XCTAssertTrue($0 is CancellationError)
+                }
+            } else {
+                XCTAssertThrowsError(try cancellable.seal(candidate)) { XCTAssertTrue($0 is CancellationError) }
+            }
+            XCTAssertEqual(counter.count, 5)
+        }
+    }
+
     func testEncryptedRoundTripPreservesPlaceObjectsAndUserName() throws {
         let candidate = try fixture()
         let export = try codec.seal(candidate)
@@ -42,9 +192,9 @@ final class SpatialPlaceArchiveServiceTests: XCTestCase {
     func testUnsupportedEnvelopeAndManifestVersionsFailExplicitly() throws {
         let export = try codec.seal(fixture())
         var future = export.encryptedData
-        future[Data("VISPACE-PLACE".utf8).count + 1] = 2
+        future[Data("VISPACE-PLACE".utf8).count + 1] = 3
         XCTAssertThrowsError(try codec.open(future, recoveryKey: export.recoveryKey)) {
-            XCTAssertEqual($0 as? SpatialPlaceArchiveError, .unsupportedVersion(2))
+            XCTAssertEqual($0 as? SpatialPlaceArchiveError, .unsupportedVersion(3))
         }
         let crafted = try encryptedFixture(manifest: ["schemaVersion": 99])
         XCTAssertThrowsError(try codec.open(crafted.data, recoveryKey: crafted.key)) {
@@ -55,7 +205,7 @@ final class SpatialPlaceArchiveServiceTests: XCTestCase {
     func testObjectLimitIsCheckedBeforeMalformedObjectOrMetadataDecode() throws {
         let crafted = try encryptedFixture(manifest: [
             "schemaVersion": 1, "metadata": [:],
-            "objects": Array(repeating: NSNull(), count: SpatialPlaceArchiveCodec.maximumObjectCount + 1)
+            "objects": Array(repeating: NSNull(), count: SpatialPlaceArchiveCodec.legacyMaximumObjectCount + 1)
         ])
         XCTAssertThrowsError(try codec.open(crafted.data, recoveryKey: crafted.key)) {
             XCTAssertEqual($0 as? SpatialPlaceArchiveError, .fileTooLarge)
@@ -306,6 +456,46 @@ final class SpatialPlaceArchiveServiceTests: XCTestCase {
         return WorldMapRestoreCandidate(metadata: metadata, archive: Data("world-map-fixture".utf8), objects: [record])
     }
 
+    private func manualFixture(count: Int) throws -> WorldMapRestoreCandidate {
+        let source = try fixture()
+        let records = try (0..<count).map { index in
+            let object = try SpatialObject(semanticLabel: UserObjectRegistrationAccumulator.semanticLabel,
+                position: .zero, certainty: .confirmed, presence: .lastSeen,
+                confidence: ConfidenceVector(semantic: .one, geometry: .one, tracking: .one,
+                    identity: .one, objectState: .one),
+                firstSeenAt: 1, lastSeenAt: 2, displayName: "직접 기억 \(index)")
+            return try SpatialObjectMetadata(mapID: source.metadata.mapID, object: object,
+                position: FramedPosition(coordinateFrameID: source.metadata.coordinateFrameID, value: .zero,
+                    observedAt: 2, trackingQuality: .normal, uncertainty: .highConfidenceDepth))
+        }
+        return WorldMapRestoreCandidate(metadata: source.metadata, archive: source.archive, objects: source.objects + records)
+    }
+
+    private func manifestDictionary(_ candidate: WorldMapRestoreCandidate) throws -> [String: Any] {
+        ["schemaVersion": 1,
+         "metadata": try JSONSerialization.jsonObject(with: JSONEncoder().encode(candidate.metadata)),
+         "objects": try JSONSerialization.jsonObject(with: JSONEncoder().encode(candidate.objects))]
+    }
+
+    /// Independent v2 fixture encoder for authenticated malformed manifests.
+    private func chunkedFixture(manifest: [String: Any], claimedArchiveLength: UInt64? = nil,
+                                validChecksum: Bool = true) throws -> (data: Data, key: String) {
+        let archive = Data("world-map-fixture".utf8)
+        func integer(_ value: UInt64, bytes: Int) -> Data {
+            Data((0..<bytes).reversed().map { UInt8((value >> ($0 * 8)) & 255) })
+        }
+        let key = SymmetricKey(size: .bits256)
+        let header = Data("VISPACE-PLACE".utf8) + Data([0, 2])
+        var plaintext = integer(claimedArchiveLength ?? UInt64(archive.count), bytes: 8)
+        plaintext.append(validChecksum ? Data(SHA256.hash(data: archive)) : Data(repeating: 0, count: 32))
+        plaintext.append(try JSONSerialization.data(withJSONObject: manifest))
+        let encryptedManifest = try XCTUnwrap(AES.GCM.seal(plaintext, using: key, authenticating: header).combined)
+        var data = header + integer(UInt64(encryptedManifest.count), bytes: 4) + encryptedManifest
+        let aad = header + Data(SHA256.hash(data: encryptedManifest)) + integer(0, bytes: 8)
+        data.append(try XCTUnwrap(AES.GCM.seal(archive, using: key, authenticating: aad).combined))
+        return (data, key.withUnsafeBytes { Data($0).base64EncodedString() })
+    }
+
     private func encryptedFixture(manifest: [String: Any], validChecksum: Bool = true, manifestLength: UInt32? = nil) throws -> (data: Data, key: String) {
         let manifestData = try JSONSerialization.data(withJSONObject: manifest)
         let length = manifestLength ?? UInt32(manifestData.count)
@@ -346,6 +536,18 @@ final class SpatialPlaceArchiveServiceTests: XCTestCase {
 
     private func temporaryDirectory() -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("vispace-portable-tests-\(UUID().uuidString)")
+    }
+}
+
+private final class ArchiveCancellationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let cancelAt: Int
+    private var checks = 0
+    var count: Int { lock.withLock { checks } }
+    init(cancelAt: Int) { self.cancelAt = cancelAt }
+    func check() throws {
+        let cancelled = lock.withLock { checks += 1; return checks == cancelAt }
+        if cancelled { throw CancellationError() }
     }
 }
 

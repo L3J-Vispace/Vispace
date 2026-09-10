@@ -1,6 +1,48 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "data.history.cleanup.action": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Clear removed-object history" } },
+        "ko": { "stringUnit": { "state": "translated", "value": "삭제된 물체 이력 정리" } }
+      }
+    },
+    "data.history.cleanup.confirm": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Permanently erase the locations and history of automatically recognized objects marked as removed in this place. Manual registrations and current, last-seen, or temporarily hidden objects stay saved. This cannot be undone." } },
+        "ko": { "stringUnit": { "state": "translated", "value": "이 장소에서 ‘삭제됨’으로 기록된 자동 인식 물체의 위치와 변경 이력을 영구적으로 지웁니다. 수동 등록한 물체와 현재·마지막 위치 기록, 잠시 보이지 않는 물체는 유지됩니다. 되돌릴 수 없습니다." } }
+      }
+    },
+    "data.history.cleanup.progress": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Clearing removed-object history…" } },
+        "ko": { "stringUnit": { "state": "translated", "value": "삭제된 물체 이력을 정리하고 있어요" } }
+      }
+    },
+    "data.history.cleanup.success": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Removed-object history cleared." } },
+        "ko": { "stringUnit": { "state": "translated", "value": "삭제된 물체 이력을 정리했어요." } }
+      }
+    },
+    "data.history.cleanup.failed": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "History cleanup could not finish. Try again." } },
+        "ko": { "stringUnit": { "state": "translated", "value": "이력 정리를 마치지 못했어요. 다시 시도해 주세요." } }
+      }
+    },
+    "data.place.checkpoint.bytes": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Map files" } },
+        "ko": { "stringUnit": { "state": "translated", "value": "지도 파일" } }
+      }
+    },
+    "data.place.checkpoint.older.bytes": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Older map files" } },
+        "ko": { "stringUnit": { "state": "translated", "value": "이전 지도 파일" } }
+      }
+    },
   "data.transfer.title": {
     "localizations": {
       "en": {
@@ -102,13 +144,13 @@
       "en": {
         "stringUnit": {
           "state": "translated",
-          "value": "Includes one latest saved map and current objects, including user names. Older checkpoints and change history are excluded; fingerprints and relations are rebuilt. No original camera frames are included. Limits: 32 MiB map, 36 MiB file, 2,048 objects."
+          "value": "Includes one latest saved map and current objects, including user names. Older checkpoints and change history are excluded; fingerprints and relations are rebuilt. No original camera frames are included. Supports maps up to 128 MiB and files up to 146 MiB. Automatic records are limited to 2,048; manual records also depend on available metadata storage."
         }
       },
       "ko": {
         "stringUnit": {
           "state": "translated",
-          "value": "최신 지도 한 개와 현재 물체 기록·사용자 이름만 옮깁니다. 과거 체크포인트와 변경 이력은 포함하지 않으며, 장소 지문·관계는 다시 생성합니다. 원본 카메라 영상은 포함하지 않습니다. 지도 32 MiB, 파일 36 MiB, 물체 2,048개로 제한됩니다."
+          "value": "최신 지도 한 개와 현재 물체 기록·사용자 이름만 옮깁니다. 과거 체크포인트와 변경 이력은 포함하지 않으며, 장소 지문·관계는 다시 생성합니다. 원본 카메라 영상은 포함하지 않습니다. 지도는 128 MiB, 파일은 146 MiB까지 지원합니다. 자동 인식 기록은 2,048개까지이며, 직접 등록 기록은 메타데이터 저장 용량에 따라 달라집니다."
         }
       }
     }
@@ -230,13 +272,13 @@
       "en": {
         "stringUnit": {
           "state": "translated",
-          "value": "This place exceeds the transfer limits: 32 MiB map, 36 MiB file, or 2,048 objects."
+          "value": "This place exceeds a transfer limit: 128 MiB map, 146 MiB file, 16 MiB metadata, 65,536 total records, or 2,048 automatic records. Older files keep their original smaller limits."
         }
       },
       "ko": {
         "stringUnit": {
           "state": "translated",
-          "value": "장소가 전송 한도를 초과해요. 지도 32 MiB, 파일 36 MiB, 물체 2,048개까지 지원합니다."
+          "value": "전송 한도를 초과해요. 지도 128 MiB, 파일 146 MiB, 메타데이터 16 MiB, 전체 기록 65,536개, 자동 인식 기록 2,048개까지 지원합니다. 이전 형식의 파일에는 기존 한도가 적용돼요."
         }
       }
     }
@@ -1269,6 +1311,66 @@
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Object recognition is unavailable" } },
         "ko" : { "stringUnit" : { "state" : "translated", "value" : "물체 인식을 사용할 수 없어요" } }
+      }
+    },
+    "placement.kind.sofa" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Sofa" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "소파" } }
+      }
+    },
+    "placement.kind.bed" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Bed" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "침대" } }
+      }
+    },
+    "placement.kind.desk" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Desk" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "책상" } }
+      }
+    },
+    "query.identityReview" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Link an observed object to a saved record" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "관측한 물체의 이전 기록 연결" } }
+      }
+    },
+    "query.objectTools" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Object registration and furniture placement" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "물체 등록 및 가구 배치" } }
+      }
+    },
+    "query.registerObject" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Remember an object location" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "물체 위치 직접 등록" } }
+      }
+    },
+    "query.retryRoute" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Check route again" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "경로 다시 확인" } }
+      }
+    },
+    "query.routeRetryHint" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Checks the object's latest location and the passage again." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "같은 물체의 최신 위치와 통로를 다시 확인합니다." } }
+      }
+    },
+    "query.navigate" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Navigate to this location" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이 위치까지 길 안내" } }
+      }
+    },
+    "query.routeStartHint" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Checks the selected object's location and walkable floor before showing a route." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "선택한 물체 위치와 이동할 수 있는 바닥을 확인한 뒤 경로를 표시합니다." } }
       }
     },
     "query.dismissResult" : {

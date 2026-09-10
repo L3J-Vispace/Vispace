@@ -11,6 +11,7 @@ public enum TemporalSpatialMemoryJournalError: Error, Equatable, Sendable {
     case mapCoordinateFrameConflict(mapID: MapID)
     case policyConflict(mapID: MapID)
     case journalDiverged(mapID: MapID)
+    case reclamationPending(mapID: MapID)
     case updateIdentifierCollision(SpatialDeltaID)
 }
 
@@ -200,6 +201,7 @@ public struct TemporalSpatialMemoryJournalRecovery: Codable, Hashable, Sendable 
     public let policy: TemporalSpatialMemoryPolicy
     public let snapshot: TemporalSpatialMemorySnapshot
     public let replayedEntryCount: Int
+    public let pendingRemovedObjects: [SpatialObjectMetadata]
 }
 
 public struct TemporalSpatialMemoryJournalRecord: Codable, Hashable, Sendable {
@@ -210,13 +212,16 @@ public struct TemporalSpatialMemoryJournalRecord: Codable, Hashable, Sendable {
     public let policy: TemporalSpatialMemoryPolicy
     public let checkpoint: TemporalSpatialMemorySnapshot
     public let entries: [TemporalSpatialMemoryJournalEntry]
+    public let pendingRemovedObjects: [SpatialObjectMetadata]
+    private let validatedSnapshot: TemporalSpatialMemorySnapshot
 
     public init(
         mapID: MapID,
         coordinateFrameID: CoordinateFrameID,
         policy: TemporalSpatialMemoryPolicy,
         checkpoint: TemporalSpatialMemorySnapshot,
-        entries: [TemporalSpatialMemoryJournalEntry]
+        entries: [TemporalSpatialMemoryJournalEntry],
+        pendingRemovedObjects: [SpatialObjectMetadata] = []
     ) throws {
         guard entries.count <= Self.absoluteMaximumEntryCount,
             checkpoint.mapID == mapID,
@@ -233,10 +238,28 @@ public struct TemporalSpatialMemoryJournalRecord: Codable, Hashable, Sendable {
         self.policy = policy
         self.checkpoint = checkpoint
         self.entries = entries
-        _ = try recoveredSnapshot()
+        let recovered = try Self.replay(checkpoint: checkpoint, policy: policy, entries: entries)
+        guard pendingRemovedObjects.count <= policy.maximumObjectCount,
+            Set(pendingRemovedObjects.map { $0.object.id }).count == pendingRemovedObjects.count,
+            pendingRemovedObjects.isEmpty || entries.isEmpty,
+            pendingRemovedObjects.allSatisfy({ metadata in
+                TemporalSpatialMemorySnapshot.isReclaimableRemovedObject(metadata)
+                    && metadata.mapID == mapID && metadata.position.coordinateFrameID == coordinateFrameID
+                    && recovered.metadata(for: metadata.object.id) == nil
+            }) else { throw TemporalSpatialMemoryJournalError.invalidJournal }
+        validatedSnapshot = recovered
+        self.pendingRemovedObjects = pendingRemovedObjects.sorted { $0.object.id < $1.object.id }
     }
 
     public func recoveredSnapshot() throws -> TemporalSpatialMemorySnapshot {
+        validatedSnapshot
+    }
+
+    private static func replay(
+        checkpoint: TemporalSpatialMemorySnapshot,
+        policy: TemporalSpatialMemoryPolicy,
+        entries: [TemporalSpatialMemoryJournalEntry]
+    ) throws -> TemporalSpatialMemorySnapshot {
         var coordinator = try TemporalSpatialMemoryCoordinator(
             restoring: checkpoint,
             policy: policy
@@ -257,6 +280,7 @@ public struct TemporalSpatialMemoryJournalRecord: Codable, Hashable, Sendable {
         case policy
         case checkpoint
         case entries
+        case pendingRemovedObjects
     }
 
     public init(from decoder: Decoder) throws {
@@ -279,7 +303,9 @@ public struct TemporalSpatialMemoryJournalRecord: Codable, Hashable, Sendable {
                 entries: container.decode(
                     [TemporalSpatialMemoryJournalEntry].self,
                     forKey: .entries
-                )
+                ),
+                pendingRemovedObjects: container.decodeIfPresent(
+                    [SpatialObjectMetadata].self, forKey: .pendingRemovedObjects) ?? []
             )
         } catch let error as DecodingError {
             throw error
@@ -294,7 +320,7 @@ public struct TemporalSpatialMemoryJournalRecord: Codable, Hashable, Sendable {
 }
 
 public struct TemporalSpatialMemoryJournalCatalog: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 3
+    public static let currentSchemaVersion: UInt16 = 4
     public static let absoluteMaximumJournalCount = 64
 
     public let schemaVersion: UInt16
@@ -374,6 +400,10 @@ public actor TemporalSpatialMemoryJournalRepository {
     private let fileManager: FileManager
     private let maximumJournalCount: Int
     private let maximumEntriesPerJournal: Int
+    private let catalogByteLimit: Int
+    // The bytes are compared after a fresh bounded read. External replacement,
+    // deletion, or corruption cannot reuse a previously validated catalog.
+    private var cachedCatalog: (data: Data, catalog: TemporalSpatialMemoryJournalCatalog)?
 
     #if DEBUG
     private var afterNextCommitForTesting: (@Sendable () async -> Void)?
@@ -390,6 +420,7 @@ public actor TemporalSpatialMemoryJournalRepository {
             .defaultMaximumJournalCount,
         maximumEntriesPerJournal: Int = TemporalSpatialMemoryJournalRepository
             .defaultMaximumEntriesPerJournal,
+        maximumCatalogBytes: Int = TemporalSpatialMemoryJournalRepository.maximumCatalogBytes,
         fileManager: FileManager = .default
     ) {
         let standardizedDirectory = directoryURL.standardizedFileURL
@@ -406,6 +437,7 @@ public actor TemporalSpatialMemoryJournalRepository {
             max(1, maximumEntriesPerJournal),
             TemporalSpatialMemoryJournalRecord.absoluteMaximumEntryCount
         )
+        catalogByteLimit = min(max(1, maximumCatalogBytes), Self.maximumCatalogBytes)
         self.fileManager = fileManager
     }
 
@@ -434,7 +466,8 @@ public actor TemporalSpatialMemoryJournalRepository {
         return TemporalSpatialMemoryJournalRecovery(
             policy: record.policy,
             snapshot: snapshot,
-            replayedEntryCount: record.entries.count
+            replayedEntryCount: record.entries.count,
+            pendingRemovedObjects: record.pendingRemovedObjects
         )
     }
 
@@ -472,6 +505,9 @@ public actor TemporalSpatialMemoryJournalRepository {
             guard existing.policy == policy else {
                 throw TemporalSpatialMemoryJournalError.policyConflict(mapID: mapID)
             }
+            guard existing.pendingRemovedObjects.isEmpty else {
+                throw TemporalSpatialMemoryJournalError.reclamationPending(mapID: mapID)
+            }
             if let prior = existing.entries.first(where: { $0.update.id == entry.update.id }) {
                 guard prior == entry else {
                     throw TemporalSpatialMemoryJournalError.updateIdentifierCollision(
@@ -482,6 +518,13 @@ public actor TemporalSpatialMemoryJournalRepository {
             }
 
             let recovered = try existing.recoveredSnapshot()
+            // Compaction may have folded the last append into the checkpoint.
+            // Verify the full transition before acknowledging its exact retry.
+            if recovered == resultingSnapshot {
+                try verify(entry, policy: policy, previousSnapshot: previousSnapshot,
+                    resultingSnapshot: resultingSnapshot)
+                return .alreadyAppended(recovered)
+            }
             guard recovered == previousSnapshot else {
                 throw TemporalSpatialMemoryJournalError.journalDiverged(mapID: mapID)
             }
@@ -535,7 +578,7 @@ public actor TemporalSpatialMemoryJournalRepository {
         catalog.journals.sort(by: TemporalSpatialMemoryJournalCatalog.journalOrder)
         try Task.checkCancellation()
         try validateBeforeCommit?()
-        try commit(catalog)
+        try commit(catalog, validateBeforeCommit: validateBeforeCommit)
         #if DEBUG
         let hook = afterNextCommitForTesting
         afterNextCommitForTesting = nil
@@ -570,6 +613,74 @@ public actor TemporalSpatialMemoryJournalRepository {
         try commit(catalog, reclaiming: true)
     }
 
+    /// Journal publication is the reclamation commit point. Exact removed
+    /// metadata is retained as an intent until its separate projection is erased.
+    public func beginRemovedObjectReclamation(
+        expectedSnapshot: TemporalSpatialMemorySnapshot,
+        policy: TemporalSpatialMemoryPolicy,
+        expectedRemovedObjects: [SpatialObjectMetadata]? = nil
+    ) async throws -> [SpatialObjectMetadata] {
+        try Task.checkCancellation()
+        var catalog = try loadCatalogRecoveringInvalidData()
+        let mapID = expectedSnapshot.mapID
+        let existingIndex = catalog.journals.firstIndex { $0.mapID == mapID }
+        if let existingIndex {
+            let existing = catalog.journals[existingIndex]
+            guard existing.policy == policy,
+                existing.coordinateFrameID == expectedSnapshot.coordinateFrameID,
+                try existing.recoveredSnapshot() == expectedSnapshot
+            else { throw TemporalSpatialMemoryJournalError.journalDiverged(mapID: mapID) }
+            guard existing.pendingRemovedObjects.isEmpty else {
+                throw TemporalSpatialMemoryJournalError.reclamationPending(mapID: mapID)
+            }
+        }
+        let journalRemoved = expectedSnapshot.reclaimableRemovedObjects
+        let removed = expectedRemovedObjects ?? journalRemoved
+        guard Set(removed.map { $0.object.id }) == Set(journalRemoved.map { $0.object.id }),
+            removed.count == journalRemoved.count else { throw TemporalSpatialMemoryJournalError.invalidJournal }
+        for metadata in removed {
+            guard let journalMetadata = expectedSnapshot.metadata(for: metadata.object.id) else {
+                throw TemporalSpatialMemoryJournalError.invalidJournal
+            }
+            var comparableObject = metadata.object
+            try comparableObject.setDisplayName(journalMetadata.object.displayName)
+            guard try SpatialObjectMetadata(mapID: metadata.mapID, object: comparableObject,
+                position: metadata.position) == journalMetadata else {
+                throw TemporalSpatialMemoryJournalError.journalDiverged(mapID: mapID)
+            }
+        }
+        guard !removed.isEmpty else { return [] }
+        let record = try TemporalSpatialMemoryJournalRecord(
+            mapID: mapID, coordinateFrameID: expectedSnapshot.coordinateFrameID,
+            policy: policy, checkpoint: expectedSnapshot.reclaimingRemovedObjectHistory(),
+            entries: [], pendingRemovedObjects: removed)
+        if let existingIndex { catalog.journals[existingIndex] = record }
+        else { catalog.journals.append(record) }
+        catalog.journals.sort(by: TemporalSpatialMemoryJournalCatalog.journalOrder)
+        try commit(catalog, reclaiming: true)
+        return removed
+    }
+
+    public func completeRemovedObjectReclamation(
+        mapID: MapID, coordinateFrameID: CoordinateFrameID,
+        expectedRemovedObjects: [SpatialObjectMetadata]
+    ) async throws {
+        try Task.checkCancellation()
+        var catalog = try loadCatalogRecoveringInvalidData()
+        guard let index = catalog.journals.firstIndex(where: { $0.mapID == mapID }) else {
+            throw TemporalSpatialMemoryJournalError.journalDiverged(mapID: mapID)
+        }
+        let record = catalog.journals[index]
+        guard record.coordinateFrameID == coordinateFrameID,
+            record.pendingRemovedObjects == expectedRemovedObjects.sorted(by: { $0.object.id < $1.object.id })
+        else { throw TemporalSpatialMemoryJournalError.journalDiverged(mapID: mapID) }
+        guard !record.pendingRemovedObjects.isEmpty else { return }
+        catalog.journals[index] = try TemporalSpatialMemoryJournalRecord(
+            mapID: mapID, coordinateFrameID: coordinateFrameID,
+            policy: record.policy, checkpoint: record.recoveredSnapshot(), entries: [])
+        try commit(catalog, reclaiming: true)
+    }
+
     private func loadCatalogRecoveringInvalidData() throws
         -> TemporalSpatialMemoryJournalCatalog
     {
@@ -580,6 +691,7 @@ public actor TemporalSpatialMemoryJournalRepository {
         )
         try SpatialStorageDirectory.validatePath(at: catalogURL, fileManager: fileManager)
         guard fileManager.fileExists(atPath: catalogURL.path) else {
+            cachedCatalog = nil
             return try TemporalSpatialMemoryJournalCatalog()
         }
         let data: Data
@@ -596,11 +708,15 @@ public actor TemporalSpatialMemoryJournalRepository {
         }
 
         do {
-            try SpatialStorageDirectory.validateJSONSchemas(data, maximumSchemaVersion: 3)
-            return try JSONDecoder().decode(
+            if let cachedCatalog, cachedCatalog.data == data { return cachedCatalog.catalog }
+            try SpatialStorageDirectory.validateJSONSchemas(data, maximumSchemaVersion: 4,
+                                                           maximumNestedSchemaVersion: 3)
+            let catalog = try JSONDecoder().decode(
                 TemporalSpatialMemoryJournalCatalog.self,
                 from: data
             )
+            cachedCatalog = (data, catalog)
+            return catalog
         } catch let error as SpatialStorageError {
             throw error
         } catch {
@@ -653,24 +769,46 @@ public actor TemporalSpatialMemoryJournalRepository {
         }
     }
 
-    private func commit(_ catalog: TemporalSpatialMemoryJournalCatalog, reclaiming: Bool = false) throws {
+    private func commit(
+        _ proposed: TemporalSpatialMemoryJournalCatalog,
+        reclaiming: Bool = false,
+        validateBeforeCommit: (@Sendable () throws -> Void)? = nil
+    ) throws {
+        var catalog = proposed
         try validateConfiguredCapacity(catalog)
         try prepareDirectory()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(catalog)
-        guard data.count <= Self.maximumCatalogBytes else {
+        var data = try encoder.encode(catalog)
+        if data.count > catalogByteLimit {
+            // Compact by bytes as well as entry count. Only redundant replay
+            // history is folded away; every place's exact latest state remains.
+            catalog.journals = try catalog.journals.map { record in
+                try Task.checkCancellation()
+                guard !record.entries.isEmpty else { return record }
+                return try TemporalSpatialMemoryJournalRecord(
+                    mapID: record.mapID, coordinateFrameID: record.coordinateFrameID,
+                    policy: record.policy, checkpoint: record.recoveredSnapshot(), entries: []
+                )
+            }
+            data = try encoder.encode(catalog)
+        }
+        guard data.count <= catalogByteLimit else {
             throw TemporalSpatialMemoryJournalError.catalogTooLarge(
                 actual: data.count,
-                maximum: Self.maximumCatalogBytes
+                maximum: catalogByteLimit
             )
         }
+        try Task.checkCancellation()
+        try validateBeforeCommit?()
         try SpatialStorageDirectory.atomicWrite(
             data, to: catalogURL, directory: directoryURL, fileManager: fileManager, reclaiming: reclaiming
         )
+        cachedCatalog = (data, catalog)
     }
 
     private func quarantineCatalog(reason: String) throws {
+        cachedCatalog = nil
         try SpatialStorageDirectory.validatePath(at: catalogURL, fileManager: fileManager)
         guard fileManager.fileExists(atPath: catalogURL.path) else {
             return

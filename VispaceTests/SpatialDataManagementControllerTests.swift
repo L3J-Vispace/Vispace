@@ -1,9 +1,28 @@
 import Foundation
 import XCTest
+import VispaceCore
 
 @testable import Vispace
 
 final class SpatialDataManagementControllerTests: XCTestCase {
+    @MainActor
+    func testRemovedHistoryCleanupIsSerializedAndReportsItsOwnSuccess() async {
+        let mapID = MapID()
+        let recorder = DeletionRecorder()
+        let controller = SpatialDataManagementController(cleanupRemovedHistoryAction: { selected in
+            XCTAssertEqual(selected, mapID)
+            await recorder.record()
+        }, deleteAction: { XCTFail("History cleanup must not erase the whole store") })
+        XCTAssertTrue(controller.supportsRemovedHistoryCleanup)
+        controller.cleanupRemovedObjectHistory(mapID)
+        controller.cleanupRemovedObjectHistory(mapID)
+        XCTAssertEqual(controller.state, .cleaningRemovedHistory)
+        XCTAssertTrue(controller.isBusy)
+        await waitUntil { controller.state == .cleanedRemovedHistory }
+        let count = await recorder.count
+        XCTAssertEqual(count, 1)
+        XCTAssertFalse(controller.isBusy)
+    }
     func testMaintenanceDeletesOnlyDedicatedSpatialCaptureContents() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

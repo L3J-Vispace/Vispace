@@ -21,6 +21,7 @@ struct CameraScreen: View {
     @ObservedObject var lifecycle: SpatialApplicationLifecycle
     @State private var showsDataManagement = false
     @State private var registrationName: String?
+    @State private var query = ""
 
     private var recoveryMode: CameraRecoveryMode? {
         if lifecycle.state == .storageUnavailable { return .storageUnavailable }
@@ -76,6 +77,7 @@ struct CameraScreen: View {
                     relationQueryController: relationQueryController,
                     placementController: placementController,
                     navigationController: navigationController,
+                    query: $query,
                     onManageData: {
                         showsDataManagement = true
                     },
@@ -90,11 +92,9 @@ struct CameraScreen: View {
                     onRegisterObject: { name in
                         registrationController.cancel()
                         registrationName = name
-                    }
+                    },
+                    isVisible: registrationName == nil
                 )
-                .opacity(registrationName == nil ? 1 : 0)
-                .allowsHitTesting(registrationName == nil)
-                .accessibilityHidden(registrationName != nil)
                 if sessionController.persistenceFailureMessage != nil
                     || perceptionController.persistenceFailureMessage != nil {
                     VStack {
@@ -138,12 +138,25 @@ struct CameraScreen: View {
                 if let registrationName {
                     UserObjectRegistrationOverlay(
                         controller: registrationController, initialName: registrationName,
+                        distanceDescription: { metadata in
+                            guard let frame = sessionController.latestDepthFrame,
+                                frame.pose.mapID == metadata.mapID,
+                                frame.pose.coordinateFrameID == metadata.position.coordinateFrameID else {
+                                return "현재 거리 확인 불가"
+                            }
+                            let camera = frame.pose.cameraTransform.column3
+                            let position = metadata.position.value
+                            let distance = hypot(hypot(position.x - Double(camera.x), position.y - Double(camera.y)),
+                                position.z - Double(camera.z))
+                            return "저장 위치는 카메라에서 약 \(distance.formatted(.number.precision(.fractionLength(1))))m"
+                        },
                         onClose: {
                             registrationController.cancel()
                             self.registrationName = nil
                         },
                         onSearch: { name in
                             registrationController.cancel()
+                            query = name
                             self.registrationName = nil
                             queryController.submit(name)
                         }

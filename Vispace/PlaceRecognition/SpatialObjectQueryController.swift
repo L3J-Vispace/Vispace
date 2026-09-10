@@ -165,6 +165,25 @@ public final class SpatialObjectQueryController: ObservableObject {
     @Published public private(set) var latestPresentation: SpatialObjectQueryPresentation?
     @Published public private(set) var latestGroundedTarget: GroundedSpatialObjectQueryTarget?
     @Published public private(set) var metrics = SpatialObjectQueryControllerMetrics()
+    @Published public private(set) var candidatePageOffset = 0
+
+    public var visibleCandidates: [GroundedSpatialObjectCandidate] {
+        guard let result = latestPresentation?.result else { return [] }
+        return result.candidatePage(startingAt: candidatePageOffset, count: result.candidates.count)
+    }
+
+    public var canShowPreviousCandidatePage: Bool { candidatePageOffset > 0 && !visibleCandidates.isEmpty }
+    public var canShowNextCandidatePage: Bool {
+        guard let result = latestPresentation?.result else { return false }
+        return candidatePageOffset + visibleCandidates.count < result.totalCandidateCount
+    }
+
+    public func showCandidatePage(next: Bool) {
+        guard queryTask == nil, presentedIdentity == currentIdentityProvider(),
+            let result = latestPresentation?.result, result.candidates.count > 0,
+            (next ? canShowNextCandidatePage : canShowPreviousCandidatePage) else { return }
+        candidatePageOffset = max(0, candidatePageOffset + (next ? 1 : -1) * result.candidates.count)
+    }
 
     var isProcessingForTesting: Bool {
         queryTask != nil
@@ -240,13 +259,15 @@ public final class SpatialObjectQueryController: ObservableObject {
     public func submit(
         _ utterance: String,
         currentFloorNodeID: SpatialNodeID? = nil,
-        now: TimeInterval = Date().timeIntervalSince1970
+        now: TimeInterval = Date().timeIntervalSince1970,
+        onRelationQuery: (@MainActor @Sendable (String) -> Void)? = nil
     ) {
         pendingObservationRefreshAt = nil
         allowsObservationRefresh = true
         latestSubmittedQuery = utterance
         latestSubmittedFloor = currentFloorNodeID
-        startQuery(utterance, currentFloorNodeID: currentFloorNodeID, now: now)
+        startQuery(utterance, currentFloorNodeID: currentFloorNodeID, now: now,
+                   onRelationQuery: onRelationQuery)
     }
 
     /// Rechecks the submitted request after real observations have been saved.
@@ -273,7 +294,7 @@ public final class SpatialObjectQueryController: ObservableObject {
                                 now: TimeInterval = Date().timeIntervalSince1970) {
         guard let presentation = latestPresentation,
             presentedIdentity == currentIdentityProvider(),
-            let candidate = presentation.result.candidates.first(where: {
+            let candidate = visibleCandidates.first(where: {
                 $0.record.metadata.object.id == objectID && $0.record.metadata.mapID == mapID
             }) else { return }
         startQuery(latestSubmittedQuery, currentFloorNodeID: latestSubmittedFloor, now: now,
@@ -476,7 +497,8 @@ public final class SpatialObjectQueryController: ObservableObject {
     }
 
     private func startQuery(_ utterance: String, currentFloorNodeID: SpatialNodeID?, now: TimeInterval,
-                            selection: SpatialObjectMetadata? = nil, selectedRoute: IntentRoute? = nil) {
+                            selection: SpatialObjectMetadata? = nil, selectedRoute: IntentRoute? = nil,
+                            onRelationQuery: (@MainActor @Sendable (String) -> Void)? = nil) {
         if selection != nil {
             allowsObservationRefresh = false
             pendingObservationRefreshAt = nil
@@ -499,6 +521,7 @@ public final class SpatialObjectQueryController: ObservableObject {
         metrics.requestsStarted &+= 1
         latestPresentation = nil
         latestGroundedTarget = nil
+        candidatePageOffset = 0
         state = .searching(requestID: requestID)
 
         let snapshotProvider = self.snapshotProvider
@@ -550,18 +573,33 @@ public final class SpatialObjectQueryController: ObservableObject {
                     }
                     result = engine.select(record: latestRecord, route: selectedRoute, context: context)
                 } else {
-                    result = await Task.detached(priority: .userInitiated) {
-                        engine.search(
+                    let worker = Task.detached(priority: .userInitiated) {
+                        try engine.search(
                         utterance: query,
                         records: records,
-                        context: context
+                        context: context,
+                        checkCancellation: { try Task.checkCancellation() }
                         )
-                    }.value
+                    }
+                    result = try await withTaskCancellationHandler {
+                        try await worker.value
+                    } onCancel: {
+                        worker.cancel()
+                    }
                 }
                 try Task.checkCancellation()
                 guard self.isCurrent(requestID: requestID, identity: identity) else {
                     self.rejectStaleResult(requestID: requestID)
                     self.finish(requestID: requestID)
+                    return
+                }
+
+                if result.route.kind == .relationQuery, let onRelationQuery {
+                    self.allowsObservationRefresh = false
+                    self.pendingObservationRefreshAt = nil
+                    self.state = .idle
+                    self.finish(requestID: requestID)
+                    onRelationQuery(query)
                     return
                 }
 

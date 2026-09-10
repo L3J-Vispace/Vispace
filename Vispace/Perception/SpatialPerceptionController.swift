@@ -1227,7 +1227,7 @@ public final class SpatialPerceptionController: ObservableObject {
         if let current = identityReviews[metadata.object.id],
             current.pose.sessionToken == frame.pose.sessionToken,
             current.candidate.existingCandidates.map(\.object.id)
-                == Array(candidates.prefix(32)).map(\.object.id),
+                == candidates.map(\.object.id),
             current.candidate.observedMetadata.position.value.distance(to: metadata.position.value) <= 0.12
         {
             refreshIdentityReviewList()
@@ -1238,7 +1238,7 @@ public final class SpatialPerceptionController: ObservableObject {
         identityReviews[metadata.object.id] = IdentityReview(
             candidate: ObjectIdentityConfirmationCandidate(
                 id: UUID(), observedObjectID: metadata.object.id, observedMetadata: metadata,
-                existingCandidates: Array(candidates.prefix(32)),
+                existingCandidates: candidates,
                 frameID: FrameID(rawValue: frame.pose.id.rawValue), capturedAt: frame.pose.capturedAt,
                 sessionToken: frame.pose.sessionToken), frame: frame)
         refreshIdentityReviewList()

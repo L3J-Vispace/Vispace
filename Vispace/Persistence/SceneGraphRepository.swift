@@ -414,6 +414,41 @@ public actor SceneGraphRepository {
         try clearProjectionDeferral(mapID: mapID)
     }
 
+    /// Reclaims only evidence touching explicitly removed objects. Unrelated
+    /// observed relations and their history cannot be reconstructed from bounds.
+    public func removeObjectHistory(
+        mapID: MapID, coordinateFrameID: CoordinateFrameID, objectIDs: Set<ObjectID>
+    ) async throws {
+        try Task.checkCancellation()
+        guard !objectIDs.isEmpty else { return }
+        var catalog = try loadRecoveringInvalidData()
+        guard let index = catalog.records.firstIndex(where: { $0.mapID == mapID }) else { return }
+        let existing = catalog.records[index]
+        guard existing.coordinateFrameID == coordinateFrameID else {
+            throw SceneGraphRepositoryError.mapCoordinateFrameConflict(mapID)
+        }
+        let removedEntities = Set(objectIDs.map { SceneEntityID.object($0) })
+        func touchesRemovedObject(_ relation: SpatialRelation) -> Bool {
+            removedEntities.contains(relation.key.subject) || removedEntities.contains(relation.key.object)
+        }
+        var graph = existing.graph
+        let removedRelations = graph.relations(includeProvisional: true).filter(touchesRemovedObject)
+        for relation in removedRelations { graph.remove(relation.key) }
+        let history = existing.expiredRelationHistory.filter { !touchesRemovedObject($0) }
+        guard !removedRelations.isEmpty || history.count != existing.expiredRelationHistory.count else { return }
+        guard existing.revision < UInt64.max else { throw SceneGraphRepositoryError.invalidRevision }
+        catalog.records[index] = try SceneGraphMapRecord(
+            mapID: mapID, coordinateFrameID: coordinateFrameID, revision: existing.revision + 1,
+            graph: graph, geometryProjection: existing.geometryProjection, expiredRelationHistory: history,
+            appliedUpdateIDs: existing.appliedUpdateIDs, appliedUpdateOrder: existing.appliedUpdateOrder,
+            createdAt: existing.createdAt, updatedAt: existing.updatedAt
+        )
+        // Retain ordering even for an empty graph so a stale writer cannot
+        // recreate reclaimed evidence. Retrying the same cleanup is a no-op.
+        try Task.checkCancellation()
+        try commit(catalog, reclaiming: true)
+    }
+
     private func loadRecoveringInvalidData() throws -> SceneGraphCatalogSnapshot {
         try SpatialStorageDirectory.prepare(
             at: directoryURL,

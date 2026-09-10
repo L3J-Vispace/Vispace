@@ -85,6 +85,21 @@ final class VispaceServices: ObservableObject {
             },
             metadataWriter: durableMetadataWriter,
             metadataBatchWriter: durableMetadataBatchWriter,
+            metadataRemover: { expected in
+                guard let first = expected.first else { return }
+                objectMutationFence.begin()
+                defer { objectMutationFence.end() }
+                try await repository.removeObjectMetadataIfMatching(expected)
+                // Reclaim only the removed objects' evidence, preserving unrelated
+                // observations and history that geometry cannot reconstruct.
+                // A failed projection leaves the journal intent pending for retry.
+                try await sceneGraphRepository.removeObjectHistory(mapID: first.mapID,
+                    coordinateFrameID: first.position.coordinateFrameID,
+                    objectIDs: Set(expected.map { $0.object.id }))
+                // Exact endpoint deletion already updates the graph. General
+                // projection replay belongs to normal recovery after reclamation
+                // and must not prevent cleanup when ordinary writes hit quota.
+            },
             poseValidator: sessionController.makeTemporalPoseValidator()
         )
         let detectorResolution: ObjectDetectorResolution
@@ -127,7 +142,37 @@ final class VispaceServices: ObservableObject {
         let registrationController = UserObjectRegistrationController(
             frameStreamProvider: { sessionController.frames },
             confirmedIdentityProvider: { sessionController.confirmedCaptureIdentity(for: $0) },
-            metadataWriter: durableMetadataWriter
+            metadataWriter: { metadata, expected in
+                objectMutationFence.begin()
+                defer { objectMutationFence.end() }
+                // This return value means the annotation is durable. Optional
+                // graph projection cannot turn that success into a failed save.
+                _ = try await repository.commitUserObjectRegistration(metadata, replacing: expected)
+            },
+            existingObjectsProvider: {
+                let identity = await sessionController.captureIdentity
+                let objects = try await repository.metadataSnapshot().objects
+                return objects.filter {
+                    $0.mapID == identity.mapID
+                        && $0.position.coordinateFrameID == identity.coordinateFrameID
+                }
+            },
+            projectionRefresher: {
+                objectMutationFence.begin()
+                defer { objectMutationFence.end() }
+                let document = try await repository.metadataSnapshot()
+                let manualMaps = Set(document.objects.filter(
+                    UserObjectRegistrationAccumulator.isManualRegistration).map(\.mapID))
+                for mapID in manualMaps.sorted() {
+                    try Task.checkCancellation()
+                    guard let map = document.maps.first(where: {
+                        $0.mapID == mapID && $0.availability == .active
+                    }) else { continue }
+                    try await sceneGraphService.rebuild(mapID: mapID,
+                        coordinateFrameID: map.coordinateFrameID,
+                        allObjects: document.objects, at: Date().timeIntervalSince1970)
+                }
+            }
         )
         let placeRecognitionController = PlaceRecognitionController(
             surfaceStreamProvider: { sessionController.surfaces },
@@ -451,10 +496,16 @@ final class VispaceServices: ObservableObject {
         let dataManagementController = SpatialDataManagementController(
             overviewProvider: {
                 let document = try await repository.metadataSnapshot()
+                let usage = try await repository.storageUsageByMap()
                 let places = Dictionary(grouping: document.maps, by: \.mapID).map { mapID, maps in
                     SpatialStoredPlace(
                         id: mapID, updatedAt: maps.map(\.updatedAt).max() ?? 0,
-                        objectCount: document.objects.filter { $0.mapID == mapID }.count
+                        objectCount: document.objects.filter { $0.mapID == mapID }.count,
+                        checkpointBytes: usage[mapID]?.checkpointBytes ?? 0,
+                        olderCheckpointBytes: usage[mapID]?.olderCheckpointBytes ?? 0,
+                        removedObjectCount: document.objects.filter {
+                            $0.mapID == mapID && TemporalSpatialMemorySnapshot.isReclaimableRemovedObject($0)
+                        }.count
                     )
                 }.sorted { $0.updatedAt > $1.updatedAt }
                 return try await Task.detached(priority: .utility) {
@@ -506,6 +557,20 @@ final class VispaceServices: ObservableObject {
                     perceptionController.resetPersistenceStatus()
                     sessionController.resetPersistenceStatus()
                     return mapID
+                }
+            },
+            cleanupRemovedHistoryAction: { mapID in
+                try await lifecycle.performStorageMaintenance {
+                    await temporalMemoryService.reset()
+                    defer { placeRecognitionController.invalidateStoredAssociationCache(for: mapID) }
+                    let document = try await repository.metadataSnapshot()
+                    guard let map = document.maps.first(where: {
+                        $0.mapID == mapID && $0.availability == .active
+                    }) else { throw SpatialDataStoreMaintenanceError.placeUnavailable }
+                    _ = try await temporalMemoryService.reclaimRemovedObjectHistory(
+                        mapID: mapID, coordinateFrameID: map.coordinateFrameID)
+                    perceptionController.resetPersistenceStatus()
+                    sessionController.resetPersistenceStatus()
                 }
             }
         ) {

@@ -7,6 +7,8 @@ struct ObjectIdentityReviewScreen: View {
     @Environment(\.dismiss) private var dismiss
     @State private var message: String?
     @State private var isSaving = false
+    @State private var candidatePageOffsets: [ObjectID: Int] = [:]
+    private let candidatePageSize = 16
 
     var body: some View {
         NavigationStack {
@@ -20,7 +22,8 @@ struct ObjectIdentityReviewScreen: View {
                         Text(
                             "현재 \(candidate.observedMetadata.object.displayLabel) · \(distanceDescription(candidate.observedMetadata.position.value))"
                         )
-                        ForEach(candidate.existingCandidates, id: \.object.id) { existing in
+                        let offset = pageOffset(for: candidate)
+                        ForEach(Array(candidate.existingCandidates.dropFirst(offset).prefix(candidatePageSize)), id: \.object.id) { existing in
                             Button {
                                 perform {
                                     try await controller.confirmObservedObjectIdentity(
@@ -38,6 +41,30 @@ struct ObjectIdentityReviewScreen: View {
                                 }
                             }.disabled(isSaving)
                         }
+                        if candidate.existingCandidates.count > candidatePageSize {
+                            HStack {
+                                Button {
+                                    candidatePageOffsets[candidate.observedObjectID] = max(0, offset - candidatePageSize)
+                                } label: {
+                                    Text("이전 기록").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+                                }
+                                .disabled(isSaving || offset == 0)
+                                .accessibilityIdentifier("vispace.identity.candidates.previous")
+                                Spacer()
+                                Text("\(offset + 1)–\(min(offset + candidatePageSize, candidate.existingCandidates.count)) / \(candidate.existingCandidates.count)")
+                                Spacer()
+                                Button {
+                                    candidatePageOffsets[candidate.observedObjectID] = offset + candidatePageSize
+                                } label: {
+                                    Text("다음 기록").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+                                }
+                                .disabled(isSaving || offset + candidatePageSize >= candidate.existingCandidates.count)
+                                .accessibilityIdentifier("vispace.identity.candidates.next")
+                            }
+                            .buttonStyle(.borderless)
+                            .frame(minHeight: 44)
+                            .accessibilityIdentifier("vispace.identity.candidates.pages")
+                        }
                         Button("이전 물체와 다른 새 물체예요") {
                             perform {
                                 try await controller.acceptObservedObjectAsNew(candidateID: candidate.id)
@@ -52,6 +79,12 @@ struct ObjectIdentityReviewScreen: View {
             .navigationTitle("물체 기록 연결")
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("닫기") { dismiss() } } }
         }
+    }
+
+    private func pageOffset(for candidate: ObjectIdentityConfirmationCandidate) -> Int {
+        let requested = candidatePageOffsets[candidate.observedObjectID] ?? 0
+        let lastPage = max(0, candidate.existingCandidates.count - 1) / candidatePageSize * candidatePageSize
+        return min(requested, lastPage)
     }
 
     private func perform(_ action: @escaping @MainActor () async throws -> Void) {

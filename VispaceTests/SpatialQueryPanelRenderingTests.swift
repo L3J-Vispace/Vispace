@@ -8,6 +8,69 @@ import simd
 
 @MainActor
 final class SpatialQueryPanelRenderingTests: XCTestCase {
+    func testHiddenQueryPanelPreservesDraftAndDisplaysExternalSearchName() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let priorKeyWindow = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.windowLevel = .normal + 1
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+            priorKeyWindow?.makeKey()
+        }
+        let fixture = try await makeFixture(retry: false)
+        var draft = "phone"
+        let binding = Binding(get: { draft }, set: { draft = $0 })
+        var panel = SpatialQueryPanel(
+            perceptionController: fixture.perception, queryController: fixture.query,
+            relationQueryController: fixture.relation, placementController: fixture.placement,
+            navigationController: fixture.navigation, query: binding, onManageData: {},
+            distanceDescription: { _ in "2 m" })
+        let host = UIHostingController(rootView: panel)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        try await waitUntil { self.queryTextField(in: window)?.text == "phone" }
+
+        panel.isVisible = false
+        host.rootView = panel
+        try await waitUntil { self.textFields(in: window).isEmpty }
+        panel.isVisible = true
+        host.rootView = panel
+        try await waitUntil { self.queryTextField(in: window)?.text == "phone" }
+        XCTAssertEqual(draft, "phone", "Showing the panel again must preserve the prior search draft")
+
+        panel.isVisible = false
+        host.rootView = panel
+        try await waitUntil { self.textFields(in: window).isEmpty }
+        let registeredName = "창가 책상 옆 개인용 기계식 키보드"
+        draft = registeredName
+        fixture.query.submit(registeredName)
+        panel.isVisible = true
+        host.rootView = panel
+        try await waitUntil { self.queryTextField(in: window)?.text == registeredName }
+        try await waitUntil { !fixture.query.isProcessingForTesting }
+        XCTAssertEqual(fixture.query.latestPresentation?.result.selectedCandidate?.record.metadata.object.displayName,
+                       registeredName, "The rendered input and the requested object must agree")
+        try await Task.sleep(for: .milliseconds(100))
+        window.layoutIfNeeded()
+        let screenshot = capture(window, name: "query-after-registered-name-search")
+        XCTAssertGreaterThan(try cyanButtonPixelCount(in: screenshot), 100,
+                             "The completed result must render with its navigation action")
+        await fixture.query.invalidateAndWaitForPendingWork()
+    }
+
+    private func queryTextField(in view: UIView) -> UITextField? {
+        // SwiftUI keeps the accessibility identifier on its virtual node, not
+        // on the backing UITextField. This isolated panel has one text input.
+        let fields = textFields(in: view)
+        return fields.count == 1 ? fields.first : nil
+    }
+
+    private func textFields(in view: UIView) -> [UITextField] {
+        if let field = view as? UITextField { return [field] }
+        return view.subviews.flatMap { textFields(in: $0) }
+    }
+
     /// Captures the production panel with in-memory controller inputs. These
     /// images support manual layout review; the backdrop and route failure are
     /// synthetic. This unit-target capture is not a tap or accessibility audit:
@@ -35,7 +98,7 @@ final class SpatialQueryPanelRenderingTests: XCTestCase {
                     let panel = SpatialQueryPanel(
                         perceptionController: fixture.perception, queryController: fixture.query,
                         relationQueryController: fixture.relation, placementController: fixture.placement,
-                        navigationController: fixture.navigation, onManageData: {},
+                        navigationController: fixture.navigation, query: .constant(""), onManageData: {},
                         distanceDescription: { _ in "2 m" })
                     let root = ZStack(alignment: .top) {
                         Color(white: dark ? 0.15 : 0.8).ignoresSafeArea()
@@ -56,6 +119,10 @@ final class SpatialQueryPanelRenderingTests: XCTestCase {
                     window.overrideUserInterfaceStyle = dark ? .dark : .light
                     window.rootViewController = host
                     window.makeKeyAndVisible()
+                    try await waitUntil {
+                        scene.activationState == .foregroundActive && window.isKeyWindow
+                            && self.queryTextField(in: window)?.window === window
+                    }
                     try await Task.sleep(for: .milliseconds(300))
                     window.layoutIfNeeded()
 

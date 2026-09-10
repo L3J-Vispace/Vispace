@@ -354,18 +354,28 @@ final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
     }
 
     func testFarObservationRequiresReviewAndUserConfirmationCommitsOriginalID() async throws {
+        try await verifyFarObservationConfirmation(candidateCount: 1)
+    }
+
+    func testIdentityReviewCanConfirmFortiethStoredCandidateWithoutMergingEarlierOnes() async throws {
+        try await verifyFarObservationConfirmation(candidateCount: 40)
+    }
+
+    private func verifyFarObservationConfirmation(candidateCount: Int) async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let identity = ARCaptureIdentity(mapID: MapID(), status: .confirmed)
-        let original = try temporalExistingMetadata(
-            id: ObjectID(), label: "chair",
-            position: temporalTestPosition(), identity: identity)
+        let existing = try (0..<candidateCount).map { index in
+            try temporalExistingMetadata(id: temporalTestObjectID(90_000 + index), label: "chair",
+                position: temporalTestPosition(), identity: identity)
+        }
+        let original = try XCTUnwrap(existing.last)
         let store = TemporalControllerMetadataStore(
             document: SpatialMetadataDocument(
                 maps: [
                     temporalTestMapMetadata(
                         mapID: identity.mapID!, coordinateFrameID: identity.coordinateFrameID)
-                ], objects: [original]))
+                ], objects: existing))
         let journal = TemporalSpatialMemoryJournalRepository(directoryURL: root)
         let service = TemporalSpatialMemoryService(
             journalRepository: journal,
@@ -401,7 +411,10 @@ final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
                     controller.identityConfirmationCandidates.first?.id, reviewedID,
                     "Stable review IDs must survive ordinary new frames while the user taps")
                 let before = await store.objects()
-                XCTAssertEqual(before, [original], "Far proximity alone must not write or merge")
+                XCTAssertEqual(Set(before), Set(existing), "Far proximity alone must not write or merge")
+                let candidates = try XCTUnwrap(controller.identityConfirmationCandidates.first?.existingCandidates)
+                XCTAssertEqual(candidates.count, candidateCount)
+                XCTAssertEqual(candidates.last?.object.id, original.object.id)
                 try await controller.confirmObservedObjectIdentity(
                     candidateID: XCTUnwrap(reviewedID),
                     existingObjectID: original.object.id,
@@ -409,8 +422,12 @@ final class SpatialPerceptionTemporalMemoryTests: XCTestCase {
             }
         }
         let objects = await store.objects()
-        XCTAssertEqual(objects.count, 1)
-        let moved = try XCTUnwrap(objects.first)
+        XCTAssertEqual(objects.count, candidateCount)
+        let moved = try XCTUnwrap(objects.first { $0.object.id == original.object.id })
+        XCTAssertEqual(Set(objects.map(\.object.id)), Set(existing.map(\.object.id)))
+        for unchanged in objects where unchanged.object.id != original.object.id {
+            XCTAssertEqual(unchanged.position.value, existing.first { $0.object.id == unchanged.object.id }?.position.value)
+        }
         XCTAssertEqual(moved.object.id, original.object.id)
         XCTAssertEqual(moved.position.value.x, 2, accuracy: 0.01)
         XCTAssertEqual(moved.object.firstSeenAt, original.object.firstSeenAt)

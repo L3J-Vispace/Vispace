@@ -147,6 +147,58 @@ final class IndoorNavigationControllerTests: XCTestCase {
         await harness.controller.deactivateAndWaitForPendingWork()
     }
 
+    func testContinuousWalkingPosesDoNotStarveDebouncedRecalculation() async throws {
+        let fixture = NavigationAppFixture()
+        let harness = makeHarness(fixture: fixture, surfaceStabilityDelay: .milliseconds(250),
+                                  tracksCameraFloorPosition: true)
+        await establishInitialRoute(harness, fixture: fixture, destination: try fixture.metadata(x: 2))
+
+        await requireReplacementWhilePosesContinue(harness, fixture: fixture) { index in
+            0.5 + Float(index) * 0.002
+        }
+        XCTAssertGreaterThanOrEqual(harness.controller.metrics.routeInvalidations, 1)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
+    func testStoppedUserReceivesReplacementWhileCameraPosesContinue() async throws {
+        let fixture = NavigationAppFixture()
+        let harness = makeHarness(fixture: fixture, surfaceStabilityDelay: .milliseconds(250),
+                                  tracksCameraFloorPosition: true)
+        await establishInitialRoute(harness, fixture: fixture, destination: try fixture.metadata(x: 2))
+
+        // Standing still does not stop ARKit from delivering fresh camera poses.
+        await requireReplacementWhilePosesContinue(harness, fixture: fixture) { _ in 0.5 }
+        XCTAssertGreaterThanOrEqual(harness.controller.metrics.routeInvalidations, 1)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
+    func testClearedRouteCanRetryAtMovedPositionDuringContinuousPoses() async throws {
+        let fixture = NavigationAppFixture()
+        let harness = makeHarness(fixture: fixture, surfaceStabilityDelay: .milliseconds(250),
+                                  tracksCameraFloorPosition: true)
+        let destination = try fixture.metadata(x: 2)
+        await establishInitialRoute(harness, fixture: fixture, destination: destination)
+
+        harness.controller.clearRoute()
+        harness.controller.navigate(to: destination)
+        await requireReplacementWhilePosesContinue(harness, fixture: fixture) { _ in 0.5 }
+        XCTAssertEqual(harness.controller.renderablePath?.destinationObjectID, destination.object.id)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
+    func testNewDestinationDoesNotReuseOldOriginDuringContinuousPoses() async throws {
+        let fixture = NavigationAppFixture()
+        let harness = makeHarness(fixture: fixture, surfaceStabilityDelay: .milliseconds(250),
+                                  tracksCameraFloorPosition: true)
+        await establishInitialRoute(harness, fixture: fixture, destination: try fixture.metadata(x: 2))
+
+        let replacement = try fixture.metadata(x: 1)
+        harness.controller.navigate(to: replacement)
+        await requireReplacementWhilePosesContinue(harness, fixture: fixture) { _ in 0.5 }
+        XCTAssertEqual(harness.controller.renderablePath?.destinationObjectID, replacement.object.id)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
     func testArrivalRemovesPathAndFinishesNavigation() async throws {
         let fixture = NavigationAppFixture()
         let harness = makeHarness(fixture: fixture)
@@ -159,6 +211,62 @@ final class IndoorNavigationControllerTests: XCTestCase {
         await eventually { harness.controller.state == .arrived }
         XCTAssertNil(harness.controller.renderablePath)
         XCTAssertTrue(harness.controller.latestPresentation?.message.contains("도착") == true)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
+    func testArrivalMessageSurvivesSurfaceUpdatesAndTrackingRecovery() async throws {
+        let fixture = NavigationAppFixture()
+        let harness = makeHarness(fixture: fixture)
+        await establishInitialRoute(harness, fixture: fixture, destination: try fixture.metadata(x: 2))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10.1, x: 1.9))
+        await eventually { harness.controller.state == .arrived }
+        let arrival = harness.controller.latestPresentation
+        XCTAssertNotNil(arrival)
+
+        harness.surfaceContinuation.yield(fixture.surface(revision: 2, timestamp: 10.2))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10.2, x: 1.9,
+                                                  trackingState: .limited(.excessiveMotion)))
+        await settle()
+        XCTAssertEqual(harness.controller.latestPresentation, arrival)
+        XCTAssertEqual(harness.controller.state, .arrived)
+
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10.3, x: 1.9))
+        await settle()
+        XCTAssertEqual(harness.controller.latestPresentation, arrival)
+        XCTAssertEqual(harness.controller.state, .arrived)
+        XCTAssertNil(harness.controller.renderablePath)
+        XCTAssertEqual(harness.controller.metrics.requestsStarted, 1)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
+    func testArrivalCompletesRequestAcrossBackgroundAndNewDestination() async throws {
+        let fixture = NavigationAppFixture()
+        let harness = makeHarness(fixture: fixture)
+        await establishInitialRoute(harness, fixture: fixture, destination: try fixture.metadata(x: 2))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10.1, x: 1.9))
+        await eventually { harness.controller.state == .arrived }
+
+        harness.controller.deactivate()
+        XCTAssertEqual(harness.controller.state, .inactive)
+        XCTAssertNil(harness.controller.latestPresentation)
+        harness.controller.activate()
+        // Wait for an observed stream transition, not the already-ready state
+        // retained by activate(). Otherwise the fresh pose can arrive only
+        // after navigate(), legitimately starting a movement reevaluation.
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10.2,
+                                                   trackingState: .limited(.excessiveMotion)))
+        await eventually { harness.controller.state == .waitingForPose }
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10.3))
+        await eventually { harness.controller.state == .ready }
+        XCTAssertNil(harness.controller.renderablePath)
+        XCTAssertNil(harness.controller.latestPresentation)
+        XCTAssertEqual(harness.controller.metrics.requestsStarted, 1)
+
+        let replacement = try fixture.metadata(x: 1)
+        harness.controller.navigate(to: replacement)
+        await eventually { harness.controller.renderablePath != nil }
+        XCTAssertEqual(harness.controller.renderablePath?.destinationObjectID, replacement.object.id)
+        XCTAssertEqual(harness.controller.metrics.requestsStarted, 2)
         await harness.controller.deactivateAndWaitForPendingWork()
     }
 
@@ -502,6 +610,115 @@ final class IndoorNavigationControllerTests: XCTestCase {
         }
         XCTAssertNil(harness.controller.renderablePath)
         XCTAssertEqual(harness.controller.state, .noPath)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
+    func testDestinationMoveDuringEvidenceReadCannotPublishOldPath() async throws {
+        let fixture = NavigationAppFixture()
+        let source = try fixture.metadata(x: 2)
+        let store = NavigationMetadataStore(source)
+        let (harness, provider) = makeSuspendedHarness(fixture: fixture, store: store)
+        harness.controller.activate()
+        harness.surfaceContinuation.yield(fixture.surface(revision: 1))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10))
+        harness.controller.navigate(to: source)
+        try await waitForEvidenceRequest(provider, 1)
+
+        await store.replace(try fixture.metadata(x: 1, objectID: source.object.id))
+        await provider.resume(index: 0, with: .ready(try fixture.evidence(revision: 1)))
+        await eventually { !harness.controller.isRoutingForTesting }
+        XCTAssertEqual(harness.controller.latestPresentation?.targetIssue, .searchTargetMismatch)
+        XCTAssertNil(harness.controller.renderablePath)
+        XCTAssertEqual(harness.controller.metrics.routesPublished, 0)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
+    func testGroundedDestinationRemovalDuringEvidenceReadCannotPublishPath() async throws {
+        let fixture = NavigationAppFixture()
+        let source = try fixture.metadata(x: 2)
+        let store = NavigationMetadataStore(source)
+        let (harness, provider) = makeSuspendedHarness(fixture: fixture, store: store)
+        harness.controller.activate()
+        harness.surfaceContinuation.yield(fixture.surface(revision: 1))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10))
+        harness.controller.navigate(to: groundedTarget(source, identity: fixture.identity))
+        try await waitForEvidenceRequest(provider, 1)
+
+        var removed = source.object
+        removed.presence = .removed
+        await store.replace(try SpatialObjectMetadata(mapID: source.mapID,
+                                                     object: removed, position: source.position))
+        await provider.resume(index: 0, with: .ready(try fixture.evidence(revision: 1)))
+        await eventually { !harness.controller.isRoutingForTesting }
+        XCTAssertEqual(harness.controller.latestPresentation?.targetIssue, .searchTargetMismatch)
+        XCTAssertNil(harness.controller.renderablePath)
+        XCTAssertEqual(harness.controller.metrics.routesPublished, 0)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
+    func testGroundedTargetLeaseMustRemainValidAtPublication() async throws {
+        let fixture = NavigationAppFixture()
+        let source = try fixture.metadata(x: 2)
+        let store = NavigationMetadataStore(source)
+        let clock = NavigationWallClock(10)
+        let (harness, provider) = makeSuspendedHarness(fixture: fixture, store: store,
+                                                     nowProvider: { clock.value })
+        harness.controller.activate()
+        harness.surfaceContinuation.yield(fixture.surface(revision: 1))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10))
+        harness.controller.navigate(to: groundedTarget(source, identity: fixture.identity))
+        try await waitForEvidenceRequest(provider, 1)
+
+        clock.value = 40
+        await provider.resume(index: 0, with: .ready(try fixture.evidence(revision: 1)))
+        await eventually { !harness.controller.isRoutingForTesting }
+        XCTAssertEqual(harness.controller.latestPresentation?.targetIssue, .targetStale)
+        XCTAssertNil(harness.controller.renderablePath)
+        XCTAssertEqual(harness.controller.metrics.routesPublished, 0)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
+    func testUnchangedGroundedObservationCanRefreshDuringEvidenceRead() async throws {
+        let fixture = NavigationAppFixture()
+        let source = try fixture.metadata(x: 2)
+        let store = NavigationMetadataStore(source)
+        let (harness, provider) = makeSuspendedHarness(fixture: fixture, store: store)
+        harness.controller.activate()
+        harness.surfaceContinuation.yield(fixture.surface(revision: 1))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10))
+        harness.controller.navigate(to: groundedTarget(source, identity: fixture.identity))
+        try await waitForEvidenceRequest(provider, 1)
+
+        await store.replace(try observingAgain(source, at: 9.5))
+        await provider.resume(index: 0, with: .ready(try fixture.evidence(revision: 1)))
+        await eventually { harness.controller.renderablePath != nil }
+        XCTAssertEqual(harness.controller.renderablePath?.destinationObjectID, source.object.id)
+        XCTAssertEqual(harness.controller.metrics.routesPublished, 1)
+        await harness.controller.deactivateAndWaitForPendingWork()
+    }
+
+    func testRenderLeaseEndsWhenGroundedTargetExpires() async throws {
+        let fixture = NavigationAppFixture()
+        let source = try fixture.metadata(x: 2)
+        let store = NavigationMetadataStore(source)
+        let clock = NavigationWallClock(38.92)
+        let (harness, provider) = makeSuspendedHarness(fixture: fixture, store: store,
+                                                     nowProvider: { clock.value })
+        harness.controller.activate()
+        harness.surfaceContinuation.yield(fixture.surface(revision: 1))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10))
+        // This handoff was resolved at 9 and expires at 39, before the
+        // ordinary one-second route lease would finish.
+        harness.controller.navigate(to: groundedTarget(source, identity: fixture.identity))
+        try await waitForEvidenceRequest(provider, 1)
+        await provider.resume(index: 0, with: .ready(try fixture.evidence(revision: 1)))
+        await eventually { harness.controller.renderablePath != nil }
+
+        clock.value = 39.1
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertNil(harness.controller.renderablePath)
+        XCTAssertEqual(harness.controller.latestPresentation?.targetIssue, .targetStale)
+        XCTAssertEqual(harness.controller.metrics.routesPublished, 1)
         await harness.controller.deactivateAndWaitForPendingWork()
     }
 
@@ -1160,12 +1377,41 @@ final class IndoorNavigationControllerTests: XCTestCase {
         return try SpatialObjectMetadata(mapID: source.mapID, object: object, position: position)
     }
 
+    private func makeSuspendedHarness(
+        fixture: NavigationAppFixture,
+        store: NavigationMetadataStore,
+        nowProvider: @escaping @Sendable () -> TimeInterval = { 10 }
+    ) -> (NavigationControllerHarness, SuspendedNavigationEvidenceProvider) {
+        let (surfaceStream, surfaceContinuation) = AsyncStream<ARSurfaceStateSnapshot>.makeStream()
+        let (poseStream, poseContinuation) = AsyncStream<ARPoseSnapshot>.makeStream()
+        let provider = SuspendedNavigationEvidenceProvider()
+        let controller = IndoorNavigationController(
+            surfaces: surfaceStream,
+            poses: poseStream,
+            currentIdentityProvider: { fixture.identity },
+            evidenceProvider: { snapshot, identity in
+                try await provider.load(surface: snapshot, identity: identity)
+            },
+            startPositionProvider: { pose, identity in
+                ARPoseIndoorNavigationAdapter().adapt(pose, currentIdentity: identity,
+                    verifiedFloorPosition: try fixture.floorPosition(timestamp: pose.timestamp))
+            },
+            sourceMetadataProvider: { objectID, mapID in
+                await store.load(objectID: objectID, mapID: mapID)
+            },
+            nowProvider: nowProvider
+        )
+        return (NavigationControllerHarness(controller: controller,
+            surfaceContinuation: surfaceContinuation, poseContinuation: poseContinuation), provider)
+    }
+
     private func makeHarness(
         fixture: NavigationAppFixture,
         engine: IndoorARNavigationEngine = IndoorARNavigationEngine(),
         evidence: IndoorNavigationEvidence? = nil,
         metadataProvider: IndoorNavigationController.SourceMetadataProvider? = nil,
         surfaceStabilityDelay: Duration = .zero,
+        tracksCameraFloorPosition: Bool = false,
         evaluationTimestampProvider: IndoorNavigationController.EvaluationTimestampProvider? = nil,
         now: TimeInterval = 10
     ) -> NavigationControllerHarness {
@@ -1188,7 +1434,11 @@ final class IndoorNavigationControllerTests: XCTestCase {
                 ARPoseIndoorNavigationAdapter().adapt(
                     pose,
                     currentIdentity: currentIdentity,
-                    verifiedFloorPosition: try fixture.floorPosition(timestamp: pose.timestamp)
+                    verifiedFloorPosition: try fixture.floorPosition(
+                        timestamp: pose.timestamp,
+                        x: tracksCameraFloorPosition ? Double(pose.cameraTransform.column3.x) : 0,
+                        z: tracksCameraFloorPosition ? Double(pose.cameraTransform.column3.z) : 0
+                    )
                 )
             },
             sourceMetadataProvider: metadataProvider,
@@ -1258,6 +1508,43 @@ final class IndoorNavigationControllerTests: XCTestCase {
         XCTFail("Condition did not become true")
     }
 
+    private func establishInitialRoute(
+        _ harness: NavigationControllerHarness,
+        fixture: NavigationAppFixture,
+        destination: SpatialObjectMetadata
+    ) async {
+        harness.controller.activate()
+        harness.surfaceContinuation.yield(fixture.surface(revision: 1))
+        harness.poseContinuation.yield(fixture.pose(timestamp: 10))
+        harness.controller.navigate(to: destination)
+        await eventually(timeoutIterations: 1_000) { harness.controller.renderablePath != nil }
+        XCTAssertEqual(harness.controller.metrics.requestsStarted, 1)
+    }
+
+    private func requireReplacementWhilePosesContinue(
+        _ harness: NavigationControllerHarness,
+        fixture: NavigationAppFixture,
+        x: (Int) -> Float,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        // Keep delivering 50 Hz poses until the replacement is actually published.
+        // Checking inside the stream prevents a test from passing only because
+        // the debounce eventually fires after the pose producer has stopped.
+        for index in 0..<75 {
+            harness.poseContinuation.yield(
+                fixture.pose(timestamp: 10.1 + Double(index) * 0.02, x: x(index))
+            )
+            try? await Task.sleep(for: .milliseconds(20))
+            if harness.controller.metrics.requestsStarted >= 2,
+                harness.controller.renderablePath != nil
+            {
+                return
+            }
+        }
+        XCTFail("Replacement route must publish while fresh camera poses continue", file: file, line: line)
+    }
+
     private func waitForEvidenceRequest(
         _ provider: SuspendedNavigationEvidenceProvider,
         _ expected: Int
@@ -1282,6 +1569,26 @@ private final class MainActorIdentity {
 
     init(_ value: ARCaptureIdentity) {
         self.value = value
+    }
+}
+
+private final class NavigationWallClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var timestamp: TimeInterval
+
+    init(_ timestamp: TimeInterval) { self.timestamp = timestamp }
+
+    var value: TimeInterval {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return timestamp
+        }
+        set {
+            lock.lock()
+            timestamp = newValue
+            lock.unlock()
+        }
     }
 }
 
@@ -1406,10 +1713,10 @@ private struct NavigationAppFixture: Sendable {
         )
     }
 
-    func floorPosition(timestamp: TimeInterval) throws -> FramedPosition {
+    func floorPosition(timestamp: TimeInterval, x: Double = 0, z: Double = 0) throws -> FramedPosition {
         try FramedPosition(
             coordinateFrameID: identity.coordinateFrameID,
-            value: Vec3(x: 0, y: 0, z: 0),
+            value: Vec3(x: x, y: 0, z: z),
             observedAt: timestamp,
             trackingQuality: .normal,
             uncertainty: .raycastEstimate

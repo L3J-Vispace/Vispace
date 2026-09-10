@@ -294,9 +294,16 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
                 triangleCount += triangles.count
                 doorSurfaces.append(door)
             case .none, .unknown:
-                // An unclassified plane can conceal an obstacle. Do not attest
-                // the surrounding cells as free until ARKit classifies it.
-                return nil
+                // Retain the entire footprint as a blocker. Classification is
+                // not needed to exclude bounded geometry from a route, but an
+                // invalid footprint cannot be safely localized.
+                guard let polygon = WorldPlanePolygon(plane),
+                    let triangles = polygon.triangles(classification: .unknown),
+                    triangles.count <= maximumTriangleCount - triangleCount,
+                    triangles.allSatisfy(\.hasBoundedCoordinates)
+                else { return nil }
+                triangleCount += triangles.count
+                planeBlockingTriangles.append(contentsOf: triangles)
             }
         }
         guard !floorPlanes.isEmpty else {
@@ -326,9 +333,6 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
                     return nil
                 }
                 let classification = mesh.faceClassifications[faceIndex]
-                guard classification != .none, classification != .unknown else {
-                    return nil
-                }
                 let index = faceIndex * 3
                 let rawIndices = mesh.triangleIndices[index..<(index + 3)]
                 let vertexIndices = rawIndices.map(Int.init)
@@ -365,7 +369,8 @@ public struct ARVerifiedNavigationEvidenceBuilder: Sendable {
                 case .table, .seat, .ceiling:
                     blockingTriangles.append(triangle)
                 case .none, .unknown:
-                    return nil
+                    guard triangle.hasBoundedCoordinates else { return nil }
+                    blockingTriangles.append(triangle)
                 }
             }
         }
@@ -1214,6 +1219,11 @@ private struct WorldTriangle {
     }
 
     var vertices: [Vec3] { [first, second, third] }
+    var hasBoundedCoordinates: Bool {
+        vertices.allSatisfy { vertex in
+            [vertex.x, vertex.y, vertex.z].allSatisfy { $0.isFinite && abs($0) <= 100_000 }
+        }
+    }
     var minX: Double { vertices.map(\.x).min()! }
     var maxX: Double { vertices.map(\.x).max()! }
     var minY: Double { vertices.map(\.y).min()! }
@@ -1293,11 +1303,13 @@ private struct WorldTriangle {
         floorElevation: Double,
         halfWidth: Double
     ) -> Bool {
-        guard maxY > floorElevation + 0.05,
-            minY < floorElevation + 2.0
-        else {
-            return false
+        if classification != .none && classification != .unknown {
+            guard maxY > floorElevation + 0.05,
+                minY < floorElevation + 2.0
+            else { return false }
         }
+        // Unknown surfaces exclude their horizontal bounds at every elevation;
+        // they can never become a floor or be dismissed as harmless overhead.
         return maxX >= centerX - halfWidth
             && minX <= centerX + halfWidth
             && maxZ >= centerZ - halfWidth

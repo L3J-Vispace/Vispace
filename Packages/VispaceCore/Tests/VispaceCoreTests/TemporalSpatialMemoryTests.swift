@@ -352,6 +352,83 @@ final class TemporalSpatialMemoryTests: XCTestCase {
         XCTAssertEqual(removed.object.stateUpdatedAt, 5)
     }
 
+    func testExplicitRemovedHistoryCleanupRetainsOrderingAndUnrelatedObjects() throws {
+        let removedID = objectID(81_190), liveID = objectID(81_191)
+        let segment = CaptureSegmentID()
+        func clock(_ timestamp: TimeInterval) throws -> TemporalSpatialClock {
+            try TemporalSpatialClock(epoch: 1, captureSegmentID: segment, monotonicTimestamp: timestamp)
+        }
+        var coordinator = makeCoordinator()
+        _ = try coordinator.apply(update(revision: 0, sequence: 1, at: 1,
+            observations: [newObservation(id: removedID, at: 1), newObservation(id: liveID, at: 1)],
+            clock: clock(1)))
+        for sequence in UInt64(2)...5 {
+            _ = try coordinator.apply(update(revision: sequence - 1, sequence: sequence,
+                at: Double(sequence), expected: [removedID], clock: clock(Double(sequence))))
+        }
+        let original = coordinator.snapshot
+        XCTAssertEqual(original.metadata(for: removedID)?.object.temporalRevision, 5)
+        let compacted = original.reclaimingRemovedObjectHistory()
+        XCTAssertNil(compacted.metadata(for: removedID))
+        XCTAssertEqual(compacted.metadata(for: liveID), original.metadata(for: liveID))
+        XCTAssertEqual(compacted.revision, original.revision)
+        XCTAssertEqual(compacted.latestSequence, original.latestSequence)
+        XCTAssertEqual(compacted.latestTimestamp, original.latestTimestamp)
+        XCTAssertEqual(compacted.latestClock, original.latestClock)
+        XCTAssertEqual(compacted.rememberedUpdateCount, original.rememberedUpdateCount)
+        let encoded = try JSONEncoder().encode(compacted)
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self).lowercased()
+            .contains(removedID.rawValue.uuidString.lowercased()))
+        let limitedPolicy = try TemporalSpatialMemoryPolicy(maximumObjectCount: 2)
+        var full = try TemporalSpatialMemoryCoordinator(restoring: original, policy: limitedPolicy)
+        let admission = try update(revision: 5, sequence: 6, at: 6,
+            observations: [newObservation(id: objectID(81_192), at: 6)], clock: clock(6))
+        _ = try full.apply(admission)
+        XCTAssertNil(full.snapshot.metadata(for: objectID(81_192)))
+        var restored = try TemporalSpatialMemoryCoordinator(restoring: compacted, policy: limitedPolicy)
+        XCTAssertEqual(try restored.apply(update(revision: 4, sequence: 5, at: 5,
+            expected: [removedID], clock: clock(5))),
+                       .alreadyApplied(currentRevision: 5))
+        _ = try restored.apply(admission)
+        XCTAssertEqual(restored.snapshot.objects.count, 2)
+        XCTAssertNotNil(restored.snapshot.metadata(for: objectID(81_192)))
+    }
+
+    func testCleanupRetainsLastSeenNotVisibleAndManualRecords() throws {
+        var records: [SpatialObjectMetadata] = []
+        for (index, presence) in [ObjectPresence.lastSeen, .notVisible, .removed].enumerated() {
+            let original = metadata(id: objectID(81_200 + index), at: 1)
+            var object = original.object
+            object.presence = presence
+            object.temporalRevision = 1
+            if presence == .removed { object.semanticLabel = UserObjectRegistrationAccumulator.semanticLabel }
+            records.append(try SpatialObjectMetadata(mapID: original.mapID, object: object, position: original.position))
+        }
+        let snapshot = try TemporalSpatialMemoryCoordinator(mapID: map, coordinateFrameID: frame,
+            restoringDurableObjects: records, policy: testPolicy()).snapshot
+        XCTAssertTrue(snapshot.reclaimableRemovedObjects.isEmpty)
+        XCTAssertEqual(snapshot.reclaimingRemovedObjectHistory(), snapshot)
+    }
+
+    func testExplicitCleanupReclaimsLegacyRemovedObjectWithoutTemporalRevision() throws {
+        let original = metadata(id: objectID(81_210), at: 1)
+        var object = original.object
+        object.presence = .removed
+        XCTAssertNil(object.temporalRevision)
+        let removed = try SpatialObjectMetadata(mapID: original.mapID, object: object, position: original.position)
+        let policy = try TemporalSpatialMemoryPolicy(maximumObjectCount: 1)
+        let snapshot = try TemporalSpatialMemoryCoordinator(mapID: map, coordinateFrameID: frame,
+            restoringDurableObjects: [removed], policy: policy).snapshot
+        XCTAssertEqual(snapshot.reclaimableRemovedObjects, [removed])
+        let compacted = snapshot.reclaimingRemovedObjectHistory()
+        XCTAssertTrue(compacted.objects.isEmpty)
+        XCTAssertEqual(compacted.revision, snapshot.revision)
+        var restored = try TemporalSpatialMemoryCoordinator(restoring: compacted, policy: policy)
+        _ = try restored.apply(update(revision: 0, sequence: 1, at: 2,
+            observations: [newObservation(id: objectID(81_211), at: 2)]))
+        XCTAssertNotNil(restored.snapshot.metadata(for: objectID(81_211)))
+    }
+
     func testSingleMissNeverChangesDurablePresenceAndCoverageIsExplicit() throws {
         let id = objectID(81_102)
         var coordinator = makeCoordinator()

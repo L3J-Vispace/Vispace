@@ -3,6 +3,83 @@ import XCTest
 @testable import VispaceCore
 
 final class SpatialRelationQueryTests: XCTestCase {
+    func testSingleKnownSubjectDoesNotReverseDirectionalQuestion() throws {
+        let cup = try makeRecord(label: "cup", aliases: ["컵"])
+        let smallBox = try makeRecord(label: "box", aliases: ["상자"])
+        var graph = SceneGraph()
+        for predicate in [SpatialRelationPredicate.on, .under, .inside, .blocking, .accessibleFrom] {
+            try graph.upsert(relation(subject: smallBox, predicate: predicate, object: cup))
+        }
+        let records = [cup, smallBox]
+        for question in [
+            "what is the cup on?", "what is the cup under?", "what is the cup inside?",
+            "컵은 무엇 위에 있어?", "컵은 무엇 아래에 있어?", "컵은 무엇 안에 있어?",
+            "cup is on the shelf", "컵이 선반 위에 있어?",
+            "what is the cup blocking?", "컵이 무엇을 막고 있어?",
+            "cup accessible from what?", "어디에서 컵으로 갈 수 있어?",
+        ] {
+            let answer = try engine.query(question, records: records, graph: graph, at: 20)
+            XCTAssertEqual(answer.status, .unsupported, question)
+            XCTAssertTrue(answer.matches.isEmpty, question)
+            XCTAssertNil(engine.targetScope(for: question, records: records), question)
+            XCTAssertNil(engine.geometryScope(for: question, records: records), question)
+        }
+        for question in ["컵 위에 뭐가 있어?", "what is on the cup?", "컵을 무엇이 막고 있어?",
+                         "what is blocking the cup?", "컵에서 어디로 갈 수 있어?", "what is accessible from cup?"] {
+            let answer = try engine.query(question, records: records, graph: graph, at: 20)
+            XCTAssertEqual(answer.status, .answered, question)
+            XCTAssertEqual(answer.matches.map(\.subject.objectID), [smallBox.metadata.object.id], question)
+            XCTAssertNotNil(engine.targetScope(for: question, records: records), question)
+        }
+    }
+
+    func testSingleReferenceCompoundRelationsNeverSelectOnlyOnePredicate() throws {
+        let cup = try makeRecord(label: "cup", aliases: ["컵"])
+        let table = try makeRecord(label: "table", aliases: ["책상"])
+        var graph = SceneGraph()
+        try graph.upsert(relation(subject: cup, predicate: .under, object: table))
+        try graph.upsert(relation(subject: cup, predicate: .near, object: table))
+        let records = [cup, table]
+        for question in [
+            "책상 위에 또는 아래에 뭐가 있어?", "책상 근처에 또는 안에 뭐가 있어?",
+            "what is on or under the table?", "what is inside or near the table?",
+        ] {
+            let answer = try engine.query(question, records: records, graph: graph, at: 20)
+            XCTAssertEqual(answer.status, .unsupported, question)
+            XCTAssertTrue(answer.matches.isEmpty, question)
+            XCTAssertNil(answer.isAffirmative, question)
+            XCTAssertNil(engine.targetScope(for: question, records: records), question)
+            XCTAssertNil(engine.geometryScope(for: question, records: records), question)
+        }
+        let simple = try engine.query("책상 아래에 뭐가 있어?", records: records, graph: graph, at: 20)
+        XCTAssertEqual(simple.status, .answered)
+        XCTAssertEqual(simple.matches.map(\.subject.objectID), [cup.metadata.object.id])
+    }
+
+    func testNewlyRoutedPhrasesRetainGroundedPredicatesAndNameSpans() throws {
+        let cup = try makeRecord(label: "cup", aliases: ["컵", "주변 컵"])
+        let table = try makeRecord(label: "table", aliases: ["책상"])
+        for (predicate, questions) in [
+            (SpatialRelationPredicate.near, ["책상 근처에 뭐가 있어?", "책상 주변에 뭐가 있어?"]),
+            (.intersects, ["컵과 책상이 겹쳐?"]),
+            (.accessibleFrom, ["책상에서 컵으로 갈 수 있어?"]),
+            (.on, ["책상 위에 주변 컵이 있어?"]),
+        ] {
+            var graph = SceneGraph()
+            try graph.upsert(relation(subject: cup, predicate: predicate, object: table))
+            for question in questions {
+                XCTAssertEqual(SpatialCommandParser().parse(question), .relationQuery(question))
+                let answer = try engine.query(question, records: [cup, table], graph: graph, at: 20)
+                XCTAssertEqual(answer.status, .answered, question)
+                XCTAssertEqual(answer.predicate, predicate, question)
+                XCTAssertEqual(answer.matches.first?.subject.objectID, cup.metadata.object.id, question)
+            }
+        }
+        let nameOnly = try engine.query("주변 컵 책상", records: [cup, table], graph: SceneGraph(), at: 20)
+        XCTAssertEqual(nameOnly.status, .unsupported)
+        XCTAssertTrue(nameOnly.matches.isEmpty)
+    }
+
     func testEquivalentKoreanOrdersKeepRolesIncludingNegativeQuestions() throws {
         let cup = try makeRecord(label: "cup", aliases: ["컵"])
         let table = try makeRecord(label: "table", aliases: ["테이블"])

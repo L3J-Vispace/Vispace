@@ -120,7 +120,8 @@ public actor ARWorldMapBlobStore {
     public func saveArchive(
         _ archive: Data,
         id: WorldMapBlobID = WorldMapBlobID(),
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        reservingAdditionalBytes: Int = 0
     ) throws -> WorldMapBlobRecord {
         try validateArchiveSize(archive)
         // Type-confusion guard: arbitrary Data (including camera pixels) is
@@ -153,7 +154,10 @@ public actor ARWorldMapBlobStore {
         guard !fileManager.fileExists(atPath: destination.path) else {
             throw WorldMapBlobStoreError.blobAlreadyExists
         }
-        try SpatialStorageDirectory.withWriteBudget(bytes: encoded.count, at: directoryURL, fileManager: fileManager) {
+        // A checkpoint owner can reserve admission headroom for its subsequent
+        // metadata publication. This only tightens the budget; it never waives it.
+        let reserve = min(max(0, reservingAdditionalBytes), 32 * 1_024 * 1_024)
+        try SpatialStorageDirectory.withWriteBudget(bytes: encoded.count + reserve, at: directoryURL, fileManager: fileManager) {
             try publish(encoded, to: destination, id: id)
         }
 
@@ -195,6 +199,17 @@ public actor ARWorldMapBlobStore {
     public func contains(id: WorldMapBlobID) -> Bool {
         guard (try? SpatialStorageDirectory.validatePath(at: fileURL(for: id), fileManager: fileManager)) != nil else { return false }
         return fileManager.fileExists(atPath: fileURL(for: id).path)
+    }
+
+    /// Physical typed-file footprint, without decoding a potentially large map.
+    /// Quarantined, staging, and unrelated files are not attributed to a place.
+    public func storedByteCount(id: WorldMapBlobID) throws -> Int64 {
+        let source = fileURL(for: id)
+        try SpatialStorageDirectory.validatePath(at: source, fileManager: fileManager)
+        guard fileManager.fileExists(atPath: source.path) else { return 0 }
+        try SpatialStorageDirectory.validateRegularFile(at: source, fileManager: fileManager)
+        let attributes = try fileManager.attributesOfItem(atPath: source.path)
+        return (attributes[.size] as? NSNumber)?.int64Value ?? 0
     }
 
     /// Enumerates only typed checkpoint files in the dedicated world-map
