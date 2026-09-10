@@ -7,6 +7,7 @@ struct SpatialQueryPanel: View {
     @ObservedObject var relationQueryController: SpatialRelationQueryController
     @ObservedObject var placementController: FurniturePlacementController
     @ObservedObject var navigationController: IndoorNavigationController
+    @Binding var query: String
     let onManageData: () -> Void
     let distanceDescription: (Vec3) -> String
     var onRegisterObject: (String) -> Void = { _ in }
@@ -14,7 +15,6 @@ struct SpatialQueryPanel: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @FocusState private var queryIsFocused: Bool
-    @State private var query = ""
     @State private var rejection: SpatialCommandRejection?
     @State private var editsFurniture = false
     @State private var selectedFurniture: FurnitureKind = .sofa
@@ -27,7 +27,7 @@ struct SpatialQueryPanel: View {
     @State private var reviewsIdentity = false
 
     var body: some View {
-        // Keep this panel's input state while removing controls during registration.
+        // Keep the parent's search draft while removing controls during registration.
         // A global accessibilityHidden(false) would override decorative child visibility.
         Group {
             if isVisible {

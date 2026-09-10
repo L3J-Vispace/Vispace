@@ -21,6 +21,7 @@ struct CameraScreen: View {
     @ObservedObject var lifecycle: SpatialApplicationLifecycle
     @State private var showsDataManagement = false
     @State private var registrationName: String?
+    @State private var query = ""
 
     private var recoveryMode: CameraRecoveryMode? {
         if lifecycle.state == .storageUnavailable { return .storageUnavailable }
@@ -76,6 +77,7 @@ struct CameraScreen: View {
                     relationQueryController: relationQueryController,
                     placementController: placementController,
                     navigationController: navigationController,
+                    query: $query,
                     onManageData: {
                         showsDataManagement = true
                     },
@@ -154,6 +156,7 @@ struct CameraScreen: View {
                         },
                         onSearch: { name in
                             registrationController.cancel()
+                            query = name
                             self.registrationName = nil
                             queryController.submit(name)
                         }
